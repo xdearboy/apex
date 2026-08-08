@@ -1,0 +1,18 @@
+# Binaries
+tachyon
+hello-server
+*.o
+*.so
+*.dylib
+*.a
+
+# Certificates and keys
+*.pem
+*.crt
+*.key
+*.csr
+
+# Logs & temp files
+*.log
+/scratch/
+.system_generated/
