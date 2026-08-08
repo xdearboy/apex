@@ -1,4 +1,4 @@
-# tachyon
+# tachyon (/ˈtæki.ɒn/)
 
 > high-throughput static HTTP/HTTPS engine written in C with Linux kTLS
 
