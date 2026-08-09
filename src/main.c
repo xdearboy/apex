@@ -3,12 +3,14 @@
 #include "tls.h"
 #include "metrics.h"
 #include "worker.h"
+#include "http.h"
 
 tachyon_config_t g_config = {
     .port = DEFAULT_PORT,
     .bind_addr = DEFAULT_BIND_ADDR,
     .cert_file = NULL,
     .key_file = NULL,
+    .root_dir = NULL,
     .num_workers = 0,
     .enable_steer = 0,
     .http_status = 204
@@ -22,6 +24,7 @@ static void print_usage(const char *prog) {
     printf("  -b <addr>        Bind IP address (default: %s)\n", DEFAULT_BIND_ADDR);
     printf("  -c <cert.pem>    Path to SSL certificate file\n");
     printf("  -k <key.pem>     Path to SSL private key file\n");
+    printf("  -d <dir>         Serve static files from directory (e.g. /var/www/html)\n");
     printf("  -w <workers>     Number of worker processes (default: CPU count)\n");
     printf("  -s               Enable BPF CPU affinity steering\n");
     printf("  --status <code>  HTTP status to return (204 or 200, default: 204)\n");
@@ -43,6 +46,8 @@ int main(int argc, char *argv[]) {
             g_config.cert_file = argv[++i];
         } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
             g_config.key_file = argv[++i];
+        } else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--root") == 0) && i + 1 < argc) {
+            g_config.root_dir = argv[++i];
         } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
             g_config.num_workers = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-s") == 0) {
@@ -94,6 +99,7 @@ int main(int argc, char *argv[]) {
     }
 
     worker_init_batch();
+    http_init_routes(g_config.root_dir);
 
     if (tls_init_server_ctx(g_config.cert_file, g_config.key_file) < 0) {
         fprintf(stderr, "Failed to initialize TLS context\n");
@@ -124,7 +130,10 @@ int main(int argc, char *argv[]) {
     printf("  Listening on    : %s:%d\n", g_config.bind_addr, g_config.port);
     printf("  Workers count   : %d (CPU steering: %s)\n", num_workers, steer ? "enabled" : "disabled");
     printf("  Max connections : %d\n", conn_cap);
-    printf("  HTTP Response   : %d (%s)\n", g_config.http_status, g_config.http_status == 204 ? "No Content" : "OK");
+    if (g_config.root_dir)
+        printf("  Static Root     : %s\n", g_config.root_dir);
+    else
+        printf("  HTTP Response   : %d (%s)\n", g_config.http_status, g_config.http_status == 204 ? "No Content" : "OK");
     printf("  Certificate     : %s\n", g_config.cert_file ? g_config.cert_file : "in-memory self-signed (ECDSA)");
     printf("===============================================================\n");
     fflush(stdout);
@@ -161,6 +170,7 @@ int main(int argc, char *argv[]) {
     }
 
     tls_destroy_server_ctx();
+    http_free_routes();
     metrics_destroy(num_workers);
     return 0;
 }

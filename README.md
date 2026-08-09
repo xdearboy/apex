@@ -93,6 +93,7 @@ Options:
 * `-p <port>` — listening port (default: `8443`)
 * `-b <addr>` — bind address (default: `0.0.0.0`)
 * `-c <cert.pem>` / `-k <key.pem>` — SSL cert and key paths
+* `-d <dir>` — serve static files from directory (HTML, CSS, JS, etc.)
 * `-w <num>` — worker count (default: auto-detected CPU cores)
 * `-s` — enable BPF CPU steering
 * `--status <204|200>` — HTTP status code (`204` No Content or `200` OK)

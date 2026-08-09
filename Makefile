@@ -10,7 +10,7 @@ ifneq ($(shell $(CC) -ljemalloc -x c /dev/null -o /dev/null 2>/dev/null && echo 
     LDFLAGS += -ljemalloc
 endif
 
-SRCS = src/main.c src/net.c src/tls.c src/worker.c src/metrics.c
+SRCS = src/main.c src/net.c src/tls.c src/worker.c src/metrics.c src/http.c
 OBJS = $(SRCS:.c=.o)
 TARGET = tachyon
 
@@ -35,8 +35,10 @@ uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
 
 test: $(TARGET)
-	./$(TARGET) -p 9443 -b 127.0.0.1 & PID=$$!; \
+	mkdir -p /tmp/tachyon-test-www && echo "<h1>Tachyon Static OK</h1>" > /tmp/tachyon-test-www/index.html; \
+	./$(TARGET) -p 9443 -b 127.0.0.1 -d /tmp/tachyon-test-www & PID=$$!; \
 	sleep 1; \
-	curl -k -v https://127.0.0.1:9443/ && \
-	curl -k https://127.0.0.1:9443/stats && \
-	kill $$PID
+	curl -k -s https://127.0.0.1:9443/ && echo "" && \
+	curl -k -s https://127.0.0.1:9443/stats && echo "" && \
+	curl -k -s https://127.0.0.1:9443/nonexistent && echo "" && \
+	kill $$PID && rm -rf /tmp/tachyon-test-www

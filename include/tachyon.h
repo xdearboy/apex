@@ -131,6 +131,7 @@ typedef struct {
     const char *bind_addr;
     const char *cert_file;
     const char *key_file;
+    const char *root_dir;
     int         num_workers;
     int         enable_steer;
     int         http_status;

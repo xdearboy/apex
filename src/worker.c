@@ -1,6 +1,7 @@
 #include "worker.h"
 #include "metrics.h"
 #include "tls.h"
+#include "http.h"
 
 static const char RESP_204[] = "HTTP/1.1 204\r\n\r\n";
 static const char RESP_200[] = "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n1";
@@ -11,7 +12,6 @@ static size_t g_batch_len = (sizeof(RESP_204) - 1) * BATCH_COPIES;
 static char g_batch[(sizeof(RESP_200) - 1) * BATCH_COPIES];
 
 static conn_t *conns = NULL;
-static const char STATS_REQUEST[] = "GET /stats";
 
 void worker_init_batch(void) {
     if (g_config.http_status == 200) {
@@ -25,16 +25,6 @@ void worker_init_batch(void) {
 
     for (int i = 0; i < BATCH_COPIES; i++) {
         memcpy(g_batch + (size_t)i * g_resp_len, g_resp, g_resp_len);
-    }
-}
-
-static inline void track_request_path(conn_t *c, char ch) {
-    if (c->request_kind != REQUEST_UNKNOWN) return;
-    if (ch == STATS_REQUEST[c->request_pos]) {
-        if (++c->request_pos == sizeof(STATS_REQUEST) - 1)
-            c->request_kind = REQUEST_STATS;
-    } else {
-        c->request_kind = REQUEST_STATIC;
     }
 }
 
@@ -94,6 +84,50 @@ static void close_conn(int epoll_fd, int fd, int conn_cap) {
 }
 
 static int flush_conn(int epoll_fd, int fd, conn_t *c) {
+    while (c->custom_len > 0) {
+        size_t chunk = c->custom_len - c->custom_off;
+        ssize_t w;
+        if (c->ktls_tx) {
+            w = send(fd, c->custom_buf + c->custom_off, chunk, MSG_NOSIGNAL);
+        } else {
+            w = SSL_write(c->ssl, c->custom_buf + c->custom_off, (int)chunk);
+        }
+
+        if (w > 0) {
+            c->custom_off += (size_t)w;
+            if (c->custom_off >= c->custom_len) {
+                c->custom_len = 0;
+                c->custom_off = 0;
+                c->custom_buf = NULL;
+            }
+            continue;
+        }
+
+        int want_out = 0;
+        if (c->ktls_tx) {
+            if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) want_out = 1;
+            else if (w < 0 && errno == EINTR) continue;
+            else return -1;
+        } else {
+            int err = SSL_get_error(c->ssl, (int)w);
+            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) want_out = 1;
+            else return -1;
+        }
+
+        if (want_out) {
+            if (!c->want_write) {
+                struct epoll_event ev = {
+                    .events = EPOLLIN | EPOLLOUT | EPOLLET | EPOLLRDHUP,
+                    .data.fd = fd
+                };
+                if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev) == 0)
+                    c->want_write = 1;
+            }
+            return 0;
+        }
+        return -1;
+    }
+
     while (c->pending > 0) {
         size_t chunk = g_batch_len - c->off;
         if (chunk > c->pending) chunk = c->pending;
@@ -261,8 +295,12 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                     c->want_write = 0;
                     c->closing = 0;
                     c->mstate = 0;
-                    c->request_kind = REQUEST_UNKNOWN;
-                    c->request_pos = 0;
+                    c->uri_parsed = 0;
+                    c->uri_parsing = 0;
+                    c->uri_len = 0;
+                    c->custom_buf = NULL;
+                    c->custom_len = 0;
+                    c->custom_off = 0;
                     c->pending = 0;
                     c->off = 0;
                     c->handshake_done = 0;
@@ -326,20 +364,56 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                         uint8_t st = c->mstate;
                         for (ssize_t k = 0; k < n; k++) {
                             char ch = buf[k];
-                            track_request_path(c, ch);
+
+                            if (!c->uri_parsed) {
+                                if (!c->uri_parsing) {
+                                    if (ch == ' ' || ch == '/') {
+                                        c->uri_parsing = 1;
+                                        c->uri_len = 0;
+                                        if (ch == '/') c->uri[c->uri_len++] = '/';
+                                    }
+                                } else {
+                                    if (ch == ' ' || ch == '?' || ch == '\r' || ch == '\n') {
+                                        c->uri_parsed = 1;
+                                        c->uri[c->uri_len] = '\0';
+                                    } else if (c->uri_len < sizeof(c->uri) - 1) {
+                                        c->uri[c->uri_len++] = ch;
+                                    }
+                                }
+                            }
+
                             if (st == 0)      st = (ch == '\r') ? 1 : 0;
                             else if (st == 1) st = (ch == '\n') ? 2 : (ch == '\r' ? 1 : 0);
                             else if (st == 2) st = (ch == '\r') ? 3 : 0;
-                            else              { if (ch == '\n') {
-                                                    if (c->request_kind == REQUEST_STATS)
-                                                        stats_request = 1;
-                                                    else
-                                                        nreq++;
-                                                    c->request_kind = REQUEST_UNKNOWN;
-                                                    c->request_pos = 0;
-                                                    st = 0;
-                                                }
-                                                else st = (ch == '\r') ? 1 : 0; }
+                            else {
+                                if (ch == '\n') {
+                                    if (c->uri_len >= 6 && strncmp(c->uri, "/stats", 6) == 0 && (c->uri[6] == '\0' || c->uri[6] == '?')) {
+                                        stats_request = 1;
+                                    } else {
+                                        const http_route_t *route = http_find_route(c->uri, c->uri_len);
+                                        if (route) {
+                                            c->custom_buf = route->response_buf;
+                                            c->custom_len = route->response_len;
+                                            c->custom_off = 0;
+                                            nreq++;
+                                        } else if (c->uri_len == 1 && c->uri[0] == '/' && (!g_config.root_dir || !g_config.root_dir[0])) {
+                                            nreq++;
+                                        } else {
+                                            size_t l404;
+                                            c->custom_buf = http_get_404_response(&l404);
+                                            c->custom_len = l404;
+                                            c->custom_off = 0;
+                                            nreq++;
+                                        }
+                                    }
+                                    c->uri_parsed = 0;
+                                    c->uri_parsing = 0;
+                                    c->uri_len = 0;
+                                    st = 0;
+                                } else {
+                                    st = (ch == '\r') ? 1 : 0;
+                                }
+                            }
                         }
                         c->mstate = st;
 
@@ -361,7 +435,8 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 }
 
                 if (nreq > 0) {
-                    c->pending += (size_t)nreq * g_resp_len;
+                    if (c->custom_len == 0)
+                        c->pending += (size_t)nreq * g_resp_len;
                     c->last_active = now;
                     local_requests += (uint64_t)nreq;
                 }
@@ -378,7 +453,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 }
                 if (!dead && flush_conn(epoll_fd, fd, c) < 0) dead = 1;
 
-                if (dead || (c->closing && c->pending == 0)) {
+                if (dead || (c->closing && c->pending == 0 && c->custom_len == 0)) {
                     close_conn(epoll_fd, fd, conn_cap);
                     continue;
                 }
