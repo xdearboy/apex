@@ -54,9 +54,12 @@ static int add_file_route(const char *rel_uri, const char *fs_path) {
     fseek(f, 0, SEEK_SET);
     if (size < 0 || size > 16777216) { fclose(f); return -1; }
 
-    char *body = malloc((size_t)size);
-    if (!body) { fclose(f); return -1; }
-    if (fread(body, 1, (size_t)size, f) != (size_t)size) { free(body); fclose(f); return -1; }
+    char *body = NULL;
+    if (size > 0) {
+        body = malloc((size_t)size);
+        if (!body) { fclose(f); return -1; }
+        if (fread(body, 1, (size_t)size, f) != (size_t)size) { free(body); fclose(f); return -1; }
+    }
     fclose(f);
 
     const char *mime = get_mime_type(fs_path);
