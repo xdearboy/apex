@@ -1,6 +1,8 @@
 # Binaries
 tachyon
 hello-server
+tests/test_config
+tests/test_http
 *.o
 *.so
 *.dylib
