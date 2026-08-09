@@ -61,7 +61,7 @@ static inline int epoll_wait(int epfd, struct epoll_event *events, int maxevents
 #define SOCK_NONBLOCK 0
 #endif
 
-#define TACHYON_VERSION      "1.0.0"
+#define TACHYON_VERSION      "1.0.1"
 #define MAX_EVENTS           8192
 #define DEFAULT_PORT         8443
 #define DEFAULT_BIND_ADDR    "0.0.0.0"
