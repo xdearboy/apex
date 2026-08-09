@@ -87,16 +87,43 @@ make
 
 # С боевыми сертификатами Let's Encrypt на 443 порту:
 ./tachyon -p 443 -b 0.0.0.0 -c /path/to/fullchain.pem -k /path/to/privkey.pem
+# Запуск через TOML-конфиг:
+./tachyon -C tachyon.toml
 ```
 
 Флаги:
+* `-C, --config <file>` — путь к TOML-файлу конфигурации
 * `-p <port>` — порт (дефолт: `8443`)
 * `-b <addr>` — адрес привязки (дефолт: `0.0.0.0`)
 * `-c <cert.pem>` / `-k <key.pem>` — пути к сертификату и ключу
-* `-d <dir>` — раздача статики из директории (HTML, CSS, JS и т.д.)
+* `-d, --root <dir>` — раздача статики из директории (HTML, CSS, JS и т.д.)
 * `-w <num>` — число воркеров (по умолчанию равно числу ядер)
 * `-s` — включить BPF CPU steering
 * `--status <204|200>` — код ответа (`204` No Content или `200` OK)
+* `--stats` / `--no-stats` — включить или выключить эндпоинт `/stats`
+* `--stats-path <path>` — кастомный путь для метрик (дефолт: `/stats`)
+
+---
+
+## Конфигурация (`tachyon.toml`)
+
+```toml
+[server]
+port = 8443
+bind = "0.0.0.0"
+# workers = 28
+status = 204
+# root = "/var/www/html"
+cpu_steer = false
+
+[tls]
+# cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[stats]
+enabled = true
+path = "/stats"
+```
 
 ---
 

@@ -1,0 +1,17 @@
+# tachyon.toml configuration example
+
+[server]
+port = 8443
+bind = "0.0.0.0"
+# workers = 28          # default: auto-detected CPU cores
+status = 204            # 204 (No Content) or 200 (OK)
+# root = "/var/www/html" # static files directory
+cpu_steer = false
+
+[tls]
+# cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[stats]
+enabled = true
+path = "/stats"

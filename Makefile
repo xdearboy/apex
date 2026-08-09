@@ -10,7 +10,7 @@ ifneq ($(shell $(CC) -ljemalloc -x c /dev/null -o /dev/null 2>/dev/null && echo 
     LDFLAGS += -ljemalloc
 endif
 
-SRCS = src/main.c src/net.c src/tls.c src/worker.c src/metrics.c src/http.c
+SRCS = src/main.c src/net.c src/tls.c src/worker.c src/metrics.c src/http.c src/config.c
 OBJS = $(SRCS:.c=.o)
 TARGET = tachyon
 
@@ -36,9 +36,10 @@ uninstall:
 
 test: $(TARGET)
 	mkdir -p /tmp/tachyon-test-www && echo "<h1>Tachyon Static OK</h1>" > /tmp/tachyon-test-www/index.html; \
-	./$(TARGET) -p 9443 -b 127.0.0.1 -d /tmp/tachyon-test-www & PID=$$!; \
+	printf '[server]\nport = 9443\nbind = "127.0.0.1"\nroot = "/tmp/tachyon-test-www"\nstatus = 200\n\n[stats]\nenabled = true\npath = "/stats"\n' > /tmp/test-tachyon.toml; \
+	./$(TARGET) -C /tmp/test-tachyon.toml & PID=$$!; \
 	sleep 1; \
 	curl -k -s https://127.0.0.1:9443/ && echo "" && \
 	curl -k -s https://127.0.0.1:9443/stats && echo "" && \
 	curl -k -s https://127.0.0.1:9443/nonexistent && echo "" && \
-	kill $$PID && rm -rf /tmp/tachyon-test-www
+	kill $$PID && rm -rf /tmp/tachyon-test-www /tmp/test-tachyon.toml

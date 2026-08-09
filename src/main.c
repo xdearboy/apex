@@ -4,15 +4,18 @@
 #include "metrics.h"
 #include "worker.h"
 #include "http.h"
+#include "config.h"
 
 tachyon_config_t g_config = {
     .port = DEFAULT_PORT,
     .bind_addr = DEFAULT_BIND_ADDR,
-    .cert_file = NULL,
-    .key_file = NULL,
-    .root_dir = NULL,
+    .cert_file = "",
+    .key_file = "",
+    .root_dir = "",
+    .stats_path = DEFAULT_STATS_PATH,
     .num_workers = 0,
     .enable_steer = 0,
+    .enable_stats = 1,
     .http_status = 204
 };
 
@@ -20,51 +23,80 @@ static void print_usage(const char *prog) {
     printf("tachyon v%s\n\n", TACHYON_VERSION);
     printf("Usage: %s [options]\n\n", prog);
     printf("Options:\n");
-    printf("  -p <port>        Port to listen on (default: %d)\n", DEFAULT_PORT);
-    printf("  -b <addr>        Bind IP address (default: %s)\n", DEFAULT_BIND_ADDR);
-    printf("  -c <cert.pem>    Path to SSL certificate file\n");
-    printf("  -k <key.pem>     Path to SSL private key file\n");
-    printf("  -d <dir>         Serve static files from directory (e.g. /var/www/html)\n");
-    printf("  -w <workers>     Number of worker processes (default: CPU count)\n");
-    printf("  -s               Enable BPF CPU affinity steering\n");
-    printf("  --status <code>  HTTP status to return (204 or 200, default: 204)\n");
-    printf("  -v, --version    Show version\n");
-    printf("  -h, --help       Show help\n\n");
+    printf("  -C, --config <file>  Load TOML configuration file (e.g. tachyon.toml)\n");
+    printf("  -p <port>            Port to listen on (default: %d)\n", DEFAULT_PORT);
+    printf("  -b <addr>            Bind IP address (default: %s)\n", DEFAULT_BIND_ADDR);
+    printf("  -c <cert.pem>        Path to SSL certificate file\n");
+    printf("  -k <key.pem>         Path to SSL private key file\n");
+    printf("  -d, --root <dir>     Serve static files from directory\n");
+    printf("  -w <workers>         Number of worker processes (default: CPU count)\n");
+    printf("  -s                   Enable BPF CPU affinity steering\n");
+    printf("  --status <code>      HTTP status to return (204 or 200, default: 204)\n");
+    printf("  --stats              Enable /stats endpoint (default: enabled)\n");
+    printf("  --no-stats           Disable /stats endpoint\n");
+    printf("  --stats-path <path>  Custom stats URL path (default: /stats)\n");
+    printf("  -v, --version        Show version\n");
+    printf("  -h, --help           Show help\n\n");
 }
 
 int main(int argc, char *argv[]) {
     pid_t pids[MAX_WORKERS];
     int lfds[MAX_WORKERS];
     int cpus[MAX_WORKERS];
+    const char *config_file = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
-            g_config.port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-            g_config.bind_addr = argv[++i];
-        } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            g_config.cert_file = argv[++i];
-        } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
-            g_config.key_file = argv[++i];
-        } else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--root") == 0) && i + 1 < argc) {
-            g_config.root_dir = argv[++i];
-        } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
-            g_config.num_workers = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-s") == 0) {
-            g_config.enable_steer = 1;
-        } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
-            g_config.http_status = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
-            printf("tachyon v%s\n", TACHYON_VERSION);
-            return 0;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
-        } else if (argv[i][0] != '-') {
-            if (i == 1) g_config.port = atoi(argv[1]);
-            else if (i == 2) g_config.bind_addr = argv[2];
-            else if (i == 3) g_config.cert_file = argv[3];
-            else if (i == 4) g_config.key_file = argv[4];
+        if ((strcmp(argv[i], "-C") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
+            config_file = argv[++i];
+        }
+    }
+
+    if (config_file) {
+        if (config_load_file(config_file, &g_config) < 0) {
+            fprintf(stderr, "Warning: could not load config file %s: %s\n", config_file, strerror(errno));
+        }
+    } else if (access("tachyon.toml", R_OK) == 0) {
+        config_load_file("tachyon.toml", &g_config);
+    }
+
+    if (argc > 1 && argv[1][0] != '-') {
+        if (argc > 1) g_config.port = atoi(argv[1]);
+        if (argc > 2) strncpy(g_config.bind_addr, argv[2], sizeof(g_config.bind_addr) - 1);
+        if (argc > 3) strncpy(g_config.cert_file, argv[3], sizeof(g_config.cert_file) - 1);
+        if (argc > 4) strncpy(g_config.key_file, argv[4], sizeof(g_config.key_file) - 1);
+    } else {
+        for (int i = 1; i < argc; i++) {
+            if ((strcmp(argv[i], "-C") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
+                i++;
+            } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+                g_config.port = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+                strncpy(g_config.bind_addr, argv[++i], sizeof(g_config.bind_addr) - 1);
+            } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+                strncpy(g_config.cert_file, argv[++i], sizeof(g_config.cert_file) - 1);
+            } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
+                strncpy(g_config.key_file, argv[++i], sizeof(g_config.key_file) - 1);
+            } else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--root") == 0) && i + 1 < argc) {
+                strncpy(g_config.root_dir, argv[++i], sizeof(g_config.root_dir) - 1);
+            } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
+                g_config.num_workers = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "-s") == 0) {
+                g_config.enable_steer = 1;
+            } else if (strcmp(argv[i], "--status") == 0 && i + 1 < argc) {
+                g_config.http_status = atoi(argv[++i]);
+            } else if (strcmp(argv[i], "--stats") == 0) {
+                g_config.enable_stats = 1;
+            } else if (strcmp(argv[i], "--no-stats") == 0) {
+                g_config.enable_stats = 0;
+            } else if (strcmp(argv[i], "--stats-path") == 0 && i + 1 < argc) {
+                strncpy(g_config.stats_path, argv[++i], sizeof(g_config.stats_path) - 1);
+            } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
+                printf("tachyon v%s\n", TACHYON_VERSION);
+                return 0;
+            } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+                print_usage(argv[0]);
+                return 0;
+            }
         }
     }
 
@@ -99,9 +131,11 @@ int main(int argc, char *argv[]) {
     }
 
     worker_init_batch();
-    http_init_routes(g_config.root_dir);
+    http_init_routes(g_config.root_dir[0] ? g_config.root_dir : NULL);
 
-    if (tls_init_server_ctx(g_config.cert_file, g_config.key_file) < 0) {
+    const char *cfile = g_config.cert_file[0] ? g_config.cert_file : NULL;
+    const char *kfile = g_config.key_file[0] ? g_config.key_file : NULL;
+    if (tls_init_server_ctx(cfile, kfile) < 0) {
         fprintf(stderr, "Failed to initialize TLS context\n");
         return 1;
     }
@@ -130,11 +164,12 @@ int main(int argc, char *argv[]) {
     printf("  Listening on    : %s:%d\n", g_config.bind_addr, g_config.port);
     printf("  Workers count   : %d (CPU steering: %s)\n", num_workers, steer ? "enabled" : "disabled");
     printf("  Max connections : %d\n", conn_cap);
-    if (g_config.root_dir)
+    if (g_config.root_dir[0])
         printf("  Static Root     : %s\n", g_config.root_dir);
     else
         printf("  HTTP Response   : %d (%s)\n", g_config.http_status, g_config.http_status == 204 ? "No Content" : "OK");
-    printf("  Certificate     : %s\n", g_config.cert_file ? g_config.cert_file : "in-memory self-signed (ECDSA)");
+    printf("  Live Stats      : %s (%s)\n", g_config.enable_stats ? "enabled" : "disabled", g_config.enable_stats ? g_config.stats_path : "none");
+    printf("  Certificate     : %s\n", cfile ? cfile : "in-memory self-signed (ECDSA)");
     printf("===============================================================\n");
     fflush(stdout);
 

@@ -13,6 +13,7 @@
 #include <time.h>
 #include <sched.h>
 #include <fcntl.h>
+#include <ctype.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -120,6 +121,7 @@ static inline int epoll_wait(int kq, struct epoll_event *events, int maxevents, 
 #define MAX_EVENTS           8192
 #define DEFAULT_PORT         8443
 #define DEFAULT_BIND_ADDR    "0.0.0.0"
+#define DEFAULT_STATS_PATH   "/stats"
 #define MAX_WORKERS          256
 #define READ_BUF             16384
 #define BATCH_COPIES         256
@@ -128,12 +130,14 @@ static inline int epoll_wait(int kq, struct epoll_event *events, int maxevents, 
 
 typedef struct {
     int         port;
-    const char *bind_addr;
-    const char *cert_file;
-    const char *key_file;
-    const char *root_dir;
+    char        bind_addr[64];
+    char        cert_file[256];
+    char        key_file[256];
+    char        root_dir[256];
+    char        stats_path[64];
     int         num_workers;
     int         enable_steer;
+    int         enable_stats;
     int         http_status;
 } tachyon_config_t;
 

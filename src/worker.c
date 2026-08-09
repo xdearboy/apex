@@ -387,7 +387,11 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                             else if (st == 2) st = (ch == '\r') ? 3 : 0;
                             else {
                                 if (ch == '\n') {
-                                    if (c->uri_len >= 6 && strncmp(c->uri, "/stats", 6) == 0 && (c->uri[6] == '\0' || c->uri[6] == '?')) {
+                                    size_t stats_plen = strlen(g_config.stats_path);
+                                    if (g_config.enable_stats && stats_plen > 0 &&
+                                        c->uri_len >= stats_plen &&
+                                        strncmp(c->uri, g_config.stats_path, stats_plen) == 0 &&
+                                        (c->uri[stats_plen] == '\0' || c->uri[stats_plen] == '?')) {
                                         stats_request = 1;
                                     } else {
                                         const http_route_t *route = http_find_route(c->uri, c->uri_len);
@@ -396,7 +400,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                                             c->custom_len = route->response_len;
                                             c->custom_off = 0;
                                             nreq++;
-                                        } else if (c->uri_len == 1 && c->uri[0] == '/' && (!g_config.root_dir || !g_config.root_dir[0])) {
+                                        } else if (c->uri_len == 1 && c->uri[0] == '/' && !g_config.root_dir[0]) {
                                             nreq++;
                                         } else {
                                             size_t l404;

@@ -87,16 +87,43 @@ make
 
 # With production Let's Encrypt certificates on port 443:
 ./tachyon -p 443 -b 0.0.0.0 -c /path/to/fullchain.pem -k /path/to/privkey.pem
+# Using TOML configuration file:
+./tachyon -C tachyon.toml
 ```
 
 Options:
+* `-C, --config <file>` — load TOML configuration file
 * `-p <port>` — listening port (default: `8443`)
 * `-b <addr>` — bind address (default: `0.0.0.0`)
 * `-c <cert.pem>` / `-k <key.pem>` — SSL cert and key paths
-* `-d <dir>` — serve static files from directory (HTML, CSS, JS, etc.)
+* `-d, --root <dir>` — serve static files from directory (HTML, CSS, JS, etc.)
 * `-w <num>` — worker count (default: auto-detected CPU cores)
 * `-s` — enable BPF CPU steering
 * `--status <204|200>` — HTTP status code (`204` No Content or `200` OK)
+* `--stats` / `--no-stats` — enable or disable `/stats` endpoint (default: enabled)
+* `--stats-path <path>` — custom metrics URL path (default: `/stats`)
+
+---
+
+## Configuration (`tachyon.toml`)
+
+```toml
+[server]
+port = 8443
+bind = "0.0.0.0"
+# workers = 28
+status = 204
+# root = "/var/www/html"
+cpu_steer = false
+
+[tls]
+# cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+# key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+
+[stats]
+enabled = true
+path = "/stats"
+```
 
 ---
 
