@@ -5,9 +5,11 @@
 
 #define MAX_ROUTES 1024
 #define MAX_URI_LEN 256
+#define ROUTE_HASH_SIZE 2048   /* power of two, >= 2*MAX_ROUTES */
 
 typedef struct {
     char   path[MAX_URI_LEN];
+    size_t path_len;
     char  *response_buf;
     size_t response_len;
 } http_route_t;

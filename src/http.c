@@ -5,8 +5,27 @@
 static http_route_t routes[MAX_ROUTES];
 static int num_routes = 0;
 
+/* open addressing, linear probing; -1 = empty slot */
+static int route_index[ROUTE_HASH_SIZE];
+
 static char resp_404[512];
 static size_t resp_404_len = 0;
+
+static uint32_t path_hash(const char *s, size_t len) {
+    uint32_t h = 2166136261u;   /* fnv-1a */
+    for (size_t i = 0; i < len; i++) {
+        h ^= (uint8_t)s[i];
+        h *= 16777619u;
+    }
+    return h;
+}
+
+static void route_index_insert(int idx) {
+    uint32_t slot = path_hash(routes[idx].path, routes[idx].path_len) & (ROUTE_HASH_SIZE - 1);
+    while (route_index[slot] != -1)
+        slot = (slot + 1) & (ROUTE_HASH_SIZE - 1);
+    route_index[slot] = idx;
+}
 
 static const char *get_mime_type(const char *path) {
     const char *dot = strrchr(path, '.');
@@ -56,10 +75,11 @@ static int add_file_route(const char *rel_uri, const char *fs_path) {
     memcpy(full + hdr_len, body, (size_t)size);
     free(body);
 
-    strncpy(routes[num_routes].path, rel_uri, MAX_URI_LEN - 1);
-    routes[num_routes].path[MAX_URI_LEN - 1] = '\0';
+    str_copy(routes[num_routes].path, rel_uri, MAX_URI_LEN);
+    routes[num_routes].path_len = strlen(routes[num_routes].path);
     routes[num_routes].response_buf = full;
     routes[num_routes].response_len = total;
+    route_index_insert(num_routes);
     num_routes++;
     return 0;
 }
@@ -116,6 +136,8 @@ static void scan_directory(const char *base_dir, const char *sub_path) {
 }
 
 int http_init_routes(const char *root_dir) {
+    for (int i = 0; i < ROUTE_HASH_SIZE; i++) route_index[i] = -1;
+
     static const char body_404[] =
         "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
         "<body style=\"font-family:sans-serif;text-align:center;padding:50px\">"
@@ -143,14 +165,18 @@ void http_free_routes(void) {
         }
     }
     num_routes = 0;
+    for (int i = 0; i < ROUTE_HASH_SIZE; i++) route_index[i] = -1;
 }
 
 const http_route_t *http_find_route(const char *path, size_t path_len) {
     if (num_routes == 0) return NULL;
-    for (int i = 0; i < num_routes; i++) {
-        if (strncmp(routes[i].path, path, path_len) == 0 && routes[i].path[path_len] == '\0') {
-            return &routes[i];
-        }
+    uint32_t slot = path_hash(path, path_len) & (ROUTE_HASH_SIZE - 1);
+    for (int probe = 0; probe < ROUTE_HASH_SIZE; probe++) {
+        int idx = route_index[slot];
+        if (idx == -1) return NULL;
+        if (routes[idx].path_len == path_len && memcmp(routes[idx].path, path, path_len) == 0)
+            return &routes[idx];
+        slot = (slot + 1) & (ROUTE_HASH_SIZE - 1);
     }
     return NULL;
 }
