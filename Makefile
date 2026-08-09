@@ -40,6 +40,7 @@ certs:
 
 clean:
 	rm -f $(OBJS) $(TARGET) $(TEST_BINS) hello-server cert.pem key.pem
+	rm -rf tests/*.dSYM
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)

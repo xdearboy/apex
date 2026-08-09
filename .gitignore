@@ -3,6 +3,7 @@ tachyon
 hello-server
 tests/test_config
 tests/test_http
+*.dSYM/
 *.o
 *.so
 *.dylib
