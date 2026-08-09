@@ -82,7 +82,7 @@ typedef struct {
 
 extern tachyon_config_t g_config;
 
-/* Bounded string copy that always NUL-terminates (unlike strncpy). */
+/* strncpy не ставит \0 если строка впритык к буферу — свой копир, всегда терминирует */
 static inline void str_copy(char *dst, const char *src, size_t dst_size) {
     if (dst_size == 0) return;
     size_t i = 0;
