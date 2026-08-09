@@ -19,6 +19,17 @@ tachyon_config_t g_config = {
     .http_status = 204
 };
 
+static pid_t g_worker_pids[MAX_WORKERS];
+static volatile sig_atomic_t g_num_running = 0;
+
+/* kill workers on the way out so they don't outlive the master as orphans */
+static void handle_shutdown(int sig) {
+    (void)sig;
+    for (int i = 0; i < g_num_running; i++)
+        if (g_worker_pids[i] > 0) kill(g_worker_pids[i], SIGTERM);
+    _exit(0);
+}
+
 static void print_usage(const char *prog) {
     printf("tachyon v%s\n\n", TACHYON_VERSION);
     printf("Usage: %s [options]\n\n", prog);
@@ -40,7 +51,6 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
-    pid_t pids[MAX_WORKERS];
     int lfds[MAX_WORKERS];
     int cpus[MAX_WORKERS];
     const char *config_file = NULL;
@@ -179,10 +189,13 @@ int main(int argc, char *argv[]) {
             worker_run(lfds[i], cpus[i], i, conn_cap);
             _exit(0);
         }
-        pids[i] = pid;
+        g_worker_pids[i] = pid;
+        g_num_running = i + 1;
     }
 
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, handle_shutdown);
+    signal(SIGINT, handle_shutdown);
 
     for (;;) {
         int status;
@@ -192,13 +205,13 @@ int main(int argc, char *argv[]) {
             break;
         }
         for (int i = 0; i < num_workers; i++) {
-            if (pids[i] != dead) continue;
+            if (g_worker_pids[i] != dead) continue;
             pid_t pid = fork();
             if (pid == 0) {
                 worker_run(lfds[i], cpus[i], i, conn_cap);
                 _exit(0);
             }
-            pids[i] = pid;
+            g_worker_pids[i] = pid;
             fprintf(stderr, "[tachyon] worker %d (pid %d) died, respawned as pid %d\n", i, dead, pid);
             fflush(stderr);
         }

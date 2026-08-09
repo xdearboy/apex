@@ -49,8 +49,7 @@ typedef union epoll_data { void *ptr; int fd; uint32_t u32; uint64_t u64; } epol
 struct epoll_event { uint32_t events; epoll_data_t data; };
 static inline int epoll_create1(int flags) { (void)flags; return 0; }
 static inline int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) { (void)epfd; (void)op; (void)fd; (void)event; return 0; }
-/* нет epoll вне linux: сервер тут не работает, но заглушка должна спать,
-   а не крутить пустой цикл на 100% cpu, если бинарь всё же запустили */
+/* no epoll off linux; sleep the timeout instead of spinning at 100% cpu */
 static inline int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
     (void)epfd; (void)events; (void)maxevents;
     if (timeout > 0) usleep((useconds_t)timeout * 1000);
@@ -88,7 +87,6 @@ typedef struct {
 
 extern tachyon_config_t g_config;
 
-/* strncpy leaves dst unterminated when src fills the buffer; this one always terminates */
 static inline void str_copy(char *dst, const char *src, size_t dst_size) {
     if (dst_size == 0) return;
     size_t i = 0;
