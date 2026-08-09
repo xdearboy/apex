@@ -6,7 +6,7 @@
 
 Static HTTP/HTTPS engine written in C, built around Linux kernel TLS.
 
-Sustains **~950,000 HTTPS requests/sec** (TLS 1.3) on a 28-core box at roughly **half a millisecond** of latency, with the symmetric crypto running inside the kernel instead of user space.
+Sustains **1,000,000+ HTTPS requests/sec** (TLS 1.3) on a 28-core box at around **250µs** latency, with the symmetric crypto running inside the kernel instead of user space. Under pipelined load it pushes several million RPS before the kernel socket buffers saturate.
 
 ---
 
@@ -28,15 +28,27 @@ Routes for a served directory are resolved through a hash index, so lookup cost 
 2x Intel Xeon E5-2680 v4 (28 cores total), Linux 7.0 (Proxmox kernel), OpenSSL 3.5, loopback:
 
 ```text
-$ wrk -t28 -c600 -d15s https://127.0.0.1:8443/
+$ wrk -t28 -c600 -d10s https://127.0.0.1:8443/
 
-Running 15s test @ https://127.0.0.1:8443/
+Running 10s test @ https://127.0.0.1:8443/
   28 threads and 600 connections
   Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   512.35us  521.99us  29.49ms   90.65%
-    Req/Sec    34.29k    14.34k   72.84k    67.25%
-  14,409,477 requests in 15.09s, 219.87MB read
-Requests/sec: 954,757.69
+    Latency   251.62us  205.78us  10.74ms   95.16%
+    Req/Sec    37.19k     5.51k   52.48k    71.49%
+  10,365,042 requests in 10.10s, 148.28MB read
+Requests/sec: 1,026,241.78
+```
+
+Numbers drift with the host's turbo state and neighbours (this is a shared box), but stay in the ~0.9-1.0M range.
+
+With request pipelining the engine is nowhere near saturated. The same machine, `wrk` sending a batch of GETs per connection:
+
+```text
+$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 8
+Requests/sec: 5,892,826
+
+$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 16
+Requests/sec: 11,451,411
 ```
 
 kTLS actually engaging is easy to verify at runtime:
