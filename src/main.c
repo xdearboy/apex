@@ -61,9 +61,9 @@ int main(int argc, char *argv[]) {
 
     if (argc > 1 && argv[1][0] != '-') {
         if (argc > 1) g_config.port = atoi(argv[1]);
-        if (argc > 2) strncpy(g_config.bind_addr, argv[2], sizeof(g_config.bind_addr) - 1);
-        if (argc > 3) strncpy(g_config.cert_file, argv[3], sizeof(g_config.cert_file) - 1);
-        if (argc > 4) strncpy(g_config.key_file, argv[4], sizeof(g_config.key_file) - 1);
+        if (argc > 2) str_copy(g_config.bind_addr, argv[2], sizeof(g_config.bind_addr));
+        if (argc > 3) str_copy(g_config.cert_file, argv[3], sizeof(g_config.cert_file));
+        if (argc > 4) str_copy(g_config.key_file, argv[4], sizeof(g_config.key_file));
     } else {
         for (int i = 1; i < argc; i++) {
             if ((strcmp(argv[i], "-C") == 0 || strcmp(argv[i], "--config") == 0) && i + 1 < argc) {
@@ -71,13 +71,13 @@ int main(int argc, char *argv[]) {
             } else if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
                 g_config.port = atoi(argv[++i]);
             } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
-                strncpy(g_config.bind_addr, argv[++i], sizeof(g_config.bind_addr) - 1);
+                str_copy(g_config.bind_addr, argv[++i], sizeof(g_config.bind_addr));
             } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-                strncpy(g_config.cert_file, argv[++i], sizeof(g_config.cert_file) - 1);
+                str_copy(g_config.cert_file, argv[++i], sizeof(g_config.cert_file));
             } else if (strcmp(argv[i], "-k") == 0 && i + 1 < argc) {
-                strncpy(g_config.key_file, argv[++i], sizeof(g_config.key_file) - 1);
+                str_copy(g_config.key_file, argv[++i], sizeof(g_config.key_file));
             } else if ((strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--root") == 0) && i + 1 < argc) {
-                strncpy(g_config.root_dir, argv[++i], sizeof(g_config.root_dir) - 1);
+                str_copy(g_config.root_dir, argv[++i], sizeof(g_config.root_dir));
             } else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) {
                 g_config.num_workers = atoi(argv[++i]);
             } else if (strcmp(argv[i], "-s") == 0) {

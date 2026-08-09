@@ -82,4 +82,12 @@ typedef struct {
 
 extern tachyon_config_t g_config;
 
+/* Bounded string copy that always NUL-terminates (unlike strncpy). */
+static inline void str_copy(char *dst, const char *src, size_t dst_size) {
+    if (dst_size == 0) return;
+    size_t i = 0;
+    for (; i + 1 < dst_size && src[i]; i++) dst[i] = src[i];
+    dst[i] = '\0';
+}
+
 #endif /* TACHYON_H */
