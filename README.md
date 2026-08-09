@@ -1,5 +1,7 @@
 # tachyon
 
+> **English** · [Русский](README.ru.md)
+
 Ultra high-throughput static HTTP/HTTPS engine written in C with Linux kTLS.
 
 Sustains **1,000,000+ HTTPS RPS** (TLS 1.3) on a standard 28-core Linux server with **~250µs latency** and minimal RAM usage. Under pipelined bursts it can push up to ~5M RPS before saturating kernel socket buffers.
