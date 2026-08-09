@@ -6,11 +6,13 @@ on:
 
 jobs:
   build-test:
-    runs-on: ubuntu-latest
+    runs-on: tachyon-runners
+    container:
+      image: gcc:bookworm
     steps:
+      - name: deps
+        run: apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config
       - uses: actions/checkout@v4
-      - name: install deps
-        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
       - name: build
         run: make
       - name: unit tests
