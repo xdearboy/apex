@@ -84,6 +84,12 @@ static void close_conn(int epoll_fd, int fd, int conn_cap) {
     close(fd);
 }
 
+static void reset_conn(int epoll_fd, int fd, int conn_cap) {
+    struct linger lg = { .l_onoff = 1, .l_linger = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+    close_conn(epoll_fd, fd, conn_cap);
+}
+
 static int flush_conn(int epoll_fd, int fd, conn_t *c) {
     while (c->custom_len > 0) {
         size_t chunk = c->custom_len - c->custom_off;
@@ -229,7 +235,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
     int epoll_fd;
     struct epoll_event ev, *events;
     int max_fd_seen = 0;
-    time_t last_sweep;
+    time_t last_sweep, last_rps_sample;
     uint64_t local_requests = atomic_load_explicit(&worker_metrics[worker_id].published, memory_order_relaxed);
     uint64_t last_published = local_requests;
 
@@ -261,6 +267,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
 
     char buf[READ_BUF];
     last_sweep = time(NULL);
+    last_rps_sample = last_sweep;
 
     while (1) {
         int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
@@ -270,6 +277,11 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
         }
 
         time_t now = time(NULL);
+
+        if (now - last_rps_sample >= 1) {
+            last_rps_sample = now;
+            current_rps(total_requests());
+        }
 
         for (int i = 0; i < nfds; i++) {
             int fd = events[i].data.fd;
@@ -347,7 +359,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
             }
 
             if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
-                int nreq = 0, stats_request = 0, dead = 0;
+                int nreq = 0, stats_request = 0, reset_request = 0, dead = 0;
 
                 for (;;) {
                     ssize_t n;
@@ -375,7 +387,11 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                                     if (q) ulen = (size_t)(q - u);
 
                                     size_t stats_plen = strlen(g_config.stats_path);
-                                    if (g_config.enable_stats && stats_plen > 0 &&
+                                    size_t reset_plen = strlen(g_config.reset_path);
+                                    if (reset_plen > 0 && ulen == reset_plen &&
+                                        memcmp(u, g_config.reset_path, reset_plen) == 0) {
+                                        reset_request = 1;
+                                    } else if (g_config.enable_stats && stats_plen > 0 &&
                                         ulen == stats_plen && memcmp(u, g_config.stats_path, stats_plen) == 0) {
                                         stats_request = 1;
                                     } else {
@@ -422,6 +438,11 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                         c->pending += (size_t)nreq * g_resp_len;
                     c->last_active = now;
                     local_requests += (uint64_t)nreq;
+                }
+                if (reset_request) {
+                    ++local_requests;
+                    reset_conn(epoll_fd, fd, conn_cap);
+                    continue;
                 }
                 if (stats_request) {
                     ++local_requests;
