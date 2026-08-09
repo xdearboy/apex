@@ -441,6 +441,11 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 }
                 if (reset_request) {
                     ++local_requests;
+                    if (local_requests - last_published >= STATS_PUBLISH_EVERY) {
+                        atomic_store_explicit(&worker_metrics[worker_id].published,
+                                              local_requests, memory_order_relaxed);
+                        last_published = local_requests;
+                    }
                     reset_conn(epoll_fd, fd, conn_cap);
                     continue;
                 }

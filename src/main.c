@@ -13,6 +13,7 @@ tachyon_config_t g_config = {
     .key_file = "",
     .root_dir = "",
     .stats_path = DEFAULT_STATS_PATH,
+    .reset_path = "",
     .num_workers = 0,
     .enable_steer = 0,
     .enable_stats = 1,
@@ -46,6 +47,7 @@ static void print_usage(const char *prog) {
     printf("  --stats              Enable /stats endpoint (default: enabled)\n");
     printf("  --no-stats           Disable /stats endpoint\n");
     printf("  --stats-path <path>  Custom stats URL path (default: /stats)\n");
+    printf("  --reset-path <path>  Drop connections hitting this path with a TCP RST (444-style)\n");
     printf("  -v, --version        Show version\n");
     printf("  -h, --help           Show help\n\n");
 }
@@ -99,7 +101,9 @@ int main(int argc, char *argv[]) {
             } else if (strcmp(argv[i], "--no-stats") == 0) {
                 g_config.enable_stats = 0;
             } else if (strcmp(argv[i], "--stats-path") == 0 && i + 1 < argc) {
-                strncpy(g_config.stats_path, argv[++i], sizeof(g_config.stats_path) - 1);
+                str_copy(g_config.stats_path, argv[++i], sizeof(g_config.stats_path));
+            } else if (strcmp(argv[i], "--reset-path") == 0 && i + 1 < argc) {
+                str_copy(g_config.reset_path, argv[++i], sizeof(g_config.reset_path));
             } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--version") == 0) {
                 printf("tachyon v%s\n", TACHYON_VERSION);
                 return 0;
@@ -179,6 +183,8 @@ int main(int argc, char *argv[]) {
     else
         printf("  HTTP Response   : %d (%s)\n", g_config.http_status, g_config.http_status == 204 ? "No Content" : "OK");
     printf("  Live Stats      : %s (%s)\n", g_config.enable_stats ? "enabled" : "disabled", g_config.enable_stats ? g_config.stats_path : "none");
+    if (g_config.reset_path[0])
+        printf("  RST Path        : %s (444-style drop)\n", g_config.reset_path);
     printf("  Certificate     : %s\n", cfile ? cfile : "in-memory self-signed (ECDSA)");
     printf("===============================================================\n");
     fflush(stdout);

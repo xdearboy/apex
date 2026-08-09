@@ -79,6 +79,7 @@ typedef struct {
     char        key_file[256];
     char        root_dir[256];
     char        stats_path[64];
+    char        reset_path[64];
     int         num_workers;
     int         enable_steer;
     int         enable_stats;

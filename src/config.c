@@ -65,6 +65,7 @@ int config_load_file(const char *path, tachyon_config_t *cfg) {
             else if (strcasecmp(key, "status") == 0) cfg->http_status = atoi(val);
             else if (strcasecmp(key, "cpu_steer") == 0) cfg->enable_steer = parse_bool(val);
             else if (strcasecmp(key, "root") == 0) str_copy(cfg->root_dir, val, sizeof(cfg->root_dir));
+            else if (strcasecmp(key, "reset_path") == 0) str_copy(cfg->reset_path, val, sizeof(cfg->reset_path));
         }
 
         if (strcasecmp(section, "tls") == 0 || section[0] == '\0') {
