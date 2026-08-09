@@ -294,10 +294,6 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                     c->in_use = 1;
                     c->want_write = 0;
                     c->closing = 0;
-                    c->mstate = 0;
-                    c->uri_parsed = 0;
-                    c->uri_parsing = 0;
-                    c->uri_len = 0;
                     c->custom_buf = NULL;
                     c->custom_len = 0;
                     c->custom_off = 0;
@@ -361,46 +357,34 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                     }
 
                     if (n > 0) {
-                        uint8_t st = c->mstate;
-                        for (ssize_t k = 0; k < n; k++) {
-                            char ch = buf[k];
+                        char *ptr = buf;
+                        char *buf_end = buf + n;
 
-                            if (!c->uri_parsed) {
-                                if (!c->uri_parsing) {
-                                    if (ch == ' ' || ch == '/') {
-                                        c->uri_parsing = 1;
-                                        c->uri_len = 0;
-                                        if (ch == '/') c->uri[c->uri_len++] = '/';
-                                    }
-                                } else {
-                                    if (ch == ' ' || ch == '?' || ch == '\r' || ch == '\n') {
-                                        c->uri_parsed = 1;
-                                        c->uri[c->uri_len] = '\0';
-                                    } else if (c->uri_len < sizeof(c->uri) - 1) {
-                                        c->uri[c->uri_len++] = ch;
-                                    }
-                                }
-                            }
+                        while (ptr < buf_end) {
+                            char *eoh = memmem(ptr, (size_t)(buf_end - ptr), "\r\n\r\n", 4);
+                            if (!eoh) break;
 
-                            if (st == 0)      st = (ch == '\r') ? 1 : 0;
-                            else if (st == 1) st = (ch == '\n') ? 2 : (ch == '\r' ? 1 : 0);
-                            else if (st == 2) st = (ch == '\r') ? 3 : 0;
-                            else {
-                                if (ch == '\n') {
+                            if (ptr[0] == 'G' && ptr[1] == 'E' && ptr[2] == 'T' && ptr[3] == ' ') {
+                                char *u = ptr + 4;
+                                while (*u == ' ') u++;
+                                char *sp = memchr(u, ' ', (size_t)(eoh - u));
+                                if (sp) {
+                                    size_t ulen = (size_t)(sp - u);
+                                    char *q = memchr(u, '?', ulen);
+                                    if (q) ulen = (size_t)(q - u);
+
                                     size_t stats_plen = strlen(g_config.stats_path);
                                     if (g_config.enable_stats && stats_plen > 0 &&
-                                        c->uri_len >= stats_plen &&
-                                        strncmp(c->uri, g_config.stats_path, stats_plen) == 0 &&
-                                        (c->uri[stats_plen] == '\0' || c->uri[stats_plen] == '?')) {
+                                        ulen == stats_plen && memcmp(u, g_config.stats_path, stats_plen) == 0) {
                                         stats_request = 1;
                                     } else {
-                                        const http_route_t *route = http_find_route(c->uri, c->uri_len);
+                                        const http_route_t *route = http_find_route(u, ulen);
                                         if (route) {
                                             c->custom_buf = route->response_buf;
                                             c->custom_len = route->response_len;
                                             c->custom_off = 0;
                                             nreq++;
-                                        } else if (c->uri_len == 1 && c->uri[0] == '/' && !g_config.root_dir[0]) {
+                                        } else if (ulen == 1 && u[0] == '/' && !g_config.root_dir[0]) {
                                             nreq++;
                                         } else {
                                             size_t l404;
@@ -410,16 +394,10 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                                             nreq++;
                                         }
                                     }
-                                    c->uri_parsed = 0;
-                                    c->uri_parsing = 0;
-                                    c->uri_len = 0;
-                                    st = 0;
-                                } else {
-                                    st = (ch == '\r') ? 1 : 0;
                                 }
                             }
+                            ptr = eoh + 4;
                         }
-                        c->mstate = st;
 
                         if (!c->ktls_rx && SSL_pending(c->ssl) > 0) continue;
                         if ((size_t)n < sizeof(buf)) break;
