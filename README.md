@@ -1,10 +1,20 @@
+<div align="center">
+
 # tachyon
 
-> **English** · [Русский](README.ru.md)
+**Static HTTP/HTTPS engine in C, built around Linux kernel TLS.**
 
-![ci](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml/badge.svg)
+[![ci](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml/badge.svg)](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml)
+![C11](https://img.shields.io/badge/C-11-00599C)
+![Linux](https://img.shields.io/badge/platform-Linux-333)
+![TLS 1.3](https://img.shields.io/badge/TLS-1.3%20kTLS-3b7)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
-Static HTTP/HTTPS engine written in C, built around Linux kernel TLS.
+English · [Русский](README.ru.md)
+
+</div>
+
+---
 
 Sustains **1,000,000+ HTTPS requests/sec** (TLS 1.3) on a 28-core box at around **250µs** latency, with the symmetric crypto running inside the kernel instead of user space. Under pipelined load it pushes several million RPS before the kernel socket buffers saturate.
 
@@ -25,7 +35,18 @@ Routes for a served directory are resolved through a hash index, so lookup cost 
 
 ### Benchmark
 
-2x Intel Xeon E5-2680 v4 (28 cores total), Linux 7.0 (Proxmox kernel), OpenSSL 3.5, loopback:
+2x Intel Xeon E5-2680 v4 (28 cores total), Linux 7.0 (Proxmox kernel), OpenSSL 3.5, loopback.
+
+| Mode | Requests/sec | Latency (avg) |
+| --- | ---: | ---: |
+| Single request | **1,026,241** | 251µs |
+| Pipelined, depth 8 | 5,892,826 | — |
+| Pipelined, depth 16 | 11,451,411 | — |
+
+Numbers drift with the host's turbo state and neighbours (it's a shared box), but single-request stays in the ~0.9-1.0M range. Pipelined figures use [`scripts/pipeline.lua`](scripts/pipeline.lua).
+
+<details>
+<summary>raw <code>wrk</code> output</summary>
 
 ```text
 $ wrk -t28 -c600 -d10s https://127.0.0.1:8443/
@@ -37,19 +58,10 @@ Running 10s test @ https://127.0.0.1:8443/
     Req/Sec    37.19k     5.51k   52.48k    71.49%
   10,365,042 requests in 10.10s, 148.28MB read
 Requests/sec: 1,026,241.78
+Transfer/sec:     14.68MB
 ```
 
-Numbers drift with the host's turbo state and neighbours (this is a shared box), but stay in the ~0.9-1.0M range.
-
-With request pipelining the engine is nowhere near saturated. The same machine, `wrk` sending a batch of GETs per connection:
-
-```text
-$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 8
-Requests/sec: 5,892,826
-
-$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 16
-Requests/sec: 11,451,411
-```
+</details>
 
 kTLS actually engaging is easy to verify at runtime:
 
@@ -67,19 +79,9 @@ Needs GCC or Clang and OpenSSL 3.0+:
 ```bash
 git clone https://github.com/xdearboy/tachyon.git
 cd tachyon
-make
-```
-
-Self-signed certs for local testing:
-
-```bash
-make certs
-```
-
-Run the unit tests:
-
-```bash
-make test
+make          # build
+make certs    # self-signed certs for local testing
+make test     # unit tests
 ```
 
 ---
@@ -97,17 +99,18 @@ make test
 ./tachyon -p 8443 -c cert.pem -k key.pem -d /var/www/html
 ```
 
-#### CLI options
-* `-C, --config <file>` — TOML config file
-* `-p <port>` — listening port (default `8443`)
-* `-b <addr>` — bind address (default `0.0.0.0`)
-* `-c <cert.pem>` / `-k <key.pem>` — TLS cert and key
-* `-d, --root <dir>` — serve static files from a directory
-* `-w <num>` — worker count (default: CPU cores)
-* `-s` — enable BPF CPU steering
-* `--status <204|200>` — response code for the empty route (default `204`)
-* `--stats` / `--no-stats` — toggle the `/stats` endpoint
-* `--stats-path <path>` — custom stats path (default `/stats`)
+| Flag | Meaning |
+| --- | --- |
+| `-C, --config <file>` | TOML config file |
+| `-p <port>` | listening port (default `8443`) |
+| `-b <addr>` | bind address (default `0.0.0.0`) |
+| `-c` / `-k` | TLS cert and key |
+| `-d, --root <dir>` | serve static files from a directory |
+| `-w <num>` | worker count (default: CPU cores) |
+| `-s` | enable BPF CPU steering |
+| `--status <204\|200>` | response code for the empty route (default `204`) |
+| `--stats` / `--no-stats` | toggle the `/stats` endpoint |
+| `--stats-path <path>` | custom stats path (default `/stats`) |
 
 ---
 

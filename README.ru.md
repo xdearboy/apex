@@ -1,10 +1,20 @@
+<div align="center">
+
 # tachyon
 
-> [English](README.md) · **Русский**
+**Статический HTTP/HTTPS-движок на C, построенный вокруг Linux kernel TLS.**
 
-![ci](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml/badge.svg)
+[![ci](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml/badge.svg)](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml)
+![C11](https://img.shields.io/badge/C-11-00599C)
+![Linux](https://img.shields.io/badge/platform-Linux-333)
+![TLS 1.3](https://img.shields.io/badge/TLS-1.3%20kTLS-3b7)
+![license](https://img.shields.io/badge/license-MIT-blue)
 
-Статический HTTP/HTTPS-движок на C, построенный вокруг Linux kernel TLS.
+[English](README.md) · Русский
+
+</div>
+
+---
 
 Держит **1 000 000+ HTTPS-запросов/сек** (TLS 1.3) на 28-ядерной машине при латентности около **250µs**, а симметричное шифрование считается в ядре, а не в user space. Под пайплайн-нагрузкой проталкивает несколько миллионов RPS, пока не упрётся в сокет-буферы ядра.
 
@@ -25,7 +35,18 @@
 
 ### Бенчмарк
 
-2x Intel Xeon E5-2680 v4 (28 ядер), Linux 7.0 (ядро Proxmox), OpenSSL 3.5, loopback:
+2x Intel Xeon E5-2680 v4 (28 ядер), Linux 7.0 (ядро Proxmox), OpenSSL 3.5, loopback.
+
+| Режим | Requests/sec | Латентность (avg) |
+| --- | ---: | ---: |
+| Одиночный запрос | **1 026 241** | 251µs |
+| Пайплайн, глубина 8 | 5 892 826 | — |
+| Пайплайн, глубина 16 | 11 451 411 | — |
+
+Цифры плавают в зависимости от турбо-состояния хоста и соседей (машина шаренная), но одиночный запрос держится в районе ~0.9–1.0M. Пайплайн-цифры сняты через [`scripts/pipeline.lua`](scripts/pipeline.lua).
+
+<details>
+<summary>сырой вывод <code>wrk</code></summary>
 
 ```text
 $ wrk -t28 -c600 -d10s https://127.0.0.1:8443/
@@ -37,19 +58,10 @@ Running 10s test @ https://127.0.0.1:8443/
     Req/Sec    37.19k     5.51k   52.48k    71.49%
   10,365,042 requests in 10.10s, 148.28MB read
 Requests/sec: 1,026,241.78
+Transfer/sec:     14.68MB
 ```
 
-Цифры плавают в зависимости от турбо-состояния хоста и соседей (машина шаренная), но держатся в районе ~0.9–1.0M.
-
-С пайплайном движок далёк от насыщения. Та же машина, `wrk` шлёт пачку GET-ов на соединение:
-
-```text
-$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 8
-Requests/sec: 5,892,826
-
-$ wrk -t28 -c600 -d10s -s pipeline.lua https://127.0.0.1:8443/ -- 16
-Requests/sec: 11,451,411
-```
+</details>
 
 Что kTLS реально включился, проверяется на лету:
 
@@ -67,19 +79,9 @@ $ curl -k -s https://127.0.0.1:8443/stats
 ```bash
 git clone https://github.com/xdearboy/tachyon.git
 cd tachyon
-make
-```
-
-Self-signed серты для локальных тестов:
-
-```bash
-make certs
-```
-
-Запуск юнит-тестов:
-
-```bash
-make test
+make          # сборка
+make certs    # self-signed серты для локальных тестов
+make test     # юнит-тесты
 ```
 
 ---
@@ -97,17 +99,18 @@ make test
 ./tachyon -p 8443 -c cert.pem -k key.pem -d /var/www/html
 ```
 
-#### Опции CLI
-* `-C, --config <file>` — TOML-конфиг
-* `-p <port>` — порт (по умолчанию `8443`)
-* `-b <addr>` — адрес привязки (по умолчанию `0.0.0.0`)
-* `-c <cert.pem>` / `-k <key.pem>` — TLS-серт и ключ
-* `-d, --root <dir>` — отдавать статику из директории
-* `-w <num>` — число воркеров (по умолчанию: число ядер)
-* `-s` — включить BPF CPU-стиринг
-* `--status <204|200>` — код ответа для пустого роута (по умолчанию `204`)
-* `--stats` / `--no-stats` — переключить эндпоинт `/stats`
-* `--stats-path <path>` — свой путь для статы (по умолчанию `/stats`)
+| Флаг | Значение |
+| --- | --- |
+| `-C, --config <file>` | TOML-конфиг |
+| `-p <port>` | порт (по умолчанию `8443`) |
+| `-b <addr>` | адрес привязки (по умолчанию `0.0.0.0`) |
+| `-c` / `-k` | TLS-серт и ключ |
+| `-d, --root <dir>` | отдавать статику из директории |
+| `-w <num>` | число воркеров (по умолчанию: число ядер) |
+| `-s` | включить BPF CPU-стиринг |
+| `--status <204\|200>` | код ответа для пустого роута (по умолчанию `204`) |
+| `--stats` / `--no-stats` | переключить эндпоинт `/stats` |
+| `--stats-path <path>` | свой путь для статы (по умолчанию `/stats`) |
 
 ---
 
