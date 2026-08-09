@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <string.h>
 #include "test.h"
 #include "../src/config.c"

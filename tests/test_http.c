@@ -1,3 +1,4 @@
+#define _GNU_SOURCE   /* memmem is glibc-gated; must come before <string.h> */
 #include <string.h>
 #include <sys/stat.h>
 #include "test.h"
