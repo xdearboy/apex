@@ -82,7 +82,7 @@ typedef struct {
 
 extern tachyon_config_t g_config;
 
-/* strncpy leaves dst unterminated when src fills the buffer — this one always terminates */
+/* strncpy leaves dst unterminated when src fills the buffer; this one always terminates */
 static inline void str_copy(char *dst, const char *src, size_t dst_size) {
     if (dst_size == 0) return;
     size_t i = 0;
