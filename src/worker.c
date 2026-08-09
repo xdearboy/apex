@@ -64,6 +64,7 @@ static void send_stats(int fd, conn_t *c, uint64_t local_requests, int worker_id
         body_len, body);
 
     if (len > 0 && (size_t)len < sizeof(response)) {
+        /* todo: ignores short writes; ok for now since the payload is tiny and we close right after */
         if (c->ktls_tx)
             (void)send(fd, response, (size_t)len, MSG_NOSIGNAL);
         else if (c->ssl)

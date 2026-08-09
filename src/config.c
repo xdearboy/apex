@@ -49,6 +49,7 @@ int config_load_file(const char *path, tachyon_config_t *cfg) {
         char *key = trim(p);
         char *val = trim(eq + 1);
 
+        /* todo: this strips '#' even inside quotes; fine until a value needs a literal one */
         char *comment = strchr(val, '#');
         if (comment) {
             *comment = '\0';

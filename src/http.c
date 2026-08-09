@@ -71,6 +71,7 @@ static int add_file_route(const char *rel_uri, const char *fs_path) {
         "Connection: keep-alive\r\n\r\n",
         mime, size);
 
+    /* todo: mmap the file and writev the header instead of buffering the whole body twice */
     size_t total = (size_t)hdr_len + (size_t)size;
     char *full = malloc(total);
     if (!full) { free(body); return -1; }
