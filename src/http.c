@@ -52,7 +52,12 @@ static int add_file_route(const char *rel_uri, const char *fs_path) {
     fseek(f, 0, SEEK_END);
     long size = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (size < 0 || size > 16777216) { fclose(f); return -1; }
+    if (size < 0) { fclose(f); return -1; }
+    if ((size_t)size > MAX_STATIC_FILE) {
+        fprintf(stderr, "[tachyon] skipping %s: %ld bytes over %u limit\n", fs_path, size, MAX_STATIC_FILE);
+        fclose(f);
+        return -1;
+    }
 
     char *body = NULL;
     if (size > 0) {
@@ -106,7 +111,8 @@ static void scan_directory(const char *base_dir, const char *sub_path) {
         snprintf(fs_path, sizeof(fs_path), "%s/%s", full_dir, ent->d_name);
 
         struct stat st;
-        if (stat(fs_path, &st) < 0) continue;
+        if (lstat(fs_path, &st) < 0) continue;
+        if (S_ISLNK(st.st_mode)) continue;   /* don't follow symlinks out of the root */
 
         if (S_ISDIR(st.st_mode)) {
             char new_sub[512];

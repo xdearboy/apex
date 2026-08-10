@@ -6,6 +6,7 @@
 #define MAX_ROUTES 1024
 #define MAX_URI_LEN 256
 #define ROUTE_HASH_SIZE 2048   /* power of two, >= 2*MAX_ROUTES */
+#define MAX_STATIC_FILE (128u * 1024 * 1024)
 
 typedef struct {
     char   path[MAX_URI_LEN];
