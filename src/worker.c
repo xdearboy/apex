@@ -84,6 +84,11 @@ static void close_conn(int epoll_fd, int fd, int conn_cap) {
             conns[fd].frag = NULL;
         }
         conns[fd].fraglen = 0;
+        if (conns[fd].out) {
+            free(conns[fd].out);
+            conns[fd].out = NULL;
+        }
+        conns[fd].out_len = conns[fd].out_off = conns[fd].out_cap = 0;
         conns[fd].in_use = 0;
     }
     close(fd);
@@ -95,22 +100,36 @@ static void reset_conn(int epoll_fd, int fd, int conn_cap) {
     close_conn(epoll_fd, fd, conn_cap);
 }
 
+/* append a full response to the connection's ordered output buffer */
+static int conn_append(conn_t *c, const char *data, size_t len) {
+    if (c->out_len + len > c->out_cap) {
+        size_t ncap = c->out_cap ? c->out_cap : 8192;
+        while (ncap < c->out_len + len) ncap *= 2;
+        char *nb = realloc(c->out, ncap);
+        if (!nb) return -1;
+        c->out = nb;
+        c->out_cap = ncap;
+    }
+    memcpy(c->out + c->out_len, data, len);
+    c->out_len += len;
+    return 0;
+}
+
 static int flush_conn(int epoll_fd, int fd, conn_t *c) {
-    while (c->custom_len > 0) {
-        size_t chunk = c->custom_len - c->custom_off;
+    while (c->out_off < c->out_len) {
+        size_t chunk = c->out_len - c->out_off;
         ssize_t w;
         if (c->ktls_tx) {
-            w = send(fd, c->custom_buf + c->custom_off, chunk, MSG_NOSIGNAL);
+            w = send(fd, c->out + c->out_off, chunk, MSG_NOSIGNAL);
         } else {
-            w = SSL_write(c->ssl, c->custom_buf + c->custom_off, (int)chunk);
+            w = SSL_write(c->ssl, c->out + c->out_off, (int)chunk);
         }
 
         if (w > 0) {
-            c->custom_off += (size_t)w;
-            if (c->custom_off >= c->custom_len) {
-                c->custom_len = 0;
-                c->custom_off = 0;
-                c->custom_buf = NULL;
+            c->out_off += (size_t)w;
+            if (c->out_off >= c->out_len) {
+                c->out_len = 0;
+                c->out_off = 0;
             }
             continue;
         }
@@ -312,9 +331,8 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                     c->in_use = 1;
                     c->want_write = 0;
                     c->closing = 0;
-                    c->custom_buf = NULL;
-                    c->custom_len = 0;
-                    c->custom_off = 0;
+                    c->out_len = 0;
+                    c->out_off = 0;
                     c->frag = NULL;
                     c->fraglen = 0;
                     c->pending = 0;
@@ -366,7 +384,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
             }
 
             if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
-                int nreq = 0, stats_request = 0, reset_request = 0, dead = 0;
+                int nreq = 0, n204 = 0, stats_request = 0, reset_request = 0, dead = 0;
 
                 for (;;) {
                     size_t base = c->fraglen;
@@ -407,17 +425,15 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                                     } else {
                                         const http_route_t *route = http_find_route(u, ulen);
                                         if (route) {
-                                            c->custom_buf = route->response_buf;
-                                            c->custom_len = route->response_len;
-                                            c->custom_off = 0;
+                                            if (conn_append(c, route->response_buf, route->response_len) < 0) dead = 1;
                                             nreq++;
                                         } else if (ulen == 1 && u[0] == '/' && !g_config.root_dir[0]) {
+                                            n204++;
                                             nreq++;
                                         } else {
                                             size_t l404;
-                                            c->custom_buf = http_get_404_response(&l404);
-                                            c->custom_len = l404;
-                                            c->custom_off = 0;
+                                            const char *r404 = http_get_404_response(&l404);
+                                            if (conn_append(c, r404, l404) < 0) dead = 1;
                                             nreq++;
                                         }
                                     }
@@ -463,8 +479,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 }
 
                 if (nreq > 0) {
-                    if (c->custom_len == 0)
-                        c->pending += (size_t)nreq * g_resp_len;
+                    c->pending += (size_t)n204 * g_resp_len;
                     c->last_active = now;
                     local_requests += (uint64_t)nreq;
                 }
@@ -491,7 +506,7 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 }
                 if (!dead && flush_conn(epoll_fd, fd, c) < 0) dead = 1;
 
-                if (dead || (c->closing && c->pending == 0 && c->custom_len == 0)) {
+                if (dead || (c->closing && c->pending == 0 && c->out_len == 0)) {
                     close_conn(epoll_fd, fd, conn_cap);
                     continue;
                 }

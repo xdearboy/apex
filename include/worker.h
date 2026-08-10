@@ -13,9 +13,10 @@ typedef struct {
     time_t  last_active;
     size_t  pending;
     size_t  off;
-    const char *custom_buf;
-    size_t  custom_len;
-    size_t  custom_off;
+    char   *out;         /* accumulated custom response bytes, in request order */
+    size_t  out_len;
+    size_t  out_off;
+    size_t  out_cap;
     char   *frag;        /* carried-over partial request between reads (lazy) */
     size_t  fraglen;
     SSL     *ssl;
