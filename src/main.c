@@ -55,6 +55,8 @@ static void print_usage(const char *prog) {
 int main(int argc, char *argv[]) {
     int lfds[MAX_WORKERS];
     int cpus[MAX_WORKERS];
+    time_t started[MAX_WORKERS] = {0};
+    int fastfails[MAX_WORKERS] = {0};
     const char *config_file = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -196,6 +198,7 @@ int main(int argc, char *argv[]) {
             _exit(0);
         }
         g_worker_pids[i] = pid;
+        started[i] = time(NULL);
         g_num_running = i + 1;
     }
 
@@ -212,12 +215,27 @@ int main(int argc, char *argv[]) {
         }
         for (int i = 0; i < num_workers; i++) {
             if (g_worker_pids[i] != dead) continue;
+
+            /* back off a crash-looping worker so a broken one can't fork-storm the box */
+            if (time(NULL) - started[i] < 5) {
+                if (fastfails[i] < 6) fastfails[i]++;
+            } else {
+                fastfails[i] = 0;
+            }
+            if (fastfails[i] >= 2) {
+                unsigned backoff = fastfails[i] >= 5 ? 30u : (1u << fastfails[i]);
+                fprintf(stderr, "[tachyon] worker %d keeps dying fast, backing off %us\n", i, backoff);
+                fflush(stderr);
+                sleep(backoff);
+            }
+
             pid_t pid = fork();
             if (pid == 0) {
                 worker_run(lfds[i], cpus[i], i, conn_cap);
                 _exit(0);
             }
             g_worker_pids[i] = pid;
+            started[i] = time(NULL);
             fprintf(stderr, "[tachyon] worker %d (pid %d) died, respawned as pid %d\n", i, dead, pid);
             fflush(stderr);
         }
