@@ -79,6 +79,11 @@ static void close_conn(int epoll_fd, int fd, int conn_cap) {
             SSL_free(conns[fd].ssl);
             conns[fd].ssl = NULL;
         }
+        if (conns[fd].frag) {
+            free(conns[fd].frag);
+            conns[fd].frag = NULL;
+        }
+        conns[fd].fraglen = 0;
         conns[fd].in_use = 0;
     }
     close(fd);
@@ -310,6 +315,8 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                     c->custom_buf = NULL;
                     c->custom_len = 0;
                     c->custom_off = 0;
+                    c->frag = NULL;
+                    c->fraglen = 0;
                     c->pending = 0;
                     c->off = 0;
                     c->handshake_done = 0;
@@ -362,16 +369,19 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                 int nreq = 0, stats_request = 0, reset_request = 0, dead = 0;
 
                 for (;;) {
+                    size_t base = c->fraglen;
+                    if (base) memcpy(buf, c->frag, base);
+
                     ssize_t n;
                     if (c->ktls_rx) {
-                        n = read(fd, buf, sizeof(buf));
+                        n = read(fd, buf + base, sizeof(buf) - base);
                     } else {
-                        n = SSL_read(c->ssl, buf, sizeof(buf));
+                        n = SSL_read(c->ssl, buf + base, (int)(sizeof(buf) - base));
                     }
 
                     if (n > 0) {
                         char *ptr = buf;
-                        char *buf_end = buf + n;
+                        char *buf_end = buf + base + (size_t)n;
 
                         while (ptr < buf_end) {
                             char *eoh = memmem(ptr, (size_t)(buf_end - ptr), "\r\n\r\n", 4);
@@ -412,12 +422,31 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
                                         }
                                     }
                                 }
+                            } else {
+                                /* not a GET: refuse instead of parsing the body as pipelined requests */
+                                dead = 1;
+                                break;
                             }
                             ptr = eoh + 4;
                         }
 
+                        /* carry an incomplete tail over to the next read so split requests aren't lost */
+                        if (!dead) {
+                            size_t tail = (size_t)(buf_end - ptr);
+                            if (tail >= sizeof(buf)) {
+                                dead = 1;               /* one request larger than the buffer */
+                            } else if (tail > 0) {
+                                if (!c->frag) c->frag = malloc(sizeof(buf));
+                                if (!c->frag) dead = 1;
+                                else { memcpy(c->frag, ptr, tail); c->fraglen = tail; }
+                            } else {
+                                c->fraglen = 0;
+                            }
+                        }
+                        if (dead) break;
+
                         if (!c->ktls_rx && SSL_pending(c->ssl) > 0) continue;
-                        if ((size_t)n < sizeof(buf)) break;
+                        if (base + (size_t)n < sizeof(buf)) break;
                         continue;
                     }
 

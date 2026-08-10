@@ -16,6 +16,8 @@ typedef struct {
     const char *custom_buf;
     size_t  custom_len;
     size_t  custom_off;
+    char   *frag;        /* carried-over partial request between reads (lazy) */
+    size_t  fraglen;
     SSL     *ssl;
 } conn_t;
 
