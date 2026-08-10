@@ -70,6 +70,8 @@ static inline int epoll_wait(int epfd, struct epoll_event *events, int maxevents
 #define READ_BUF             16384
 #define BATCH_COPIES         256
 #define IDLE_TIMEOUT         60
+#define HANDSHAKE_TIMEOUT    10
+#define SWEEP_INTERVAL       5
 #define STATS_PUBLISH_EVERY  64
 
 typedef struct {

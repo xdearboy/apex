@@ -469,12 +469,18 @@ void worker_run(int listen_fd, int cpu, int worker_id, int conn_cap) {
             }
         }
 
-        if (now - last_sweep >= IDLE_TIMEOUT) {
+        if (now - last_sweep >= SWEEP_INTERVAL) {
             last_sweep = now;
             for (int fd = 0; fd <= max_fd_seen; fd++) {
-                if (!conns[fd].in_use) continue;
-                if (now - conns[fd].last_active > IDLE_TIMEOUT)
+                conn_t *cc = &conns[fd];
+                if (!cc->in_use) continue;
+                time_t idle = now - cc->last_active;
+                /* stalled TLS handshake (slowloris) gets a much shorter leash than idle keep-alive */
+                if (!cc->handshake_done) {
+                    if (idle > HANDSHAKE_TIMEOUT) close_conn(epoll_fd, fd, conn_cap);
+                } else if (idle > IDLE_TIMEOUT) {
                     close_conn(epoll_fd, fd, conn_cap);
+                }
             }
         }
     }
