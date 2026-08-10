@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.1.0]
+
+### Added
+- `--reset-path` / `[server] reset_path`: connections hitting the given path are dropped with a TCP RST and no response, nginx `return 444` style. Off by default.
+
+### Changed
+- Peak RPS is sampled every second from the worker loop instead of only when `/stats` is polled, so it reflects real spikes.
+
+### Security / Fixed
+- Buffer incomplete requests across reads; a request split over multiple TCP segments is no longer lost (and no longer hangs the connection).
+- Refuse non-GET request lines instead of walking into the body, closing off HTTP request smuggling.
+- Accumulate pipelined responses in order so none are dropped when several arrive in one packet.
+- Do not follow symlinks when indexing the static root, preventing reads outside it (e.g. a link to /etc/passwd) and symlink-loop recursion.
+- Reap stalled TLS handshakes on a 10s deadline with a 5s sweep, blunting slowloris.
+- Back off crash-looping workers (up to 30s) instead of respawning in a tight fork loop.
+- Serve static files up to 128MB and log skips instead of silently returning 404.
+
 ## [1.0.1]
 
 ### Added
