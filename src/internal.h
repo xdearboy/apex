@@ -35,6 +35,7 @@ typedef struct conn {
     uint32_t wlen;
     uint32_t woff;
     uint8_t close_after_write;
+    uint8_t epollout_active;
     char rbuf[BUF_SIZE];
     char wbuf[BUF_SIZE];
 } conn_t;

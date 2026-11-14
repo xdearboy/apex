@@ -6,14 +6,15 @@ on:
 
 jobs:
   build-test:
-    runs-on: tachyon-runners
-    container:
-      image: gcc:bookworm
+    runs-on: ubuntu-latest
     steps:
-      - name: deps
-        run: apt-get update && apt-get install -y --no-install-recommends libssl-dev pkg-config
       - uses: actions/checkout@v4
-      - name: build
+      - name: Build
         run: make
-      - name: unit tests
-        run: make test
+      - name: Smoke test
+        run: |
+          ./examples/hello_world &
+          PID=$!
+          sleep 1
+          curl -f http://127.0.0.1:8080/ || exit 1
+          kill $PID

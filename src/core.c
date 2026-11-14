@@ -16,6 +16,7 @@ static inline void close_conn(int epfd, conn_t *c) {
         c->wlen = 0;
         c->woff = 0;
         c->close_after_write = 0;
+        c->epollout_active = 0;
     }
 }
 
@@ -43,14 +44,21 @@ static inline void flush_write(int epfd, conn_t *c) {
         return;
     }
 
-    struct epoll_event ev;
     if (c->wlen > c->woff) {
-        ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
-    } else {
+        if (!c->epollout_active) {
+            struct epoll_event ev;
+            ev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+            ev.data.fd = c->fd;
+            epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+            c->epollout_active = 1;
+        }
+    } else if (c->epollout_active) {
+        struct epoll_event ev;
         ev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+        ev.data.fd = c->fd;
+        epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
+        c->epollout_active = 0;
     }
-    ev.data.fd = c->fd;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, c->fd, &ev);
 }
 
 static void *worker_main(void *arg) {
@@ -162,6 +170,7 @@ static void *worker_main(void *arg) {
 
                     int one = 1;
                     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 
                     conn_t *c = &conns[cfd];
                     c->fd = cfd;
@@ -169,6 +178,7 @@ static void *worker_main(void *arg) {
                     c->wlen = 0;
                     c->woff = 0;
                     c->close_after_write = 0;
+                    c->epollout_active = 0;
 
                     struct epoll_event cev;
                     cev.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
@@ -193,6 +203,9 @@ static void *worker_main(void *arg) {
                     ssize_t n = recv(c->fd, c->rbuf + c->rlen, sizeof(c->rbuf) - c->rlen, 0);
                     if (n > 0) {
                         c->rlen += (uint32_t)n;
+                        if (memmem(c->rbuf, c->rlen, "\r\n\r\n", 4)) {
+                            break;
+                        }
                     } else if (n == 0) {
                         close_conn(epfd, c);
                         goto next_event;
