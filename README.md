@@ -1,149 +1,48 @@
-<div align="center">
+# Apex
 
-# tachyon
+Apex is an ultra-high-performance, zero-allocation web micro-framework for Linux written in modern C.
 
-**Static HTTP/HTTPS engine in C, built around Linux kernel TLS.**
+Designed for extreme throughput and sub-millisecond tail latency, Apex utilizes a lock-free thread-per-core architecture, edge-triggered epoll, kernel connection load balancing, and direct vector response streaming.
 
-[![ci](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml/badge.svg)](https://github.com/xdearboy/tachyon/actions/workflows/ci.yml)
-![C11](https://img.shields.io/badge/C-11-00599C)
-![Linux](https://img.shields.io/badge/platform-Linux-333)
-![TLS 1.3](https://img.shields.io/badge/TLS-1.3%20kTLS-3b7)
-![license](https://img.shields.io/badge/license-MIT-blue)
+## Features
 
-English · [Русский](README.ru.md)
+- **Thread-per-Core Architecture**: Automatically spawns dedicated worker threads pinned to CPU cores (`pthread_setaffinity_np`) to eliminate context switches and cross-core cache invalidation.
+- **Kernel Load Balancing (`SO_REUSEPORT`)**: Independent listening sockets per thread with kernel 4-tuple connection hashing, `TCP_DEFER_ACCEPT`, and `TCP_NODELAY`.
+- **Edge-Triggered Epoll (`EPOLLET`)**: Non-blocking event loop using `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)`.
+- **Zero-Allocation Hot Path**: Pre-allocated connection state indexed by file descriptor; zero dynamic heap allocations per request.
+- **HTTP Pipelining**: Drains and batches pipelined requests in a single read/write syscall cycle.
+- **Microsecond Precision**: Microsecond-resolution timer heap with sub-millisecond polling accuracy.
 
-</div>
+## Quick Start
 
----
+```c
+#include "apex.h"
 
-Sustains **1,000,000+ HTTPS requests/sec** (TLS 1.3) on a 28-core box at around **250µs** latency, with the symmetric crypto running inside the kernel instead of user space. Under pipelined load it pushes several million RPS before the kernel socket buffers saturate.
+static void handle_root(apex_req_t *req, apex_res_t *res) {
+    (void)req;
+    static const char body[] = "Hello from Apex!";
+    apex_res_send(res, 200, body, sizeof(body) - 1);
+}
 
----
+static void handle_user(apex_req_t *req, apex_res_t *res) {
+    apex_res_send(res, 200, req->param, req->param_len);
+}
 
-### Why it's fast
-
-A normal HTTPS server burns most of its CPU shuffling bytes between user-space buffers and the TLS library. tachyon skips that work:
-
-* **Kernel TLS.** OpenSSL only does the TLS 1.3 handshake. Once keys are set, `AES-128-GCM` is handed to the kernel (`TCP_ULP` / `SOL_TLS`) and encrypted with AES-NI, so response data never gets copied through user space.
-* **Pre-rendered batches.** Static responses are built once into contiguous buffers and written back to back.
-* **BPF CPU steering.** A `SO_ATTACH_REUSEPORT_CBPF` filter pins each connection to the worker already running on that core, so a request is handled where it landed.
-* **Lock-free metrics.** Request counters live in shared memory (`mmap`) and move with plain atomics, no mutexes on the hot path.
-
-Routes for a served directory are resolved through a hash index, so lookup cost does not grow with the number of files.
-
----
-
-### Benchmark
-
-2x Intel Xeon E5-2680 v4 (28 cores total), Linux 7.0 (Proxmox kernel), OpenSSL 3.5, loopback.
-
-| Mode | Requests/sec | Latency (avg) |
-| --- | ---: | ---: |
-| Single request | **1,026,241** | 251µs |
-| Pipelined, depth 8 | 5,892,826 | — |
-| Pipelined, depth 16 | 11,451,411 | — |
-
-Numbers drift with the host's turbo state and neighbours (it's a shared box), but single-request stays in the ~0.9-1.0M range. Pipelined figures use [`scripts/pipeline.lua`](scripts/pipeline.lua).
-
-<details>
-<summary>raw <code>wrk</code> output</summary>
-
-```text
-$ wrk -t28 -c600 -d10s https://127.0.0.1:8443/
-
-Running 10s test @ https://127.0.0.1:8443/
-  28 threads and 600 connections
-  Thread Stats   Avg      Stdev     Max   +/- Stdev
-    Latency   251.62us  205.78us  10.74ms   95.16%
-    Req/Sec    37.19k     5.51k   52.48k    71.49%
-  10,365,042 requests in 10.10s, 148.28MB read
-Requests/sec: 1,026,241.78
-Transfer/sec:     14.68MB
+int main(void) {
+    apex_app_t *app = apex_create();
+    apex_get(app, "/", handle_root);
+    apex_get(app, "/user/:id", handle_user);
+    return apex_run(app, 3000);
+}
 ```
 
-</details>
-
-kTLS actually engaging is easy to verify at runtime:
+## Building
 
 ```bash
-$ curl -k -s https://127.0.0.1:8443/stats
-{ "ktls_tx": true, "ktls_rx": true, "cipher": "TLS_AES_128_GCM_SHA256 (TLS 1.3)", ... }
+make
+./examples/web_frameworks
 ```
 
----
+## License
 
-### Building
-
-Needs GCC or Clang and OpenSSL 3.0+:
-
-```bash
-git clone https://github.com/xdearboy/tachyon.git
-cd tachyon
-make          # build
-make certs    # self-signed certs for local testing
-make test     # unit tests
-```
-
----
-
-### Usage
-
-```bash
-# TOML config:
-./tachyon -C tachyon.toml
-
-# or plain flags:
-./tachyon -p 443 -b 0.0.0.0 -c /path/to/cert.pem -k /path/to/key.pem
-
-# serve a static directory:
-./tachyon -p 8443 -c cert.pem -k key.pem -d /var/www/html
-```
-
-| Flag | Meaning |
-| --- | --- |
-| `-C, --config <file>` | TOML config file |
-| `-p <port>` | listening port (default `8443`) |
-| `-b <addr>` | bind address (default `0.0.0.0`) |
-| `-c` / `-k` | TLS cert and key |
-| `-d, --root <dir>` | serve static files from a directory |
-| `-w <num>` | worker count (default: CPU cores) |
-| `-s` | enable BPF CPU steering |
-| `--status <204\|200>` | response code for the empty route (default `204`) |
-| `--stats` / `--no-stats` | toggle the `/stats` endpoint |
-| `--stats-path <path>` | custom stats path (default `/stats`) |
-
----
-
-### Configuration (`tachyon.toml`)
-
-```toml
-[server]
-port = 443
-bind = "0.0.0.0"
-# workers = 28
-status = 204
-# root = "/var/www/html"
-cpu_steer = true
-
-[tls]
-cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
-key  = "/etc/letsencrypt/live/example.com/privkey.pem"
-
-[stats]
-enabled = true
-path = "/stats"
-```
-
----
-
-### Kernel tuning
-
-For maximum throughput under load:
-
-```bash
-sudo ./scripts/tune-os.sh
-```
-
-### License
-
-MIT
+MIT License.
