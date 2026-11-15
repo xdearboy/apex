@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.1]
+
+### Security / Fixed
+- Socket Hardening & Connection Exhaustion Protection:
+  - Enabled `SO_KEEPALIVE` on all accepted client sockets.
+  - Configured `TCP_KEEPIDLE=15`, `TCP_KEEPINTVL=5`, `TCP_KEEPCNT=3`, and `TCP_USER_TIMEOUT=15000` to automatically drop zombie and slowloris connections.
+  - Eliminated stale socket accumulation under heavy distributed connection floods.
+
 ## [1.3.0]
 
 ### Added
