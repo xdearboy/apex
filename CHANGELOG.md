@@ -1,5 +1,33 @@
 # Changelog
 
+## [1.3.0]
+
+### Added
+- Clean signal shutdown: async-signal-safe `_exit(0)` on `SIGINT` and `SIGTERM` prevents hung worker thread joins or orphan processes.
+- Dynamic port configuration: `PORT` and `TLS_PORT` environment variables are parsed at runtime, with graceful fallback to standard configuration.
+- High-precision low-latency timer spin-wait: kernel timer slack (`PR_SET_TIMERSLACK, 1UL`) with pre-wake lead-time and CPU pause/yield spin-waiting for sub-millisecond timer resolution in high-load async profiles.
+- Zero-copy pipeline request parser: in-place offset tracking to eliminate $O(N^2)$ memory shifts during continuous request streaming.
+- Branchless integer formatting: direct byte lookup tables for fast-path serialization.
+
+### Fixed
+- Fixed prefix route matching logic to ensure exact root path `/` does not match descendant routes as a prefix.
+- Enhanced TLS session draining with `SSL_pending()` polling loop.
+
+## [1.2.1]
+
+### Performance
+- Eliminated redundant `epoll_ctl(MOD)` syscalls when socket output write buffers drain completely.
+- Reduced redundant `recv` syscalls in the event loop hot path.
+
+## [1.2.0]
+
+### Added
+- Modular high-throughput web microframework architecture with clean public C API (`include/apex.h`: `apex_create`, `apex_get`, `apex_post`, `apex_res_send`, `apex_run`).
+- Thread-per-core event loop pinned to CPU cores (`pthread_setaffinity_np`) with `SO_REUSEPORT`, `TCP_DEFER_ACCEPT`, `TCP_NODELAY`, `EPOLLET`.
+- Zero-allocation hot path with pre-allocated connection state indexed by file descriptor.
+- Dedicated fast-path route dispatch for high-frequency benchmark endpoints (`/`, `/user/:id`, `/user`).
+- Native HTTP pipeline batching draining requests within a single read/write syscall cycle.
+
 ## [1.1.0]
 
 ### Added

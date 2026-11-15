@@ -282,8 +282,21 @@ static void *worker_main(void *arg) {
     return NULL;
 }
 
+static void apex_handle_sig(int sig) {
+    (void)sig;
+    _exit(0);
+}
+
 int apex_run(apex_app_t *app, int port) {
+    signal(SIGINT, apex_handle_sig);
+    signal(SIGTERM, apex_handle_sig);
     signal(SIGPIPE, SIG_IGN);
+
+    const char *port_env = getenv("PORT");
+    if (port_env) {
+        int p = atoi(port_env);
+        if (p > 0) port = p;
+    }
 
     int nprocs = get_nprocs();
     if (nprocs <= 0) {
