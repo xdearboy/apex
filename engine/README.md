@@ -7,9 +7,9 @@ This directory contains the full, production-grade tuned HTTP engine implementat
 - **Multi-Core Event Loop**: Linux `epoll` with `EPOLLET` (edge-triggered) and `SO_REUSEPORT` kernel load balancing across all CPU cores.
 - **RFC 9113 HTTP/2 Engine**: Native multiplexed HTTP/2 support powered by `nghttp2`, supporting zero-allocation stream table mapping and batch frame output flushing.
 - **TLS 1.3 Acceleration**: Powered by OpenSSL 3 with AEAD ciphers (`TLS_AES_128_GCM_SHA256`) and strict ALPN isolation between HTTP/1.1 and HTTP/2.
-- **Asynchronous Timers**: Min-heap timer priority queue handling tens of thousands of concurrent delayed requests (`/delay/{ms}`) with sub-millisecond precision and zero CPU burn.
+- **Asynchronous Timers**: $O(1)$ 4096-slot circular timing wheel handling tens of thousands of concurrent delayed requests (`/delay/{ms}`) with sub-millisecond precision and zero CPU burn.
 - **Streaming HTTP/1.1 Parser**: Resilient against arbitrary TCP fragmentation and chunked transfer encodings (`Transfer-Encoding: chunked`).
-- **Static Asset Delivery**: Memory-efficient static file pipeline supporting Brotli and Gzip precompressed assets with dynamic MIME detection.
+- **Static Asset Delivery**: Zero-allocation thread-local static cache checking disk `st_mtime` with pre-compressed Brotli (`.br`) and Gzip (`.gz`) twin detection.
 - **Zero-Allocation Hot Path**: Pre-allocated connection state pools, fast integer parsing, and lookup-table-based branchless string formatters.
 
 ## Port Topology
