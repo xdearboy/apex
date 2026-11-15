@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.3.2]
+
+### Changed / Code Quality
+- Standardized Code Formatting:
+  - Added `.clang-format` specification adhering to standard LLVM C conventions (4-space indent, 120 column limit, explicit braces).
+  - Formatted all headers, core implementation files, and examples via `clang-format`.
+- Intent-Revealing Domain Naming:
+  - Refactored `conn_t` members and event-loop variables to use descriptive domain identifiers (`connection`, `read_buffer`, `write_buffer`, `read_length`, `write_length`, `bytes_to_send`, etc.).
+- Benchmarks & Community:
+  - Updated official worldwide HttpArena standings (Rank 1 Worldwide in `json-tls` and `limited-conn`, 54.4M RPS `pipelined`).
+  - Added official inclusion into `the-benchmarker/web-frameworks` (PR #10329 merged).
+
 ## [1.3.1]
 
 ### Security / Fixed

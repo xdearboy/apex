@@ -31,13 +31,13 @@
 
 typedef struct conn {
     int fd;
-    uint32_t rlen;
-    uint32_t wlen;
-    uint32_t woff;
+    uint32_t read_length;
+    uint32_t write_length;
+    uint32_t write_offset;
     uint8_t close_after_write;
     uint8_t epollout_active;
-    char rbuf[BUF_SIZE];
-    char wbuf[BUF_SIZE];
+    char read_buffer[BUF_SIZE];
+    char write_buffer[BUF_SIZE];
 } conn_t;
 
 struct apex_res {
@@ -61,11 +61,7 @@ struct apex_app {
     apex_handler_t fast_post_user;
 };
 
-void apex_dispatch(apex_app_t *app,
-                   const char *req_buf,
-                   size_t header_len,
-                   const char *body,
-                   size_t body_len,
+void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
                    apex_res_t *res);
 
 #endif /* APEX_INTERNAL_H */

@@ -52,11 +52,15 @@ Apex is engineered for extreme throughput, sub-millisecond tail latency, and zer
 | **GET / (Plaintext HTTP/1.1)** | `zrk` (closed-loop, 100 conn) | **380,778 req/s** | **176 µs** | 3.30 ms | 32.57 MB/s |
 | **GET /baseline11 (Query Math)** | `zrk` (closed-loop, 100 conn) | **369,839 req/s** | **178 µs** | 3.29 ms | 31.74 MB/s |
 
-### Worldwide HttpArena League Standing (64-core Bare-Metal)
-- **`baseline`**: **4,253,034 RPS** (**Rank 1 Worldwide**)
-- **`limited-conn`**: **2,787,598 RPS** (**Rank 1 Worldwide**)
-- **`pipelined`**: **51,260,873 RPS** (**Rank 1 Worldwide**)
-- **`latency-1m`**: **997,386 RPS** at **18.09 µs** (**Rank 1 Worldwide**)
+### Worldwide HttpArena League Standing (64-core Dedicated Bare-Metal)
+- **`json-tls`**: **1,868,684 RPS** (🥇 **Rank 1 Worldwide**)
+- **`limited-conn`**: **2,751,635 RPS** (🥇 **Rank 1 Worldwide**)
+- **`pipelined`**: **54,435,798 RPS** (54.4M RPS throughput)
+- **`async` (32,000 connections)**: **2,082,812 RPS** (2.08M RPS on 32k concurrent connections)
+- **`baseline-4096`**: **4,175,936 RPS**
+
+### Official Web Frameworks Benchmark
+- Included in **[the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)** (PR [#10329](https://github.com/the-benchmarker/web-frameworks/pull/10329) merged).
 
 ---
 

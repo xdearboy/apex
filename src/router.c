@@ -53,22 +53,21 @@ void apex_post(apex_app_t *app, const char *pattern, apex_handler_t handler) {
 }
 
 void apex_res_send(apex_res_t *res, int status, const void *body, size_t body_len) {
-    conn_t *c = res->conn;
-    char *wbuf = c->wbuf + c->wlen;
-    size_t avail = sizeof(c->wbuf) - c->wlen;
+    conn_t *connection = res->conn;
+    char *write_cursor = connection->write_buffer + connection->write_length;
+    size_t available_capacity = sizeof(connection->write_buffer) - connection->write_length;
 
     if (status == 200) {
         if (!body || body_len == 0) {
-            static const char RESP_200_EMPTY[] =
-                "HTTP/1.1 200 OK\r\n"
-                "Server: apex\r\n"
-                "Content-Length: 0\r\n"
-                "Connection: keep-alive\r\n"
-                "\r\n";
+            static const char RESP_200_EMPTY[] = "HTTP/1.1 200 OK\r\n"
+                                                 "Server: apex\r\n"
+                                                 "Content-Length: 0\r\n"
+                                                 "Connection: keep-alive\r\n"
+                                                 "\r\n";
             static const size_t RESP_200_EMPTY_LEN = sizeof(RESP_200_EMPTY) - 1;
-            if (avail >= RESP_200_EMPTY_LEN) {
-                memcpy(wbuf, RESP_200_EMPTY, RESP_200_EMPTY_LEN);
-                c->wlen += RESP_200_EMPTY_LEN;
+            if (available_capacity >= RESP_200_EMPTY_LEN) {
+                memcpy(write_cursor, RESP_200_EMPTY, RESP_200_EMPTY_LEN);
+                connection->write_length += RESP_200_EMPTY_LEN;
             }
             return;
         }
@@ -78,37 +77,36 @@ void apex_res_send(apex_res_t *res, int status, const void *body, size_t body_le
         static const char HDR_POST[] = "\r\nConnection: keep-alive\r\n\r\n";
         static const size_t HDR_POST_LEN = sizeof(HDR_POST) - 1;
 
-        char len_str[16];
-        size_t len_digits = 0;
-        size_t tmp = body_len;
+        char length_string[16];
+        size_t digit_count = 0;
+        size_t temp_length = body_len;
         do {
-            len_str[len_digits++] = (char)('0' + (tmp % 10));
-            tmp /= 10;
-        } while (tmp > 0);
+            length_string[digit_count++] = (char)('0' + (temp_length % 10));
+            temp_length /= 10;
+        } while (temp_length > 0);
 
-        size_t total = HDR_PRE_LEN + len_digits + HDR_POST_LEN + body_len;
-        if (avail >= total) {
-            memcpy(wbuf, HDR_PRE, HDR_PRE_LEN);
-            size_t pos = HDR_PRE_LEN;
-            for (size_t i = 0; i < len_digits; i++) {
-                wbuf[pos++] = len_str[len_digits - 1 - i];
+        size_t total_response_size = HDR_PRE_LEN + digit_count + HDR_POST_LEN + body_len;
+        if (available_capacity >= total_response_size) {
+            memcpy(write_cursor, HDR_PRE, HDR_PRE_LEN);
+            size_t write_position = HDR_PRE_LEN;
+            for (size_t digit_index = 0; digit_index < digit_count; digit_index++) {
+                write_cursor[write_position++] = length_string[digit_count - 1 - digit_index];
             }
-            memcpy(wbuf + pos, HDR_POST, HDR_POST_LEN);
-            pos += HDR_POST_LEN;
-            memcpy(wbuf + pos, body, body_len);
-            c->wlen += total;
+            memcpy(write_cursor + write_position, HDR_POST, HDR_POST_LEN);
+            write_position += HDR_POST_LEN;
+            memcpy(write_cursor + write_position, body, body_len);
+            connection->write_length += total_response_size;
         }
     } else {
-        static const char RESP_404[] =
-            "HTTP/1.1 404 Not Found\r\n"
-            "Server: apex\r\n"
-            "Content-Length: 0\r\n"
-            "Connection: keep-alive\r\n"
-            "\r\n";
+        static const char RESP_404[] = "HTTP/1.1 404 Not Found\r\n"
+                                       "Server: apex\r\n"
+                                       "Content-Length: 0\r\n"
+                                       "Connection: keep-alive\r\n"
+                                       "\r\n";
         static const size_t RESP_404_LEN = sizeof(RESP_404) - 1;
-        if (avail >= RESP_404_LEN) {
-            memcpy(wbuf, RESP_404, RESP_404_LEN);
-            c->wlen += RESP_404_LEN;
+        if (available_capacity >= RESP_404_LEN) {
+            memcpy(write_cursor, RESP_404, RESP_404_LEN);
+            connection->write_length += RESP_404_LEN;
         }
     }
 }
@@ -119,67 +117,59 @@ void apex_res_header(apex_res_t *res, const char *key, const char *value) {
     (void)value;
 }
 
-void apex_dispatch(apex_app_t *app,
-                   const char *req_buf,
-                   size_t header_len,
-                   const char *body,
-                   size_t body_len,
+void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
                    apex_res_t *res) {
     if (req_buf[0] == 'G' && req_buf[1] == 'E' && req_buf[2] == 'T' && req_buf[3] == ' ') {
         const char *path = req_buf + 4;
         if (path[0] == '/' && path[1] == ' ') {
             if (app->fast_get_root) {
-                apex_req_t req = {
-                    .method = "GET",
-                    .method_len = 3,
-                    .path = "/",
-                    .path_len = 1,
-                    .param = NULL,
-                    .param_len = 0,
-                    .body = NULL,
-                    .body_len = 0,
-                    .user_data = NULL
-                };
+                apex_req_t req = {.method = "GET",
+                                  .method_len = 3,
+                                  .path = "/",
+                                  .path_len = 1,
+                                  .param = NULL,
+                                  .param_len = 0,
+                                  .body = NULL,
+                                  .body_len = 0,
+                                  .user_data = NULL};
                 app->fast_get_root(&req, res);
                 return;
             }
-        } else if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'e' && path[4] == 'r' && path[5] == '/') {
+        } else if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'e' && path[4] == 'r' &&
+                   path[5] == '/') {
             if (app->fast_get_user_id) {
                 const char *id_start = path + 6;
                 const char *id_end = id_start;
                 while (*id_end != ' ' && *id_end != '?' && *id_end != '\r') {
                     id_end++;
                 }
-                apex_req_t req = {
-                    .method = "GET",
-                    .method_len = 3,
-                    .path = "/user",
-                    .path_len = 5,
-                    .param = id_start,
-                    .param_len = (size_t)(id_end - id_start),
-                    .body = NULL,
-                    .body_len = 0,
-                    .user_data = NULL
-                };
+                apex_req_t req = {.method = "GET",
+                                  .method_len = 3,
+                                  .path = "/user",
+                                  .path_len = 5,
+                                  .param = id_start,
+                                  .param_len = (size_t)(id_end - id_start),
+                                  .body = NULL,
+                                  .body_len = 0,
+                                  .user_data = NULL};
                 app->fast_get_user_id(&req, res);
                 return;
             }
         }
     } else if (req_buf[0] == 'P' && req_buf[1] == 'O' && req_buf[2] == 'S' && req_buf[3] == 'T' && req_buf[4] == ' ') {
         const char *path = req_buf + 5;
-        if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'e' && path[4] == 'r' && (path[5] == ' ' || path[5] == '?')) {
+        if (path[0] == '/' && path[1] == 'u' && path[2] == 's' && path[3] == 'e' && path[4] == 'r' &&
+            (path[5] == ' ' || path[5] == '?')) {
             if (app->fast_post_user) {
-                apex_req_t req = {
-                    .method = "POST",
-                    .method_len = 4,
-                    .path = "/user",
-                    .path_len = 5,
-                    .param = NULL,
-                    .param_len = 0,
-                    .body = body,
-                    .body_len = body_len,
-                    .user_data = NULL
-                };
+                apex_req_t req = {.method = "POST",
+                                  .method_len = 4,
+                                  .path = "/user",
+                                  .path_len = 5,
+                                  .param = NULL,
+                                  .param_len = 0,
+                                  .body = body,
+                                  .body_len = body_len,
+                                  .user_data = NULL};
                 app->fast_post_user(&req, res);
                 return;
             }
@@ -211,33 +201,29 @@ void apex_dispatch(apex_app_t *app,
             if (path_len >= r->prefix_len && strncmp(path, r->pattern, r->prefix_len) == 0) {
                 const char *param_start = path + r->prefix_len;
                 size_t param_len = path_len - r->prefix_len;
-                apex_req_t req = {
-                    .method = r->method,
-                    .method_len = method_len,
-                    .path = path,
-                    .path_len = path_len,
-                    .param = param_start,
-                    .param_len = param_len,
-                    .body = body,
-                    .body_len = body_len,
-                    .user_data = NULL
-                };
+                apex_req_t req = {.method = r->method,
+                                  .method_len = method_len,
+                                  .path = path,
+                                  .path_len = path_len,
+                                  .param = param_start,
+                                  .param_len = param_len,
+                                  .body = body,
+                                  .body_len = body_len,
+                                  .user_data = NULL};
                 r->handler(&req, res);
                 return;
             }
         } else {
             if (path_len == r->pattern_len && strncmp(path, r->pattern, path_len) == 0) {
-                apex_req_t req = {
-                    .method = r->method,
-                    .method_len = method_len,
-                    .path = path,
-                    .path_len = path_len,
-                    .param = NULL,
-                    .param_len = 0,
-                    .body = body,
-                    .body_len = body_len,
-                    .user_data = NULL
-                };
+                apex_req_t req = {.method = r->method,
+                                  .method_len = method_len,
+                                  .path = path,
+                                  .path_len = path_len,
+                                  .param = NULL,
+                                  .param_len = 0,
+                                  .body = body,
+                                  .body_len = body_len,
+                                  .user_data = NULL};
                 r->handler(&req, res);
                 return;
             }
