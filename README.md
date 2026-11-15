@@ -36,6 +36,12 @@ int main(void) {
 }
 ```
 
+## Repository Structure
+
+- [`include/`](include/) & [`src/`](src/): The core public C micro-framework library (`libapex.a`) powering [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks).
+- [`engine/`](engine/): The high-performance tuned HTTP/1.1 & HTTP/2 engine with TLS 1.3, asynchronous timer heaps, static asset compression, and multi-port routing powering [HttpArena](https://http-arena.com).
+- [`examples/`](examples/): Example applications (`web_frameworks`, `hello_world`).
+
 ## Performance & Benchmarks
 
 Apex is engineered for extreme throughput, sub-millisecond tail latency, and zero heap allocations on the hot path.
