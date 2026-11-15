@@ -171,6 +171,23 @@ static void *worker_main(void *arg) {
                     int one = 1;
                     setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
                     setsockopt(cfd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+                    setsockopt(cfd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+#if defined(TCP_KEEPIDLE)
+                    int keepidle = 15;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+#endif
+#if defined(TCP_KEEPINTVL)
+                    int keepintvl = 5;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+#endif
+#if defined(TCP_KEEPCNT)
+                    int keepcnt = 3;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
+#if defined(TCP_USER_TIMEOUT)
+                    unsigned int user_timeout = 15000;
+                    setsockopt(cfd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout, sizeof(user_timeout));
+#endif
 
                     conn_t *c = &conns[cfd];
                     c->fd = cfd;
