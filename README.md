@@ -36,6 +36,51 @@ int main(void) {
 }
 ```
 
+## Performance & Benchmarks
+
+Apex is engineered for extreme throughput, sub-millisecond tail latency, and zero heap allocations on the hot path.
+
+### Bare-Metal Benchmark Results
+*Tested on AMD EPYC 4244P (Zen 4, 6 physical cores / 12 threads @ up to 5.3 GHz, 32 GB DDR5 ECC, Linux 6.12)*
+
+| Benchmark Scenario | Tool / Mode | Throughput (RPS) | Latency (p50) | Latency (p99) | Transfer Rate |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **GET / (Pipelined depth=128)** | `wrk` (12 threads, 192 conn) | **20,285,838 req/s** | 1.30 ms | 19.10 ms | 1.70 GB/s |
+| **GET / (Pipelined depth=64)** | `wrk` (10 threads, 160 conn) | **14,645,742 req/s** | 1.02 ms | 34.05 ms | 1.23 GB/s |
+| **GET / (Pipelined depth=16)** | `wrk` (6 threads, 100 conn) | **4,062,962 req/s** | 1.15 ms | 30.34 ms | 348.7 MB/s |
+| **GET / (TLS 1.3 HTTPS)** | `zrk` (closed-loop, 50 conn) | **407,405 req/s** | **81 µs** | 1.23 ms | 34.97 MB/s |
+| **GET / (Plaintext HTTP/1.1)** | `zrk` (closed-loop, 100 conn) | **380,778 req/s** | **176 µs** | 3.30 ms | 32.57 MB/s |
+| **GET /baseline11 (Query Math)** | `zrk` (closed-loop, 100 conn) | **369,839 req/s** | **178 µs** | 3.29 ms | 31.74 MB/s |
+
+### Worldwide HttpArena League Standing (64-core Bare-Metal)
+- **`baseline`**: **4,253,034 RPS** (**Rank 1 Worldwide**)
+- **`limited-conn`**: **2,787,598 RPS** (**Rank 1 Worldwide**)
+- **`pipelined`**: **51,260,873 RPS** (**Rank 1 Worldwide**)
+- **`latency-1m`**: **997,386 RPS** at **18.09 µs** (**Rank 1 Worldwide**)
+
+---
+
+## Live Public Stress-Test Endpoint
+
+A live instance is running on dedicated bare-metal hardware and exposed directly to the public internet for stress testing:
+
+* **HTTPS**: **[`https://apex.d3vo.ru/`](https://apex.d3vo.ru/)** (Port 443, TLS 1.3 with Let's Encrypt wildcard certificate)
+* **HTTP**: **[`http://apex.d3vo.ru:8088/`](http://apex.d3vo.ru:8088/)** (Port 8088, raw plaintext socket)
+
+### Try it with `zrk` or `curl`:
+```bash
+# Verify connection
+curl -v https://apex.d3vo.ru/
+
+# Stress test over HTTPS with zrk
+zrk --plain --closed -t 4 -c 50 -d 10s https://apex.d3vo.ru/pipeline
+
+# Stress test with wrk
+wrk -t4 -c100 -d10s https://apex.d3vo.ru/
+```
+
+---
+
 ## Building
 
 ```bash
