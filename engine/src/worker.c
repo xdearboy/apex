@@ -698,6 +698,11 @@ void *worker_thread_main(void *thread_argument) {
                             break;
                         }
                     }
+                    if (connection->fd >= 0 && !h2_connection_drain_send(connection, worker)) {
+                        if (connection->fd >= 0) {
+                            close_conn(worker, connection);
+                        }
+                    }
                     continue;
                 }
 

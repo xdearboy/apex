@@ -469,7 +469,7 @@ bool h2_connection_process_incoming_data(conn_t *connection, worker_t *worker, c
         return false;
     }
 
-    return h2_connection_drain_send(connection, worker);
+    return true;
 }
 
 void h2_connection_destroy(conn_t *connection) {
