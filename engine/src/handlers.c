@@ -218,10 +218,20 @@ size_t format_json_http1_response(const request_t *request, worker_t *worker, ch
     int64_t multiplier;
     parse_json_request_parameters(request, &item_count, &multiplier);
 
+    bool accepts_gzip = json_accepts_gzip(request);
+    if (accepts_gzip && request->keep_alive) {
+        size_t response_length = json_gzip_http1_response(&worker->compress, item_count, multiplier,
+                                                          destination_buffer, max_destination_size,
+                                                          out_response_start);
+        if (response_length > 0) {
+            return response_length;
+        }
+    }
+
     char *body_start = destination_buffer + JSON_HEADER_RESERVE;
     size_t body_capacity = max_destination_size - JSON_HEADER_RESERVE;
     size_t body_length;
-    bool use_gzip = json_accepts_gzip(request);
+    bool use_gzip = accepts_gzip;
     if (use_gzip) {
         size_t json_length = json_serialize(item_count, multiplier, worker->compress.json_buf,
                                             sizeof(worker->compress.json_buf));

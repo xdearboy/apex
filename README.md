@@ -9,7 +9,7 @@ Designed for extreme throughput and sub-millisecond tail latency, Apex utilizes 
 
 ## Features
 
-- **Thread-per-Core Architecture**: Automatically spawns dedicated worker threads pinned to CPU cores (`pthread_setaffinity_np`) to eliminate context switches and cross-core cache invalidation.
+- **Thread-per-Core Architecture**: Automatically spawns one worker per allowed CPU. The kernel schedules workers by default for co-located loads; set `APEX_PIN_CPUS=1` to pin workers on dedicated CPUs.
 - **Kernel Load Balancing (`SO_REUSEPORT`)**: Independent listening sockets per thread with kernel 4-tuple connection hashing, `TCP_DEFER_ACCEPT`, and `TCP_NODELAY`.
 - **Edge-Triggered Epoll (`EPOLLET`)**: Non-blocking event loop using `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)`.
 - **Zero-Allocation Hot Path**: Pre-allocated connection state indexed by file descriptor; zero dynamic heap allocations per request.
