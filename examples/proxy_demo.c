@@ -1,0 +1,373 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "apex/proxy.h"
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+
+#define DEMO_BACKENDS 2
+#define DEMO_BACKEND_ACCEPTORS 8
+#define DEMO_SEQUENTIAL_REQUESTS 12
+#define DEMO_WORKERS 4
+#define DEMO_WORKER_REQUESTS 50
+
+typedef struct {
+    int listen_fd;
+    int id;
+    int thread_count;
+    _Atomic bool *stop;
+    pthread_t threads[DEMO_BACKEND_ACCEPTORS];
+} backend_t;
+
+typedef struct {
+    upstream_group_t *group;
+    int requests;
+    _Atomic int *succeeded;
+    _Atomic int *failed;
+    int worker_id;
+} worker_arg_t;
+
+static int send_all(int fd, const void *data, size_t len) {
+    const char *cursor = data;
+    while (len > 0) {
+        ssize_t sent;
+#ifdef MSG_NOSIGNAL
+        sent = send(fd, cursor, len, MSG_NOSIGNAL);
+#else
+        sent = send(fd, cursor, len, 0);
+#endif
+        if (sent > 0) {
+            cursor += sent;
+            len -= (size_t)sent;
+            continue;
+        }
+        if (sent < 0 && errno == EINTR) {
+            continue;
+        }
+        return -1;
+    }
+    return 0;
+}
+
+static void serve_client(int fd, int backend_id, _Atomic bool *stop, unsigned long long *sequence) {
+    char buffer[16384];
+    size_t used = 0;
+
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 200000;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    while (!atomic_load_explicit(stop, memory_order_relaxed)) {
+        size_t header_length = 0;
+        for (size_t index = 0; index + 3u < used; index++) {
+            if (memcmp(buffer + index, "\r\n\r\n", 4) == 0) {
+                header_length = index + 4u;
+                break;
+            }
+        }
+
+        if (header_length > 0) {
+            char body[96];
+            int body_length =
+                snprintf(body, sizeof(body), "backend=%d seq=%llu\n", backend_id, *sequence);
+            (*sequence)++;
+            if (body_length < 0 || (size_t)body_length >= sizeof(body)) {
+                return;
+            }
+
+            char response[256];
+            int response_length =
+                snprintf(response, sizeof(response),
+                         "HTTP/1.1 200 OK\r\n"
+                         "Content-Type: text/plain\r\n"
+                         "Content-Length: %d\r\n"
+                         "Connection: keep-alive\r\n"
+                         "\r\n"
+                         "%s",
+                         body_length, body);
+            if (response_length < 0 || (size_t)response_length >= sizeof(response)) {
+                return;
+            }
+            if (send_all(fd, response, (size_t)response_length) < 0) {
+                return;
+            }
+
+            memmove(buffer, buffer + header_length, used - header_length);
+            used -= header_length;
+            continue;
+        }
+
+        if (used == sizeof(buffer)) {
+            return;
+        }
+
+        ssize_t received = recv(fd, buffer + used, sizeof(buffer) - used, 0);
+        if (received > 0) {
+            used += (size_t)received;
+            continue;
+        }
+        if (received == 0) {
+            return;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            continue;
+        }
+        return;
+    }
+}
+
+static void *backend_main(void *argument) {
+    backend_t *backend = argument;
+    unsigned long long sequence = 0;
+
+    while (!atomic_load_explicit(backend->stop, memory_order_relaxed)) {
+        struct pollfd descriptor = {.fd = backend->listen_fd, .events = POLLIN, .revents = 0};
+        int ready = poll(&descriptor, 1, 100);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (ready == 0) {
+            continue;
+        }
+
+        int client = accept(backend->listen_fd, NULL, NULL);
+        if (client < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+                continue;
+            }
+            break;
+        }
+
+#ifdef SO_NOSIGPIPE
+        int enabled = 1;
+        (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
+        serve_client(client, backend->id, backend->stop, &sequence);
+        close(client);
+    }
+
+    return NULL;
+}
+
+static int start_backend(backend_t *backend, int id, _Atomic bool *stop) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -1;
+    }
+
+    int enabled = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
+
+    struct sockaddr_in address;
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+
+    if (bind(fd, (struct sockaddr *)&address, sizeof(address)) < 0 || listen(fd, 128) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    socklen_t address_length = sizeof(address);
+    if (getsockname(fd, (struct sockaddr *)&address, &address_length) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    backend->listen_fd = fd;
+    backend->id = id;
+    backend->stop = stop;
+    backend->thread_count = 0;
+    for (int index = 0; index < DEMO_BACKEND_ACCEPTORS; index++) {
+        if (pthread_create(&backend->threads[index], NULL, backend_main, backend) != 0) {
+            break;
+        }
+        backend->thread_count++;
+    }
+
+    if (backend->thread_count == 0) {
+        close(fd);
+        return -1;
+    }
+
+    return (int)ntohs(address.sin_port);
+}
+
+static int parse_backend_id(const apex_proxy_response_t *response) {
+    if (response->body == NULL || response->body_len < 9u) {
+        return -1;
+    }
+    const char *body = response->body;
+    if (memcmp(body, "backend=", 8) != 0) {
+        return -1;
+    }
+    char digit = body[8];
+    if (digit < '0' || digit > '9') {
+        return -1;
+    }
+    return digit - '0';
+}
+
+static void *proxy_worker(void *argument) {
+    worker_arg_t *worker = argument;
+    for (int index = 0; index < worker->requests; index++) {
+        apex_proxy_request_t request = {0};
+        request.method = "GET";
+        request.target = "/";
+        request.keep_alive = true;
+
+        apex_proxy_response_t response;
+        int result = apex_proxy_forward(worker->group, &request, &response);
+        if (result == APEX_PROXY_OK && response.status == 200 && response.body_len > 0) {
+            atomic_fetch_add_explicit(worker->succeeded, 1, memory_order_relaxed);
+        } else {
+            if (result != APEX_PROXY_OK) {
+                fprintf(stderr, "worker %d: %s\n", worker->worker_id, apex_proxy_strerror(result));
+            }
+            atomic_fetch_add_explicit(worker->failed, 1, memory_order_relaxed);
+        }
+        apex_proxy_response_free(&response);
+    }
+
+    apex_proxy_pool_stats_t stats;
+    apex_proxy_pool_get_stats(&stats);
+    printf("worker %d: created=%zu reused=%zu idle=%zu\n", worker->worker_id, stats.total_created,
+           stats.total_reused, stats.idle_connections);
+    apex_proxy_pool_reset();
+    return NULL;
+}
+
+int main(void) {
+    (void)signal(SIGPIPE, SIG_IGN);
+
+    _Atomic bool stop = false;
+    backend_t backends[DEMO_BACKENDS];
+    int ports[DEMO_BACKENDS];
+    memset(backends, 0, sizeof(backends));
+
+    for (int index = 0; index < DEMO_BACKENDS; index++) {
+        ports[index] = start_backend(&backends[index], index, &stop);
+        if (ports[index] < 0) {
+            fprintf(stderr, "failed to start backend %d\n", index);
+            return 1;
+        }
+        printf("backend %d listening on 127.0.0.1:%d\n", index, ports[index]);
+    }
+
+    upstream_group_t group;
+    apex_upstream_group_init(&group);
+    if (apex_upstream_add_server(&group, "127.0.0.1", (uint16_t)ports[0], 1) < 0 ||
+        apex_upstream_add_server(&group, "127.0.0.1", (uint16_t)ports[1], 3) < 0) {
+        fprintf(stderr, "failed to configure upstream group\n");
+        return 1;
+    }
+    apex_upstream_set_policy(&group, APEX_BALANCE_ROUND_ROBIN);
+
+    int backend_hits[DEMO_BACKENDS] = {0, 0};
+    int sequential_failures = 0;
+    int sequential_succeeded = 0;
+
+    for (int index = 0; index < DEMO_SEQUENTIAL_REQUESTS; index++) {
+        apex_proxy_request_t request = {0};
+        request.method = "GET";
+        request.target = "/";
+        request.keep_alive = true;
+
+        apex_proxy_response_t response;
+        int result = apex_proxy_forward(&group, &request, &response);
+        if (result != APEX_PROXY_OK || response.status != 200) {
+            fprintf(stderr, "sequential request %d: %s\n", index,
+                    result == APEX_PROXY_OK ? "unexpected status" : apex_proxy_strerror(result));
+            sequential_failures++;
+        } else {
+            int backend_id = parse_backend_id(&response);
+            if (backend_id >= 0 && backend_id < DEMO_BACKENDS) {
+                backend_hits[backend_id]++;
+            }
+            sequential_succeeded++;
+        }
+        apex_proxy_response_free(&response);
+    }
+
+    apex_proxy_pool_stats_t main_stats;
+    apex_proxy_pool_get_stats(&main_stats);
+    printf("round_robin hits: backend0=%d backend1=%d\n", backend_hits[0], backend_hits[1]);
+    printf("main thread pool: created=%zu reused=%zu closed=%zu idle=%zu\n", main_stats.total_created,
+           main_stats.total_reused, main_stats.total_closed, main_stats.idle_connections);
+
+    apex_proxy_pool_reset();
+    apex_upstream_set_policy(&group, APEX_BALANCE_P2C);
+
+    _Atomic int succeeded = 0;
+    _Atomic int failed = 0;
+    pthread_t workers[DEMO_WORKERS];
+    worker_arg_t worker_args[DEMO_WORKERS];
+    int started_workers = 0;
+
+    for (int index = 0; index < DEMO_WORKERS; index++) {
+        worker_args[index].group = &group;
+        worker_args[index].requests = DEMO_WORKER_REQUESTS;
+        worker_args[index].succeeded = &succeeded;
+        worker_args[index].failed = &failed;
+        worker_args[index].worker_id = index;
+        if (pthread_create(&workers[index], NULL, proxy_worker, &worker_args[index]) != 0) {
+            fprintf(stderr, "failed to start worker %d\n", index);
+            break;
+        }
+        started_workers++;
+    }
+
+    for (int index = 0; index < started_workers; index++) {
+        (void)pthread_join(workers[index], NULL);
+    }
+
+    int total_failures = sequential_failures + atomic_load_explicit(&failed, memory_order_relaxed);
+    int total_succeeded = sequential_succeeded + atomic_load_explicit(&succeeded, memory_order_relaxed);
+    int expected = started_workers * DEMO_WORKER_REQUESTS + DEMO_SEQUENTIAL_REQUESTS;
+
+    printf("p2c workers: succeeded=%d failed=%d\n", total_succeeded, total_failures);
+    printf("requests=%d expected=%d\n", total_succeeded, expected);
+
+    atomic_store_explicit(&stop, true, memory_order_relaxed);
+    for (int index = 0; index < DEMO_BACKENDS; index++) {
+        for (int thread = 0; thread < backends[index].thread_count; thread++) {
+            (void)pthread_join(backends[index].threads[thread], NULL);
+        }
+        close(backends[index].listen_fd);
+    }
+
+    if (total_failures != 0 || total_succeeded != expected) {
+        return 1;
+    }
+
+    printf("proxy demo ok\n");
+    return 0;
+}
