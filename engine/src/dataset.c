@@ -9,8 +9,8 @@ static bool g_json_hufftables_initialized = false;
 enum {
     JSON_GZIP_CACHE_CAPACITY = 2048,
     JSON_GZIP_CACHE_MAX_ENTRIES = 1024,
-    JSON_GZIP_FAST_COUNT_LIMIT = 50,
-    JSON_GZIP_FAST_MULTIPLIER_LIMIT = 10
+    JSON_FAST_COUNT_LIMIT = 50,
+    JSON_FAST_MULTIPLIER_LIMIT = 10
 };
 
 struct json_gzip_cache_entry {
@@ -25,9 +25,17 @@ typedef struct {
     size_t response_length;
 } json_gzip_fast_entry_t;
 
-static json_gzip_fast_entry_t
-    g_json_gzip_fast_cache[JSON_GZIP_FAST_COUNT_LIMIT + 1][JSON_GZIP_FAST_MULTIPLIER_LIMIT];
+typedef struct {
+    char *http1_response;
+    const char *payload;
+    size_t http1_response_length;
+    size_t payload_length;
+} json_fast_entry_t;
 
+static json_gzip_fast_entry_t g_json_gzip_fast_cache[JSON_FAST_COUNT_LIMIT + 1][JSON_FAST_MULTIPLIER_LIMIT];
+static json_fast_entry_t g_json_fast_cache[JSON_FAST_COUNT_LIMIT + 1][JSON_FAST_MULTIPLIER_LIMIT];
+
+static void dataset_prepare_json_responses(void);
 static void dataset_prepare_gzip_responses(void);
 
 static inline size_t json_gzip_cache_index(size_t count, int64_t multiplier) {
@@ -281,6 +289,7 @@ bool dataset_load(const char *dataset_file_path) {
     }
 
     cJSON_Delete(root_array);
+    dataset_prepare_json_responses();
     dataset_prepare_gzip_hufftables();
     dataset_prepare_gzip_responses();
     return true;
@@ -329,6 +338,94 @@ size_t json_serialize(size_t count, int64_t multiplier, char *destination_buffer
     return (size_t)(cursor - destination_buffer);
 }
 
+static void dataset_prepare_json_responses(void) {
+    static const char header_prefix[] =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ";
+    static const char header_suffix[] = "\r\nConnection: keep-alive\r\n\r\n";
+
+    char *json_buffer = malloc(WRITE_BUF_SIZE);
+    if (!json_buffer) {
+        return;
+    }
+
+    size_t maximum_count = g_num_items < JSON_FAST_COUNT_LIMIT ? g_num_items : JSON_FAST_COUNT_LIMIT;
+    for (size_t count = 1; count <= maximum_count; count++) {
+        for (int64_t multiplier = 0; multiplier < JSON_FAST_MULTIPLIER_LIMIT; multiplier++) {
+            size_t payload_length = json_serialize(count, multiplier, json_buffer, WRITE_BUF_SIZE);
+            if (payload_length > UINT32_MAX) {
+                continue;
+            }
+
+            char content_length_buffer[10];
+            size_t content_length_length = format_u32(content_length_buffer, (uint32_t)payload_length);
+            size_t header_length =
+                sizeof(header_prefix) - 1 + content_length_length + sizeof(header_suffix) - 1;
+            size_t response_length = header_length + payload_length;
+            char *response = malloc(response_length);
+            if (!response) {
+                continue;
+            }
+
+            char *cursor = response;
+            memcpy(cursor, header_prefix, sizeof(header_prefix) - 1);
+            cursor += sizeof(header_prefix) - 1;
+            memcpy(cursor, content_length_buffer, content_length_length);
+            cursor += content_length_length;
+            memcpy(cursor, header_suffix, sizeof(header_suffix) - 1);
+            cursor += sizeof(header_suffix) - 1;
+            memcpy(cursor, json_buffer, payload_length);
+
+            json_fast_entry_t *entry = &g_json_fast_cache[count][multiplier];
+            entry->http1_response = response;
+            entry->payload = response + header_length;
+            entry->http1_response_length = response_length;
+            entry->payload_length = payload_length;
+        }
+    }
+
+    free(json_buffer);
+}
+
+static const json_fast_entry_t *json_fast_cache_entry(size_t count, int64_t multiplier) {
+    if (count == 0 || count > JSON_FAST_COUNT_LIMIT || count > g_num_items || multiplier < 0 ||
+        multiplier >= JSON_FAST_MULTIPLIER_LIMIT) {
+        return NULL;
+    }
+
+    const json_fast_entry_t *entry = &g_json_fast_cache[count][multiplier];
+    return entry->http1_response ? entry : NULL;
+}
+
+size_t json_cached_payload(size_t count, int64_t multiplier, const char **out_payload) {
+    if (!out_payload) {
+        return 0;
+    }
+    *out_payload = NULL;
+
+    const json_fast_entry_t *entry = json_fast_cache_entry(count, multiplier);
+    if (!entry) {
+        return 0;
+    }
+
+    *out_payload = entry->payload;
+    return entry->payload_length;
+}
+
+size_t json_cached_http1_response(size_t count, int64_t multiplier, const char **out_response_start) {
+    if (!out_response_start) {
+        return 0;
+    }
+    *out_response_start = NULL;
+
+    const json_fast_entry_t *entry = json_fast_cache_entry(count, multiplier);
+    if (!entry) {
+        return 0;
+    }
+
+    *out_response_start = entry->http1_response;
+    return entry->http1_response_length;
+}
+
 static size_t build_json_gzip_http1_response(worker_compress_t *worker_compress, size_t count,
                                               int64_t multiplier, char *destination_buffer,
                                               size_t max_destination_size) {
@@ -373,9 +470,9 @@ static void dataset_prepare_gzip_responses(void) {
     }
 
     compress_worker_init(worker_compress);
-    size_t maximum_count = g_num_items < JSON_GZIP_FAST_COUNT_LIMIT ? g_num_items : JSON_GZIP_FAST_COUNT_LIMIT;
+    size_t maximum_count = g_num_items < JSON_FAST_COUNT_LIMIT ? g_num_items : JSON_FAST_COUNT_LIMIT;
     for (size_t count = 1; count <= maximum_count; count++) {
-        for (int64_t multiplier = 0; multiplier < JSON_GZIP_FAST_MULTIPLIER_LIMIT; multiplier++) {
+        for (int64_t multiplier = 0; multiplier < JSON_FAST_MULTIPLIER_LIMIT; multiplier++) {
             size_t response_length = build_json_gzip_http1_response(
                 worker_compress, count, multiplier, response_buffer, WRITE_BUF_SIZE);
             if (response_length == 0) {
@@ -403,8 +500,8 @@ size_t json_gzip_cached_http1_response(size_t count, int64_t multiplier, const c
     }
     *out_response_start = NULL;
 
-    if (count > JSON_GZIP_FAST_COUNT_LIMIT || count > g_num_items || multiplier < 0 ||
-        multiplier >= JSON_GZIP_FAST_MULTIPLIER_LIMIT) {
+    if (count > JSON_FAST_COUNT_LIMIT || count > g_num_items || multiplier < 0 ||
+        multiplier >= JSON_FAST_MULTIPLIER_LIMIT) {
         return 0;
     }
 
@@ -419,8 +516,8 @@ size_t json_gzip_cached_http1_response(size_t count, int64_t multiplier, const c
 size_t json_gzip_http1_response(worker_compress_t *worker_compress, size_t count, int64_t multiplier,
                                 char *destination_buffer, size_t max_destination_size,
                                 const char **out_response_start) {
-    if (count > JSON_GZIP_FAST_COUNT_LIMIT) {
-        count = JSON_GZIP_FAST_COUNT_LIMIT;
+    if (count > JSON_FAST_COUNT_LIMIT) {
+        count = JSON_FAST_COUNT_LIMIT;
     }
     if (count > g_num_items) {
         count = g_num_items;

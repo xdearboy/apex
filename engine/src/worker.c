@@ -7,6 +7,7 @@
 #include "listener.h"
 #include "response_builder.h"
 #include "router.h"
+#include "static_files.h"
 #include "timer.h"
 
 #include <errno.h>
@@ -427,6 +428,29 @@ void process_requests(worker_t *worker, conn_t *connection) {
                 break;
             }
             continue;
+        }
+
+        if (__builtin_expect(request.method == HTTP_METHOD_GET && request.keep_alive && request.path.len > 8 &&
+                                 memcmp(request.path.ptr, "/static/", 8) == 0,
+                             0)) {
+            const char *response_start = NULL;
+            size_t response_length = static_cached_http1_response(&request, &response_start);
+            if (response_length > 0) {
+                if (write_pos > 0) {
+                    flush_data(worker, connection, worker->write_buf, write_pos);
+                    write_pos = 0;
+                    if (connection->fd < 0) {
+                        return;
+                    }
+                }
+
+                read_offset += consumed_bytes;
+                flush_data(worker, connection, response_start, response_length);
+                if (connection->fd < 0) {
+                    break;
+                }
+                continue;
+            }
         }
 
         response_t response;

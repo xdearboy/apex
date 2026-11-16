@@ -27,6 +27,8 @@ bool dataset_load(const char *path);
 size_t dataset_count(void);
 
 size_t json_serialize(size_t count, int64_t multiplier, char *out_buf, size_t max_out);
+size_t json_cached_payload(size_t count, int64_t multiplier, const char **out_payload);
+size_t json_cached_http1_response(size_t count, int64_t multiplier, const char **out_response_start);
 
 typedef struct json_gzip_cache_entry json_gzip_cache_entry_t;
 
