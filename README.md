@@ -61,12 +61,26 @@ Apex is engineered for extreme throughput, sub-millisecond tail latency, and zer
 | **GET / (Plaintext HTTP/1.1)** | `zrk` (closed-loop, 100 conn) | **380,778 req/s** | **176 µs** | 3.30 ms | 32.57 MB/s |
 | **GET /baseline11 (Query Math)** | `zrk` (closed-loop, 100 conn) | **369,839 req/s** | **178 µs** | 3.29 ms | 31.74 MB/s |
 
-### Worldwide HttpArena League Standing (64-core Dedicated Bare-Metal)
-- **`json-tls`**: **1,868,684 RPS** (🥇 **Rank 1 Worldwide**)
-- **`limited-conn`**: **2,751,635 RPS** (🥇 **Rank 1 Worldwide**)
-- **`pipelined`**: **54,435,798 RPS** (54.4M RPS throughput)
-- **`async` (32,000 connections)**: **2,082,812 RPS** (2.08M RPS on 32k concurrent connections)
-- **`baseline-4096`**: **4,175,936 RPS**
+### Official HttpArena Worldwide Standing (64-core Bare-Metal)
+
+Apex is ranked **#1 in HTTP/2** and **Top 5 in HTTP/1.1** overall across all web frameworks in the official [HttpArena](https://http-arena.com) benchmark running on dedicated 64-core AMD Threadripper hardware.
+
+| Profile / Scenario | Official Rank | Throughput (RPS) | Tail Latency (p99) | Bandwidth | Protocol |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`pipelined` (depth=16, 4k conn)** | 🥇 **#1 of 180** | **59,539,961 req/s** | 1.39 ms | 3.55 GB/s | HTTP/1.1 |
+| **`baseline-h2c` (1024 conn)** | 🥇 **#1 of 70** | **16,634,930 req/s** | 16.26 ms | 337.8 MB/s | HTTP/2 Cleartext |
+| **`baseline-h2c` (256 conn)** | 🥇 **#1 of 70** | **16,350,916 req/s** | 44.38 ms | 328.8 MB/s | HTTP/2 Cleartext |
+| **`baseline-h2` (1024 conn)** | 🥇 **#1 of 81** | **16,030,277 req/s** | 86.69 ms | 324.3 MB/s | HTTP/2 over TLS |
+| **`baseline-h2c` (4096 conn)** | 🥇 **#1 of 70** | **15,055,383 req/s** | 29.38 ms | 307.0 MB/s | HTTP/2 Cleartext |
+| **`limited-conn` (4096 conn)** | 🥇 **#1 of 195** | **2,822,803 req/s** | 1.80 ms | 172.2 MB/s | HTTP/1.1 |
+| **`baseline-h2` (256 conn)** | 🥈 **#2 of 81** | **16,094,035 req/s** | 30.55 ms | 324.3 MB/s | HTTP/2 over TLS |
+| **`json-h2c` (1024 conn)** | 🥈 **#2 of 68** | **5,961,855 req/s** | 60.23 ms | 19.85 GB/s | HTTP/2 Cleartext |
+| **`json-h2c` (4096 conn)** | 🥈 **#2 of 68** | **5,232,884 req/s** | 86.51 ms | 17.59 GB/s | HTTP/2 Cleartext |
+| **`baseline-4096`** | 🥉 **#3 of 195** | **4,403,856 req/s** | 1.96 ms | 268.7 MB/s | HTTP/1.1 |
+| **`static-h2` (256 conn)** | **Top 5** (#5 of 80) | **1,431,689 req/s** | 189.1 ms | 21.87 GB/s | HTTP/2 over TLS |
+| **`static-h2` (1024 conn)** | **Top 5** (#4 of 80) | **1,424,828 req/s** | 213.3 ms | 21.89 GB/s | HTTP/2 over TLS |
+| **`json-tls` (4096 conn)** | **Top 6** (#6 of 174) | **1,822,383 req/s** | 79.25 ms | 6.14 GB/s | HTTP/1.1 + TLS 1.3 |
+| **`async` (32,000 conn)** | **2.0M req/s** | **1,997,036 req/s** | 21.50 ms | 171.4 MB/s | HTTP/1.1 Timers |
 
 ### Official Web Frameworks Benchmark
 - Included in **[the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)** (PR [#10329](https://github.com/the-benchmarker/web-frameworks/pull/10329) merged).
