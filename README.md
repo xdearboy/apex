@@ -1,5 +1,8 @@
 # Apex
 
+[![HTTP Arena H/1.1](https://img.shields.io/endpoint?url=https://http-arena.com/badge/apex-tuned/h1.json)](https://http-arena.com/#tuned=1)
+[![HTTP Arena H/2](https://img.shields.io/endpoint?url=https://http-arena.com/badge/apex-tuned/h2.json)](https://http-arena.com/#tuned=1)
+
 Apex is an ultra-high-performance, zero-allocation web micro-framework for Linux written in modern C.
 
 Designed for extreme throughput and sub-millisecond tail latency, Apex utilizes a lock-free thread-per-core architecture, edge-triggered epoll, kernel connection load balancing, and direct vector response streaming.
