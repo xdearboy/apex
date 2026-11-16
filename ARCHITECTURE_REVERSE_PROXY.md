@@ -210,3 +210,38 @@ Phase 4: NeoGate Shield Engine
    ├── SIMD WAF query/body inspection module
    └── Stateless WASM / JS Proof-of-Work challenge injector
 ```
+
+---
+
+## 7. Production Hardening, Observability & Lifecycle Management
+
+To fully replace NGINX, Envoy, and H2O in real-world mission-critical edge deployments, Apex includes:
+
+### 7.1. Zero-Downtime Hot Upgrades & Configuration Reloads (`SIGHUP` / Socket Passing)
+- **Binary Upgrades without Dropping a Single Packet**:
+  - Fork-and-exec workflow: Master process spawns new Apex binary and passes listening socket file descriptors via `SCM_RIGHTS` UNIX domain socket control messages.
+  - Old workers enter graceful drain mode: stop accepting new connections, finish in-flight requests, and cleanly terminate (`close_idle_connections`).
+- **Live Configuration Reloads**:
+  - Atomic pointer swap (`RCU` pattern) for routing tables, upstream backend clusters, TLS certificates, and ACL lists.
+  - Workers swap to new configuration trees in **zero CPU cycles of latency overhead**.
+
+### 7.2. High-Performance Caching & Microcaching Engine
+- **Hierarchical Tiered Cache**:
+  - **L1 RAM Cache**: Lock-free thread-local LRU slab for hot microcached objects (<128KB).
+  - **L2 Fast NVMe / SSD Cache**: Asynchronous direct I/O (`io_uring` + `O_DIRECT`) eliminating OS buffer cache pollution.
+- **Cache-Control & Revalidation Protocols**:
+  - Full RFC 9111 HTTP caching compliance: `stale-while-revalidate`, `stale-if-error`, and conditional upstream probing (`304 Not Modified`).
+  - Single-Flight Request Collapsing: If 10,000 requests hit an expired cache entry simultaneously, only **one** request passes through to the upstream backend, while 9,999 wait for the response fill.
+
+### 7.3. Dynamic Scripting Engine: Embedded LuaJIT / WASM (WebAssembly)
+- **Ultra-Fast Custom Edge Logic**:
+  - Embedded **LuaJIT** integration (FFI-based) with pre-compiled bytecode execution for custom routing, token validation, and header injection with near-native C performance.
+  - Optional **WASM Runtime (wasmtime / wasmer)** support allowing developers to compile proxy filters written in Rust, Go, or Zig directly into Apex.
+
+### 7.4. Observability & Zero-Cost Telemetry
+- **Prometheus / OpenMetrics Native Scraper Endpoint**:
+  - Sub-microsecond `/metrics` handler exposing per-worker throughput, tail latencies (p50, p90, p99, p99.9 histograms), upstream connection pool health, and active stream counts.
+- **OpenTelemetry & W3C Distributed Tracing**:
+  - Sub-nanosecond parsing and injection of `traceparent` / `tracestate` headers across downstream-to-upstream boundaries.
+- **eBPF-Assisted Telemetry**:
+  - Kernel tracepoints for measuring TCP round-trip times (RTT), socket buffer bloat, and retransmission rates directly from kernel `tcp_info`.
