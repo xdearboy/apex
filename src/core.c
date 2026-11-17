@@ -1,22 +1,105 @@
 #include "internal.h"
 
+#include <limits.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/signalfd.h>
+
+enum { WORKERS_RUNNING, WORKERS_DRAINING, WORKERS_STOPPING };
+
 typedef struct {
-    int thread_id;
-    int port;
-    int nprocs;
+    _Atomic int shutdown;
+    int status_fd;
+} run_control_t;
+
+typedef struct {
+    pthread_t thread;
+    int cpu;
+    int epoll_fd;
+    int listen_fd;
+    int wake_fd;
+    int highest_fd;
+    size_t connection_count;
+    conn_t *connections;
     apex_app_t *app;
+    run_control_t *control;
+    apex_generation_t *generation;
+    _Atomic(apex_generation_t *) pending_generation;
+    _Atomic int error;
+    _Atomic bool finished;
 } worker_arg_t;
 
-static inline void close_conn(int epoll_fd, conn_t *connection) {
+typedef struct {
+    char host[APEX_CONFIG_HOST_MAX];
+    uint16_t port;
+    struct sockaddr_storage address;
+    socklen_t address_length;
+} listen_endpoint_t;
+
+static int close_fd(int *fd);
+static bool configure_client(int fd);
+
+static int close_fd(int *fd) {
+    if (*fd < 0) {
+        return 0;
+    }
+    int descriptor = *fd;
+    *fd = -1;
+    if (close(descriptor) != 0) {
+        perror("apex: close");
+        return -1;
+    }
+    return 0;
+}
+
+static int notify_fd(int fd) {
+    const uint64_t notification = 1u;
+    ssize_t written;
+    do {
+        written = write(fd, &notification, sizeof(notification));
+    } while (written < 0 && errno == EINTR);
+    if (written == (ssize_t)sizeof(notification) || (written < 0 && errno == EAGAIN)) {
+        return 0;
+    }
+    if (written >= 0) {
+        errno = EIO;
+    }
+    perror("apex: eventfd write");
+    return -1;
+}
+
+static int drain_notification(int fd) {
+    uint64_t notification;
+    ssize_t received;
+    do {
+        received = read(fd, &notification, sizeof(notification));
+    } while (received < 0 && errno == EINTR);
+    if (received == (ssize_t)sizeof(notification) || (received < 0 && errno == EAGAIN)) {
+        return 0;
+    }
+    if (received >= 0) {
+        errno = EIO;
+    }
+    perror("apex: eventfd read");
+    return -1;
+}
+
+static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
     free(connection->aux_buffer);
     connection->aux_buffer = NULL;
     connection->aux_length = 0;
     connection->aux_offset = 0;
 
-    if (connection->fd >= 0) {
-        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL);
-        close(connection->fd);
-        connection->fd = -1;
+    if (connection->active) {
+        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL) != 0 && errno != ENOENT) {
+            perror("apex: epoll_ctl remove connection");
+        }
+        if (close_fd(&connection->fd) != 0) {
+            atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+        }
+        connection->active = 0;
+        worker->connection_count--;
         connection->read_length = 0;
         connection->write_length = 0;
         connection->write_offset = 0;
@@ -53,7 +136,7 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
     connection->aux_length += length;
 }
 
-static inline void flush_write(int epoll_fd, conn_t *connection) {
+static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
     while (connection->fd >= 0) {
         ssize_t bytes_sent = 0;
 
@@ -91,7 +174,7 @@ static inline void flush_write(int epoll_fd, conn_t *connection) {
         if (bytes_sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             break;
         }
-        close_conn(epoll_fd, connection);
+        close_conn(worker, connection);
         return;
     }
 
@@ -103,186 +186,229 @@ static inline void flush_write(int epoll_fd, conn_t *connection) {
                    connection->aux_length > connection->aux_offset;
 
     if (!pending && connection->close_after_write) {
-        close_conn(epoll_fd, connection);
+        close_conn(worker, connection);
         return;
     }
 
     if (pending && !connection->epollout_active) {
         struct epoll_event event_config;
-        event_config.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+        event_config.events = EPOLLOUT | EPOLLRDHUP | EPOLLET;
+        if (!connection->close_after_write) {
+            event_config.events |= EPOLLIN;
+        }
         event_config.data.fd = connection->fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config);
+        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+            perror("apex: epoll_ctl enable output");
+            close_conn(worker, connection);
+            return;
+        }
         connection->epollout_active = 1;
     } else if (!pending && connection->epollout_active) {
         struct epoll_event event_config;
         event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
         event_config.data.fd = connection->fd;
-        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config);
+        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+            perror("apex: epoll_ctl disable output");
+            close_conn(worker, connection);
+            return;
+        }
         connection->epollout_active = 0;
     }
 }
 
+static void adopt_generation(worker_arg_t *worker) {
+    apex_generation_t *generation =
+        atomic_exchange_explicit(&worker->pending_generation, NULL, memory_order_acq_rel);
+    if (generation != NULL) {
+        /* Mailbox exchange transfers its reference to this worker. No request
+         * is active at this boundary, so the previous generation can go. */
+        apex_proxy_pool_reset();
+        apex_generation_release(worker->generation);
+        worker->generation = generation;
+    }
+}
+
+static void begin_drain(worker_arg_t *worker) {
+    /* Adopt everything already queued on the listener before it goes away so
+     * queued connections close with FIN instead of a listener-close RST. */
+    for (;;) {
+        int queued_fd = accept4(worker->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (queued_fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
+            }
+            break;
+        }
+        if (queued_fd < MAX_FDS && configure_client(queued_fd)) {
+            conn_t *queued_connection = &worker->connections[queued_fd];
+            memset(queued_connection, 0, sizeof(*queued_connection));
+            queued_connection->fd = queued_fd;
+            queued_connection->active = 1;
+            worker->connection_count++;
+            if (queued_fd > worker->highest_fd) {
+                worker->highest_fd = queued_fd;
+            }
+            struct epoll_event queued_event = {.events = EPOLLIN | EPOLLRDHUP | EPOLLET, .data.fd = queued_fd};
+            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, queued_fd, &queued_event) == 0) {
+                continue;
+            }
+            perror("apex: epoll_ctl add draining connection");
+        }
+        if (close_fd(&queued_fd) != 0) {
+            atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+        }
+    }
+
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL, worker->listen_fd, NULL) != 0) {
+        perror("apex: epoll_ctl stop listener");
+        atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+    }
+    if (close_fd(&worker->listen_fd) != 0) {
+        atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+    }
+    for (int fd = 0; fd <= worker->highest_fd; fd++) {
+        conn_t *connection = &worker->connections[fd];
+        if (connection->active) {
+            connection->close_after_write = 1;
+            flush_write(worker, connection);
+        }
+    }
+}
+
+static bool configure_client(int fd) {
+    const int enabled = 1;
+    const int idle_seconds = 15;
+    const int interval_seconds = 5;
+    const int probe_count = 3;
+    const unsigned int user_timeout_ms = 15000;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) != 0) {
+        perror("apex: configure client socket");
+        return false;
+    }
+    return true;
+}
+
 static void *worker_main(void *arg) {
-    worker_arg_t *worker_arg = (worker_arg_t *)arg;
-    int thread_id = worker_arg->thread_id;
-    int port = worker_arg->port;
-    apex_app_t *app = worker_arg->app;
-    int process_count = worker_arg->nprocs;
-
-    if (process_count > 0) {
-        cpu_set_t cpu_affinity_set;
-        CPU_ZERO(&cpu_affinity_set);
-        CPU_SET(thread_id % process_count, &cpu_affinity_set);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_affinity_set), &cpu_affinity_set);
-    }
-
-    int epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd < 0) {
-        perror("epoll_create1");
-        return NULL;
-    }
-
-    int listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (listen_fd < 0) {
-        perror("socket");
-        close(epoll_fd);
-        return NULL;
-    }
-
-    int socket_option_enable = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEPORT, &socket_option_enable, sizeof(socket_option_enable));
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &socket_option_enable, sizeof(socket_option_enable));
-    setsockopt(listen_fd, IPPROTO_TCP, TCP_NODELAY, &socket_option_enable, sizeof(socket_option_enable));
-    setsockopt(listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &socket_option_enable, sizeof(socket_option_enable));
-
-    struct sockaddr_in socket_address;
-    memset(&socket_address, 0, sizeof(socket_address));
-    socket_address.sin_family = AF_INET;
-    socket_address.sin_port = htons((uint16_t)port);
-    socket_address.sin_addr.s_addr = htonl(INADDR_ANY);
-
-    if (bind(listen_fd, (struct sockaddr *)&socket_address, sizeof(socket_address)) < 0) {
-        perror("bind");
-        close(listen_fd);
-        close(epoll_fd);
-        return NULL;
-    }
-
-    if (listen(listen_fd, 65535) < 0) {
-        perror("listen");
-        close(listen_fd);
-        close(epoll_fd);
-        return NULL;
-    }
-
-    struct epoll_event listen_event;
-    listen_event.events = EPOLLIN | EPOLLET;
-    listen_event.data.fd = listen_fd;
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &listen_event) < 0) {
-        perror("epoll_ctl listen_fd");
-        close(listen_fd);
-        close(epoll_fd);
-        return NULL;
-    }
-
-    conn_t *connections =
-        (conn_t *)mmap(NULL, sizeof(conn_t) * MAX_FDS, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (connections == MAP_FAILED) {
-        perror("mmap");
-        close(listen_fd);
-        close(epoll_fd);
-        return NULL;
-    }
-
-    for (int fd_index = 0; fd_index < MAX_FDS; fd_index++) {
-        connections[fd_index].fd = -1;
+    worker_arg_t *worker = arg;
+    conn_t *connections = worker->connections;
+    int epoll_fd = worker->epoll_fd;
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    CPU_SET(worker->cpu, &affinity);
+    int affinity_error = pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
+    if (affinity_error != 0) {
+        fprintf(stderr, "apex: cannot pin worker to CPU %d: %s\n", worker->cpu, strerror(affinity_error));
     }
 
     struct epoll_event events[MAX_EVENTS];
+    bool draining = false;
+    for (;;) {
+        adopt_generation(worker);
+        int shutdown = atomic_load_explicit(&worker->control->shutdown, memory_order_acquire);
+        if (shutdown == WORKERS_STOPPING) {
+            break;
+        }
+        if (shutdown == WORKERS_DRAINING && !draining) {
+            begin_drain(worker);
+            draining = true;
+        }
+        if (draining && worker->connection_count == 0) {
+            break;
+        }
 
-    while (1) {
         int ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
         if (ready_events_count < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            perror("apex: epoll_wait");
+            atomic_store_explicit(&worker->error, errno != 0 ? errno : EIO, memory_order_relaxed);
             break;
         }
 
         for (int event_index = 0; event_index < ready_events_count; event_index++) {
+            if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING &&
+                !draining) {
+                break;
+            }
+            if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) == WORKERS_STOPPING) {
+                goto worker_finished;
+            }
             int active_fd = events[event_index].data.fd;
             uint32_t active_event_flags = events[event_index].events;
 
-            if (active_fd == listen_fd) {
+            if (active_fd == worker->wake_fd) {
+                if (drain_notification(worker->wake_fd) != 0) {
+                    atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+                    goto worker_finished;
+                }
+                continue;
+            }
+            if (active_fd == worker->listen_fd) {
                 while (1) {
-                    int client_socket_fd = accept4(listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING) {
+                        break;
+                    }
+                    int client_socket_fd = accept4(worker->listen_fd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
                     if (client_socket_fd < 0) {
+                        if (errno == EINTR || errno == ECONNABORTED) {
+                            continue;
+                        }
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
                         }
-                        break;
+                        perror("apex: accept4");
+                        atomic_store_explicit(&worker->error, errno != 0 ? errno : EIO, memory_order_relaxed);
+                        goto worker_finished;
                     }
 
-                    if (client_socket_fd >= MAX_FDS) {
-                        close(client_socket_fd);
+                    if (client_socket_fd >= MAX_FDS || !configure_client(client_socket_fd)) {
+                        if (close_fd(&client_socket_fd) != 0) {
+                            atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+                        }
                         continue;
                     }
 
-                    int tcp_flag = 1;
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_NODELAY, &tcp_flag, sizeof(tcp_flag));
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_QUICKACK, &tcp_flag, sizeof(tcp_flag));
-                    setsockopt(client_socket_fd, SOL_SOCKET, SO_KEEPALIVE, &tcp_flag, sizeof(tcp_flag));
-#if defined(TCP_KEEPIDLE)
-                    int keepalive_idle_seconds = 15;
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_KEEPIDLE, &keepalive_idle_seconds,
-                               sizeof(keepalive_idle_seconds));
-#endif
-#if defined(TCP_KEEPINTVL)
-                    int keepalive_interval_seconds = 5;
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_KEEPINTVL, &keepalive_interval_seconds,
-                               sizeof(keepalive_interval_seconds));
-#endif
-#if defined(TCP_KEEPCNT)
-                    int keepalive_probes_count = 3;
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_KEEPCNT, &keepalive_probes_count,
-                               sizeof(keepalive_probes_count));
-#endif
-#if defined(TCP_USER_TIMEOUT)
-                    unsigned int user_timeout_milliseconds = 15000;
-                    setsockopt(client_socket_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_milliseconds,
-                               sizeof(user_timeout_milliseconds));
-#endif
-
                     conn_t *client_connection = &connections[client_socket_fd];
+                    memset(client_connection, 0, sizeof(*client_connection));
                     client_connection->fd = client_socket_fd;
-                    client_connection->read_length = 0;
-                    client_connection->write_length = 0;
-                    client_connection->write_offset = 0;
-                    client_connection->close_after_write = 0;
-                    client_connection->epollout_active = 0;
-                    client_connection->aux_buffer = NULL;
-                    client_connection->aux_length = 0;
-                    client_connection->aux_offset = 0;
+                    client_connection->active = 1;
+                    worker->connection_count++;
+                    if (client_socket_fd > worker->highest_fd) {
+                        worker->highest_fd = client_socket_fd;
+                    }
 
                     struct epoll_event client_event;
                     client_event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
                     client_event.data.fd = client_socket_fd;
-                    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket_fd, &client_event);
+                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket_fd, &client_event) != 0) {
+                        perror("apex: epoll_ctl add connection");
+                        close_conn(worker, client_connection);
+                    }
                 }
                 continue;
             }
 
+            if (active_fd < 0 || active_fd >= MAX_FDS) {
+                continue;
+            }
             conn_t *connection = &connections[active_fd];
-            if (connection->fd < 0) {
+            if (!connection->active) {
                 continue;
             }
 
             if (active_event_flags & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
-                close_conn(epoll_fd, connection);
+                close_conn(worker, connection);
                 continue;
             }
 
-            if (active_event_flags & EPOLLIN) {
+            if ((active_event_flags & EPOLLIN) && !draining) {
                 while (1) {
                     ssize_t bytes_received = recv(connection->fd, connection->read_buffer + connection->read_length,
                                                   sizeof(connection->read_buffer) - connection->read_length, 0);
@@ -292,13 +418,16 @@ static void *worker_main(void *arg) {
                             break;
                         }
                     } else if (bytes_received == 0) {
-                        close_conn(epoll_fd, connection);
+                        close_conn(worker, connection);
                         goto next_event;
                     } else {
+                        if (errno == EINTR) {
+                            continue;
+                        }
                         if (errno == EAGAIN || errno == EWOULDBLOCK) {
                             break;
                         }
-                        close_conn(epoll_fd, connection);
+                        close_conn(worker, connection);
                         goto next_event;
                     }
 
@@ -331,7 +460,11 @@ static void *worker_main(void *arg) {
                         }
                     }
 
-                    if (remaining_bytes < header_length + content_length) {
+                    if (content_length > sizeof(connection->read_buffer) - header_length) {
+                        close_conn(worker, connection);
+                        goto next_event;
+                    }
+                    if (remaining_bytes - header_length < content_length) {
                         break;
                     }
 
@@ -340,12 +473,18 @@ static void *worker_main(void *arg) {
                     }
 
                     apex_res_t response = {.conn = connection};
-                    apex_dispatch(app, buffer_cursor, header_length, buffer_cursor + header_length, content_length,
-                                  &response);
+                    const apex_runtime_t *runtime = worker->generation != NULL ? worker->generation->runtime : NULL;
+                    apex_dispatch_runtime(worker->app, runtime, buffer_cursor, header_length,
+                                          buffer_cursor + header_length, content_length, &response);
 
                     size_t total_request_length = header_length + content_length;
                     buffer_cursor += total_request_length;
                     remaining_bytes -= total_request_length;
+                    if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING) {
+                        connection->close_after_write = 1;
+                        remaining_bytes = 0;
+                        break;
+                    }
                 }
 
                 if (remaining_bytes > 0 && buffer_cursor != connection->read_buffer) {
@@ -353,78 +492,514 @@ static void *worker_main(void *arg) {
                 }
                 connection->read_length = (uint32_t)remaining_bytes;
 
-                flush_write(epoll_fd, connection);
+                flush_write(worker, connection);
             }
 
             if ((active_event_flags & EPOLLOUT) && connection->fd >= 0) {
-                flush_write(epoll_fd, connection);
+                flush_write(worker, connection);
             }
 
         next_event:;
         }
     }
 
-    munmap(connections, sizeof(conn_t) * MAX_FDS);
-    close(listen_fd);
-    close(epoll_fd);
+worker_finished:
+    for (int fd = 0; fd <= worker->highest_fd; fd++) {
+        if (connections[fd].active) {
+            close_conn(worker, &connections[fd]);
+        }
+    }
+    apex_proxy_pool_reset();
+    apex_generation_release(worker->generation);
+    worker->generation = NULL;
+    atomic_store_explicit(&worker->finished, true, memory_order_release);
+    if (notify_fd(worker->control->status_fd) != 0) {
+        atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+    }
     return NULL;
 }
 
-static void apex_handle_sig(int sig) {
-    (void)sig;
-    _exit(0);
+static int listener_error(const apex_config_t *config, int line, apex_config_error_t *error, const char *message) {
+    memset(error, 0, sizeof(*error));
+    error->code = APEX_CONFIG_ERR_RUNTIME;
+    error->line = line;
+    snprintf(error->file, sizeof(error->file), "%s", config->source);
+    snprintf(error->message, sizeof(error->message), "%s", message);
+    return -1;
 }
 
-int apex_run(apex_app_t *app, int port) {
-    signal(SIGINT, apex_handle_sig);
-    signal(SIGTERM, apex_handle_sig);
-    signal(SIGPIPE, SIG_IGN);
-
-    if (port <= 0 && app != NULL && app->owned_config != NULL) {
-        int configured_port = apex_config_first_listen_port(app->owned_config);
-        if (configured_port > 0) {
-            port = configured_port;
+static int config_listener(const apex_config_t *config, listen_endpoint_t *endpoint, apex_config_error_t *error) {
+    if (config->server_count == 0) {
+        return listener_error(config, 0, error, "configuration needs a server with a listen directive");
+    }
+    const apex_server_config_t *first = &config->servers[0];
+    for (size_t index = 0; index < config->server_count; index++) {
+        const apex_server_config_t *server = &config->servers[index];
+        if (server->listen_tls || server->tls.enabled) {
+            return listener_error(config, server->line, error, "the standalone core does not support TLS listeners");
+        }
+        if (server->listen_port == 0) {
+            return listener_error(config, server->line, error, "the standalone core requires a nonzero listen port");
+        }
+        if (server->listen_port != first->listen_port || strcmp(server->listen_host, first->listen_host) != 0) {
+            return listener_error(config, server->line, error,
+                                  "the standalone core supports one listening endpoint; virtual hosts must share it");
         }
     }
-    if (port <= 0) {
-        port = 8080;
+    snprintf(endpoint->host, sizeof(endpoint->host), "%s", first->listen_host);
+    endpoint->port = first->listen_port;
+    return 0;
+}
+
+static void report_config_error(const char *prefix, const apex_config_error_t *error) {
+    fprintf(stderr, "apex: %s: %s:%d:%d: %s\n", prefix, error->file, error->line, error->column, error->message);
+    if (error->hint[0] != '\0') {
+        fprintf(stderr, "  hint: %s\n", error->hint);
+    }
+}
+
+static int resolve_listener(listen_endpoint_t *endpoint) {
+    char service[6];
+    int written = snprintf(service, sizeof(service), "%u", (unsigned)endpoint->port);
+    if (written < 0 || (size_t)written >= sizeof(service)) {
+        fprintf(stderr, "apex: cannot format listen port\n");
+        return -1;
+    }
+    struct addrinfo hints = {0};
+    hints.ai_family = strchr(endpoint->host, ':') != NULL ? AF_INET6 : AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE | AI_NUMERICSERV;
+    struct addrinfo *addresses = NULL;
+    int status = getaddrinfo(endpoint->host[0] != '\0' ? endpoint->host : NULL, service, &hints, &addresses);
+    if (status != 0) {
+        fprintf(stderr, "apex: cannot resolve listen address: %s\n",
+                status == EAI_SYSTEM ? strerror(errno) : gai_strerror(status));
+        return -1;
+    }
+    if (addresses == NULL || addresses->ai_addrlen > sizeof(endpoint->address)) {
+        fprintf(stderr, "apex: unsupported listen address\n");
+        if (addresses != NULL) {
+            freeaddrinfo(addresses);
+        }
+        return -1;
+    }
+    memcpy(&endpoint->address, addresses->ai_addr, addresses->ai_addrlen);
+    endpoint->address_length = addresses->ai_addrlen;
+    freeaddrinfo(addresses);
+    return 0;
+}
+
+static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoint) {
+    worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
+    if (worker->epoll_fd < 0) {
+        perror("apex: epoll_create1");
+        return -1;
+    }
+    worker->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (worker->wake_fd < 0) {
+        perror("apex: eventfd worker");
+        return -1;
+    }
+    worker->listen_fd = socket(endpoint->address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (worker->listen_fd < 0) {
+        perror("apex: socket listener");
+        return -1;
+    }
+    const int enabled = 1;
+    /* No TCP_DEFER_ACCEPT: it RSTs accepted-but-never-accepted queued idle
+     * connections when the drain closes the listener; graceful shutdown wins. */
+    if (setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
+        (endpoint->address.ss_family == AF_INET6 &&
+         setsockopt(worker->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0)) {
+        perror("apex: configure listener socket");
+        return -1;
+    }
+    if (bind(worker->listen_fd, (const struct sockaddr *)&endpoint->address, endpoint->address_length) != 0) {
+        perror("apex: bind");
+        return -1;
+    }
+    if (listen(worker->listen_fd, 65535) != 0) {
+        perror("apex: listen");
+        return -1;
+    }
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.fd = worker->listen_fd};
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->listen_fd, &event) != 0) {
+        perror("apex: epoll_ctl listener");
+        return -1;
+    }
+    event.events = EPOLLIN;
+    event.data.fd = worker->wake_fd;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->wake_fd, &event) != 0) {
+        perror("apex: epoll_ctl worker control");
+        return -1;
+    }
+    worker->connections = mmap(NULL, sizeof(conn_t) * MAX_FDS, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (worker->connections == MAP_FAILED) {
+        worker->connections = NULL;
+        perror("apex: mmap connections");
+        return -1;
+    }
+    /* Zero-filled mappings use active == 0, so startup need not dirty every
+     * connection page merely to initialize a file-descriptor sentinel. */
+    worker->generation = worker->app->generation;
+    apex_generation_retain(worker->generation);
+    return 0;
+}
+
+static int wake_workers(worker_arg_t *workers, size_t count) {
+    int status = 0;
+    for (size_t index = 0; index < count; index++) {
+        if (notify_fd(workers[index].wake_fd) != 0) {
+            status = -1;
+        }
+    }
+    return status;
+}
+
+static int reload_config(apex_app_t *app, const char *path, const listen_endpoint_t *listener,
+                         worker_arg_t *workers, size_t count) {
+    apex_config_error_t error = {0};
+    apex_config_t *config = NULL;
+    if (apex_config_parse_file(path, &config, &error) != APEX_CONFIG_OK) {
+        report_config_error("reload rejected; keeping previous configuration", &error);
+        return 0;
+    }
+    listen_endpoint_t candidate = {0};
+    if (config_listener(config, &candidate, &error) != 0) {
+        report_config_error("reload rejected; keeping previous configuration", &error);
+        apex_config_free(config);
+        return 0;
+    }
+    if (candidate.port != listener->port || strcmp(candidate.host, listener->host) != 0) {
+        listener_error(config, config->servers[0].line, &error, "changing the listening endpoint requires a restart");
+        report_config_error("reload rejected; keeping previous configuration", &error);
+        apex_config_free(config);
+        return 0;
+    }
+    apex_generation_t *generation = apex_generation_create(config, &error);
+    if (generation == NULL) {
+        report_config_error("reload rejected; keeping previous configuration", &error);
+        apex_config_free(config);
+        return 0;
     }
 
-    const char *port_env = getenv("PORT");
-    if (port_env) {
-        int p = atoi(port_env);
-        if (p > 0)
-            port = p;
+    apex_generation_t *previous = app->generation;
+    app->generation = generation;
+    for (size_t index = 0; index < count; index++) {
+        apex_generation_retain(generation);
+        apex_generation_t *pending =
+            atomic_exchange_explicit(&workers[index].pending_generation, generation, memory_order_acq_rel);
+        apex_generation_release(pending);
     }
-
-    int nprocs = get_nprocs();
-    if (nprocs <= 0) {
-        nprocs = 1;
+    apex_generation_release(previous);
+    if (wake_workers(workers, count) != 0) {
+        return -1;
     }
+    fprintf(stderr, "apex: configuration reloaded: %s\n", path);
+    return 0;
+}
 
-    pthread_t *threads = (pthread_t *)calloc((size_t)nprocs, sizeof(pthread_t));
-    worker_arg_t *args = (worker_arg_t *)calloc((size_t)nprocs, sizeof(worker_arg_t));
-    if (!threads || !args) {
-        fprintf(stderr, "Memory allocation error\n");
+static int run_app(apex_app_t *app, int port, const char *config_path) {
+    if (app == NULL || (config_path != NULL && (config_path[0] == '\0' || app->generation == NULL))) {
+        fprintf(stderr, "apex: invalid application or configuration path\n");
+        return 1;
+    }
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&app->running, &expected, true,
+                                                 memory_order_acq_rel, memory_order_acquire)) {
+        fprintf(stderr, "apex: application is already running\n");
         return 1;
     }
 
-    for (int i = 0; i < nprocs; i++) {
-        args[i].thread_id = i;
-        args[i].port = port;
-        args[i].nprocs = nprocs;
-        args[i].app = app;
-        if (pthread_create(&threads[i], NULL, worker_main, &args[i]) != 0) {
-            fprintf(stderr, "Failed to create worker thread %d\n", i);
-            return 1;
+    int result = 1;
+    int signal_fd = -1;
+    size_t worker_count = 0;
+    size_t started = 0;
+    worker_arg_t *workers = NULL;
+    run_control_t control = {.status_fd = -1};
+    atomic_init(&control.shutdown, WORKERS_RUNNING);
+    bool mask_changed = false;
+    bool pipe_changed = false;
+    sigset_t signals;
+    sigset_t previous_mask;
+    struct sigaction previous_pipe;
+    listen_endpoint_t listener = {0};
+
+    if (app->generation != NULL && (config_path != NULL || app->generation->config->server_count > 0)) {
+        apex_config_error_t error;
+        if (config_listener(app->generation->config, &listener, &error) != 0) {
+            report_config_error("cannot start", &error);
+            goto cleanup;
+        }
+    }
+    if (config_path == NULL) {
+        if (port <= 0) {
+            port = listener.port != 0 ? listener.port : 8080;
+        }
+        const char *port_env = getenv("PORT");
+        if (port_env != NULL && port_env[0] != '\0') {
+            char *end;
+            errno = 0;
+            long value = strtol(port_env, &end, 10);
+            if (errno == 0 && end != port_env && *end == '\0' && value > 0 && value <= UINT16_MAX) {
+                port = (int)value;
+            } else {
+                fprintf(stderr, "apex: ignoring invalid PORT value\n");
+            }
+        }
+        if (port <= 0 || port > UINT16_MAX) {
+            fprintf(stderr, "apex: listen port is outside 1..65535\n");
+            goto cleanup;
+        }
+        listener.port = (uint16_t)port;
+    }
+    if (resolve_listener(&listener) != 0) {
+        goto cleanup;
+    }
+
+    if (sigemptyset(&signals) != 0 || sigaddset(&signals, SIGHUP) != 0 || sigaddset(&signals, SIGQUIT) != 0 ||
+        sigaddset(&signals, SIGINT) != 0 || sigaddset(&signals, SIGTERM) != 0) {
+        perror("apex: construct signal mask");
+        goto cleanup;
+    }
+    int mask_error = pthread_sigmask(SIG_BLOCK, &signals, &previous_mask);
+    if (mask_error != 0) {
+        fprintf(stderr, "apex: block signals: %s\n", strerror(mask_error));
+        goto cleanup;
+    }
+    mask_changed = true;
+    struct sigaction ignore_pipe = {.sa_handler = SIG_IGN};
+    if (sigemptyset(&ignore_pipe.sa_mask) != 0 || sigaction(SIGPIPE, &ignore_pipe, &previous_pipe) != 0) {
+        perror("apex: ignore SIGPIPE");
+        goto cleanup;
+    }
+    pipe_changed = true;
+    signal_fd = signalfd(-1, &signals, SFD_NONBLOCK | SFD_CLOEXEC);
+    if (signal_fd < 0) {
+        perror("apex: signalfd");
+        goto cleanup;
+    }
+    control.status_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (control.status_fd < 0) {
+        perror("apex: eventfd controller");
+        goto cleanup;
+    }
+
+    cpu_set_t cpus;
+    if (sched_getaffinity(0, sizeof(cpus), &cpus) != 0) {
+        perror("apex: sched_getaffinity");
+        goto cleanup;
+    }
+    worker_count = (size_t)CPU_COUNT(&cpus);
+    if (worker_count == 0) {
+        fprintf(stderr, "apex: no available worker CPUs\n");
+        goto cleanup;
+    }
+    workers = calloc(worker_count, sizeof(*workers));
+    if (workers == NULL) {
+        perror("apex: allocate workers");
+        goto cleanup;
+    }
+    for (size_t index = 0; index < worker_count; index++) {
+        workers[index].epoll_fd = -1;
+        workers[index].listen_fd = -1;
+        workers[index].wake_fd = -1;
+        workers[index].highest_fd = -1;
+        workers[index].app = app;
+        workers[index].control = &control;
+        atomic_init(&workers[index].pending_generation, NULL);
+        atomic_init(&workers[index].error, 0);
+        atomic_init(&workers[index].finished, false);
+    }
+    size_t index = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (CPU_ISSET(cpu, &cpus)) {
+            workers[index++].cpu = cpu;
+        }
+    }
+    for (index = 0; index < worker_count; index++) {
+        if (prepare_worker(&workers[index], &listener) != 0) {
+            goto cleanup;
+        }
+    }
+    for (index = 0; index < worker_count; index++) {
+        int thread_error = pthread_create(&workers[index].thread, NULL, worker_main, &workers[index]);
+        if (thread_error != 0) {
+            fprintf(stderr, "apex: create worker: %s\n", strerror(thread_error));
+            goto cleanup;
+        }
+        started++;
+    }
+    fprintf(stderr, "apex: listening on %s:%u with %zu worker(s)\n",
+            listener.host[0] != '\0' ? listener.host : "0.0.0.0", (unsigned)listener.port, worker_count);
+    result = 0;
+
+    struct pollfd descriptors[2] = {
+        {.fd = signal_fd, .events = POLLIN},
+        {.fd = control.status_fd, .events = POLLIN},
+    };
+    for (;;) {
+        size_t finished = 0;
+        for (index = 0; index < started; index++) {
+            if (atomic_load_explicit(&workers[index].error, memory_order_relaxed) != 0) {
+                result = 1;
+                goto cleanup;
+            }
+            if (atomic_load_explicit(&workers[index].finished, memory_order_acquire)) {
+                finished++;
+            }
+        }
+        if (finished == started) {
+            break;
+        }
+        if (finished > 0 && atomic_load_explicit(&control.shutdown, memory_order_acquire) == WORKERS_RUNNING) {
+            fprintf(stderr, "apex: worker exited unexpectedly\n");
+            result = 1;
+            goto cleanup;
+        }
+        int ready = poll(descriptors, 2, -1);
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("apex: poll controller");
+            result = 1;
+            goto cleanup;
+        }
+        if ((descriptors[0].revents | descriptors[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "apex: controller descriptor failed\n");
+            result = 1;
+            goto cleanup;
+        }
+        if ((descriptors[1].revents & POLLIN) && drain_notification(control.status_fd) != 0) {
+            result = 1;
+            goto cleanup;
+        }
+        if (descriptors[0].revents & POLLIN) {
+            struct signalfd_siginfo notification;
+            for (;;) {
+                ssize_t received = read(signal_fd, &notification, sizeof(notification));
+                if (received < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (received < 0 && errno == EAGAIN) {
+                    break;
+                }
+                if (received != (ssize_t)sizeof(notification)) {
+                    if (received >= 0) {
+                        errno = EIO;
+                    }
+                    perror("apex: signalfd read");
+                    result = 1;
+                    goto cleanup;
+                }
+                int shutdown = atomic_load_explicit(&control.shutdown, memory_order_acquire);
+                if (notification.ssi_signo == SIGHUP) {
+                    if (config_path != NULL && shutdown == WORKERS_RUNNING &&
+                        reload_config(app, config_path, &listener, workers, started) != 0) {
+                        result = 1;
+                        goto cleanup;
+                    }
+                    continue;
+                }
+                if (notification.ssi_signo == SIGQUIT && shutdown == WORKERS_RUNNING) {
+                    fprintf(stderr, "apex: graceful shutdown requested\n");
+                    atomic_store_explicit(&control.shutdown, WORKERS_DRAINING, memory_order_release);
+                } else if (notification.ssi_signo == SIGINT || notification.ssi_signo == SIGTERM) {
+                    fprintf(stderr, "apex: shutdown requested\n");
+                    atomic_store_explicit(&control.shutdown, WORKERS_STOPPING, memory_order_release);
+                }
+                if (wake_workers(workers, started) != 0) {
+                    result = 1;
+                    goto cleanup;
+                }
+            }
         }
     }
 
-    for (int i = 0; i < nprocs; i++) {
-        pthread_join(threads[i], NULL);
+cleanup:
+    atomic_store_explicit(&control.shutdown, WORKERS_STOPPING, memory_order_release);
+    if (started > 0 && wake_workers(workers, started) != 0) {
+        result = 1;
     }
+    for (size_t index = 0; index < started; index++) {
+        int join_error = pthread_join(workers[index].thread, NULL);
+        if (join_error != 0) {
+            /* Continuing would free storage still reachable by a worker. */
+            fprintf(stderr, "apex: join worker: %s\n", strerror(join_error));
+            abort();
+        }
+        if (atomic_load_explicit(&workers[index].error, memory_order_relaxed) != 0) {
+            result = 1;
+        }
+    }
+    if (workers != NULL) {
+        for (size_t index = 0; index < worker_count; index++) {
+            apex_generation_release(atomic_exchange_explicit(&workers[index].pending_generation, NULL,
+                                                              memory_order_acq_rel));
+            apex_generation_release(workers[index].generation);
+            if (workers[index].connections != NULL &&
+                munmap(workers[index].connections, sizeof(conn_t) * MAX_FDS) != 0) {
+                perror("apex: munmap connections");
+                result = 1;
+            }
+            if (close_fd(&workers[index].listen_fd) != 0) {
+                result = 1;
+            }
+            if (close_fd(&workers[index].wake_fd) != 0) {
+                result = 1;
+            }
+            if (close_fd(&workers[index].epoll_fd) != 0) {
+                result = 1;
+            }
+        }
+        free(workers);
+    }
+    if (mask_changed && signal_fd >= 0) {
+        /* Consume shutdown/reload signals queued during joins before restoring
+         * the caller's mask and its original dispositions. */
+        struct signalfd_siginfo notification;
+        ssize_t received;
+        do {
+            received = read(signal_fd, &notification, sizeof(notification));
+        } while (received == (ssize_t)sizeof(notification) || (received < 0 && errno == EINTR));
+        if (received >= 0 || errno != EAGAIN) {
+            fprintf(stderr, "apex: cannot drain pending control signals\n");
+            result = 1;
+        }
+    }
+    if (close_fd(&signal_fd) != 0) {
+        result = 1;
+    }
+    if (close_fd(&control.status_fd) != 0) {
+        result = 1;
+    }
+    if (pipe_changed && sigaction(SIGPIPE, &previous_pipe, NULL) != 0) {
+        perror("apex: restore SIGPIPE disposition");
+        result = 1;
+    }
+    if (mask_changed) {
+        int mask_error = pthread_sigmask(SIG_SETMASK, &previous_mask, NULL);
+        if (mask_error != 0) {
+            fprintf(stderr, "apex: restore signal mask: %s\n", strerror(mask_error));
+            result = 1;
+        }
+    }
+    atomic_store_explicit(&app->running, false, memory_order_release);
+    return result;
+}
 
-    free(threads);
-    free(args);
-    return 0;
+int apex_run(apex_app_t *app, int port) {
+    return run_app(app, port, NULL);
+}
+
+int apex_run_config(apex_app_t *app, const char *config_path) {
+    if (config_path == NULL) {
+        fprintf(stderr, "apex: configuration path is null\n");
+        return 1;
+    }
+    return run_app(app, 0, config_path);
 }

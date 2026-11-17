@@ -3,6 +3,8 @@ CSTD ?= -std=c2x
 CFLAGS ?= $(CSTD) -O3 -flto -D_GNU_SOURCE -pthread -Wall -Wextra -Werror -Iinclude -Isrc
 AR ?= ar
 LDFLAGS ?= -pthread -flto
+VERSION ?= 1.3.2
+PYTHON ?= python3
 
 ifdef SANITIZE
 CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -g
@@ -10,6 +12,7 @@ LDFLAGS += -fsanitize=address,undefined
 endif
 
 LIB = libapex.a
+BIN = apex
 SRCS = src/core.c src/router.c src/proxy.c src/config.c
 OBJS = $(SRCS:.c=.o)
 HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal.h
@@ -17,10 +20,27 @@ HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo
 
-all: $(LIB) $(EXAMPLES)
+all: $(LIB) $(BIN) $(EXAMPLES)
 
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
+
+BUILD_META_H = src/build_meta.h
+
+# Regenerated whenever the Makefile changes. If you override CC/CFLAGS/LDFLAGS
+# or SANITIZE on the command line, run `make clean` once so -v stays truthful.
+$(BUILD_META_H): Makefile
+	@{ printf '#define APEX_VERSION "%s"\n' "$(VERSION)"; \
+	   printf '#define APEX_BUILD_CC "%s"\n' "$(CC)"; \
+	   printf '#define APEX_BUILD_CFLAGS "%s"\n' "$(CFLAGS)"; \
+	   printf '#define APEX_BUILD_LDFLAGS "%s"\n' "$(LDFLAGS)"; } > $@.tmp \
+	&& mv -f $@.tmp $@
+
+$(BIN): src/main.o $(BUILD_META_H) $(LIB)
+	$(CC) $(CFLAGS) -o $@ src/main.o $(LIB) $(LDFLAGS)
+
+src/main.o: src/main.c $(HEADERS) $(BUILD_META_H) Makefile
+	$(CC) $(CFLAGS) -c $< -o $@
 
 examples/web_frameworks: examples/web_frameworks.o $(LIB)
 	$(CC) $(CFLAGS) -o $@ examples/web_frameworks.o $(LIB) $(LDFLAGS)
@@ -39,6 +59,7 @@ proxy: examples/proxy_demo
 test: all
 	./examples/config_demo --selftest
 	./examples/proxy_demo
+	$(PYTHON) tests/test_cli.py ./$(BIN)
 
 check: test
 
@@ -46,6 +67,6 @@ check: test
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(LIB) examples/*.o $(EXAMPLES)
+	rm -f $(OBJS) src/main.o $(LIB) $(BIN) examples/*.o $(EXAMPLES) $(BUILD_META_H)
 
 .PHONY: all clean proxy test check

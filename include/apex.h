@@ -38,11 +38,19 @@ void apex_route(apex_app_t *app, const char *method, const char *pattern, apex_h
 void apex_res_send(apex_res_t *res, int status, const void *body, size_t body_len);
 void apex_res_header(apex_res_t *res, const char *key, const char *value);
 
-/* Attaches a compiled configuration. On success the app owns config. On
- * failure the caller keeps ownership and error describes the reason. */
+/* Attach configurations and register routes before running the app. On
+ * successful attachment the app owns config; on failure the caller owns it. */
 int apex_app_attach_config(apex_app_t *app, apex_config_t *config, apex_config_error_t *error);
 
+/* These calls block until shutdown. SIGQUIT drains active requests and queued
+ * responses; SIGINT/SIGTERM stop workers after their current handler returns.
+ * Call from the main thread, before starting other application threads. */
 int apex_run(apex_app_t *app, int port);
+
+/* Run an attached configuration and reload config_path on SIGHUP. Failed
+ * reloads preserve the active configuration. A listener change requires a
+ * restart. The standalone core supports one plaintext listening endpoint. */
+int apex_run_config(apex_app_t *app, const char *config_path);
 
 #ifdef __cplusplus
 }

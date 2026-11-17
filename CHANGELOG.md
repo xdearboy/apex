@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- Standalone CLI binary `./apex` (`src/main.c`): `-c <path>` (default `/etc/apex/apex.conf`),
+  `-t` config validation without starting workers, `-v` version with real build metadata
+  (generated into `src/build_meta.h`), invalid usage exits 1.
+- `SIGHUP` hot reload: a fully validated candidate generation is built before publication;
+  rejected reloads (syntax, semantics, unresolvable upstream, listener change) keep the
+  previous configuration and the running process. In-flight requests finish with their
+  generation; routing changes on the same listening endpoint without dropping keep-alive
+  connections.
+- Graceful `SIGQUIT` shutdown: drains in-flight requests and queued responses, closes idle
+  keep-alive connections with FIN (not RST); `SIGINT`/`SIGTERM` stop workers after the
+  current handler returns. Control loop uses `signalfd` + `eventfd` (no async-signal
+  parse/alloc/free).
+- Integration test suite `tests/test_cli.py` (24 tests, runs via `make test`).
+
+### Changed
+- Removed `TCP_DEFER_ACCEPT` from the listener: it caused queued idle connections to be
+  reset when the drain path closed the listener; the accept queue is now drained before
+  the listener is closed so idle clients always observe FIN.
+
 ## [1.3.2]
 
 ### Changed / Code Quality

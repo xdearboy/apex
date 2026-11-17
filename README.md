@@ -41,9 +41,13 @@ int main(void) {
 
 ## Repository Structure
 
-- [`include/`](include/) & [`src/`](src/): The core public C micro-framework library (`libapex.a`) powering [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks).
-- [`engine/`](engine/): The high-performance tuned HTTP/1.1 & HTTP/2 engine with TLS 1.3, asynchronous timer heaps, static asset compression, and multi-port routing powering [HttpArena](https://http-arena.com).
-- [`examples/`](examples/): Example applications (`web_frameworks`, `hello_world`).
+- [`include/`](include/) & [`src/`](src/): The core public C micro-framework library (`libapex.a`) and the standalone `apex` server binary powering [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks).
+- [`engine/`](engine/): The high-performance tuned HTTP/1.1 & HTTP/2 engine with TLS 1.3, asynchronous timer heaps, static asset compression, and multi-port routing powering [HttpArena](https://http-arena.com). Self-contained: own Makefile and Dockerfile, built independently of the library.
+- [`examples/`](examples/): Example applications (`web_frameworks`, `hello_world`, `proxy_demo`, `config_demo`).
+- [`tests/`](tests/): Integration tests (`make test`).
+- [`conf/`](conf/): Reference configuration.
+- [`docs/`](docs/): Design documents — reverse-proxy architecture, web-server roadmap, configuration language spec.
+- [`scripts/`](scripts/): Benchmarking and OS-tuning helpers.
 
 ## Performance & Benchmarks
 
@@ -114,6 +118,28 @@ wrk -t4 -c100 -d10s https://apex.d3vo.ru/
 make
 ./examples/web_frameworks
 ```
+
+## CLI (`apex`)
+
+`make` also builds the standalone server binary `./apex`:
+
+```bash
+./apex -t conf/apex.conf        # validate configuration, exit 0/1
+./apex -c /etc/apex/apex.conf   # serve (default config path: /etc/apex/apex.conf)
+./apex -v                       # version and build flags
+```
+
+Signals: `SIGHUP` rebuilds and validates the candidate configuration in place —
+routing (static/proxy) changes on the same listening endpoint, active requests
+keep serving their generation, and a rejected reload keeps the previous
+configuration. `SIGQUIT` drains in-flight requests and queued responses, then
+stops; `SIGINT`/`SIGTERM` stop workers after the current handler returns.
+
+Scope of the standalone core: one plaintext listening endpoint (virtual hosts
+may share it), no TLS yet. Changing the listener on reload requires a restart
+and is rejected with a message; `PORT` is honored only by `apex_run()` library
+users, the CLI follows the configuration. Integration tests live in
+`tests/test_cli.py` (`make test`).
 
 ## License
 

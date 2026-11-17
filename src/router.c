@@ -368,13 +368,52 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
 
 apex_app_t *apex_create(void) {
     apex_app_t *app = (apex_app_t *)calloc(1, sizeof(apex_app_t));
+    if (app != NULL) {
+        atomic_init(&app->running, false);
+    }
     return app;
+}
+
+apex_generation_t *apex_generation_create(apex_config_t *config, apex_config_error_t *error) {
+    apex_runtime_t *runtime = apex_runtime_create(config, error);
+    if (runtime == NULL) {
+        return NULL;
+    }
+
+    apex_generation_t *generation = malloc(sizeof(*generation));
+    if (generation == NULL) {
+        apex_runtime_destroy(runtime);
+        if (error != NULL) {
+            memset(error, 0, sizeof(*error));
+            error->code = APEX_CONFIG_ERR_MEMORY;
+            snprintf(error->message, sizeof(error->message), "cannot allocate configuration generation");
+        }
+        return NULL;
+    }
+    atomic_init(&generation->references, 1u);
+    generation->config = config;
+    generation->runtime = runtime;
+    return generation;
+}
+
+void apex_generation_retain(apex_generation_t *generation) {
+    if (generation != NULL) {
+        atomic_fetch_add_explicit(&generation->references, 1u, memory_order_relaxed);
+    }
+}
+
+void apex_generation_release(apex_generation_t *generation) {
+    if (generation != NULL &&
+        atomic_fetch_sub_explicit(&generation->references, 1u, memory_order_acq_rel) == 1u) {
+        apex_runtime_destroy(generation->runtime);
+        apex_config_free(generation->config);
+        free(generation);
+    }
 }
 
 void apex_destroy(apex_app_t *app) {
     if (app) {
-        apex_runtime_destroy(app->runtime);
-        apex_config_free(app->owned_config);
+        apex_generation_release(app->generation);
         free(app);
     }
 }
@@ -389,15 +428,27 @@ int apex_app_attach_config(apex_app_t *app, apex_config_t *config, apex_config_e
         return -1;
     }
 
-    apex_runtime_t *runtime = apex_runtime_create(config, error);
-    if (runtime == NULL) {
+    if (atomic_load_explicit(&app->running, memory_order_acquire)) {
+        if (error != NULL) {
+            memset(error, 0, sizeof(*error));
+            error->code = APEX_CONFIG_ERR_RUNTIME;
+            snprintf(error->message, sizeof(error->message), "cannot attach a configuration while the app is running");
+        }
         return -1;
     }
+    if (app->generation != NULL && app->generation->config == config) {
+        if (error != NULL) {
+            memset(error, 0, sizeof(*error));
+        }
+        return 0;
+    }
 
-    apex_runtime_destroy(app->runtime);
-    apex_config_free(app->owned_config);
-    app->owned_config = config;
-    app->runtime = runtime;
+    apex_generation_t *generation = apex_generation_create(config, error);
+    if (generation == NULL) {
+        return -1;
+    }
+    apex_generation_release(app->generation);
+    app->generation = generation;
     return 0;
 }
 
@@ -652,6 +703,12 @@ static void router_serve_static(const apex_location_config_t *location, const ch
 
 void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
                    apex_res_t *res) {
+    const apex_runtime_t *runtime = app->generation != NULL ? app->generation->runtime : NULL;
+    apex_dispatch_runtime(app, runtime, req_buf, header_len, body, body_len, res);
+}
+
+void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const char *req_buf, size_t header_len,
+                           const char *body, size_t body_len, apex_res_t *res) {
     if (req_buf[0] == 'G' && req_buf[1] == 'E' && req_buf[2] == 'T' && req_buf[3] == ' ') {
         const char *path = req_buf + 4;
         if (path[0] == '/' && path[1] == ' ') {
@@ -763,7 +820,7 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
         }
     }
 
-    if (app->runtime != NULL) {
+    if (runtime != NULL) {
         char host[256];
         size_t host_length = 0;
         const char *host_value = NULL;
@@ -782,7 +839,7 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
         }
 
         apex_config_route_t route;
-        if (apex_runtime_match(app->runtime, host, host_length, path, match_path_length, &route) &&
+        if (apex_runtime_match(runtime, host, host_length, path, match_path_length, &route) &&
             route.location != NULL) {
             if (route.location->target != APEX_PROXY_TARGET_NONE) {
                 router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
@@ -799,4 +856,3 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
 
     apex_res_send(res, 404, NULL, 0);
 }
-
