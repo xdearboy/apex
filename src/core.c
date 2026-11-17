@@ -8,6 +8,11 @@ typedef struct {
 } worker_arg_t;
 
 static inline void close_conn(int epoll_fd, conn_t *connection) {
+    free(connection->aux_buffer);
+    connection->aux_buffer = NULL;
+    connection->aux_length = 0;
+    connection->aux_offset = 0;
+
     if (connection->fd >= 0) {
         epoll_ctl(epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL);
         close(connection->fd);
@@ -20,40 +25,95 @@ static inline void close_conn(int epoll_fd, conn_t *connection) {
     }
 }
 
+void apex_conn_write(conn_t *connection, const void *data, size_t length) {
+    if (connection == NULL || data == NULL || length == 0) {
+        return;
+    }
+
+    bool aux_pending = connection->aux_length > connection->aux_offset;
+
+    if (!aux_pending && length <= sizeof(connection->write_buffer) - connection->write_length) {
+        memcpy(connection->write_buffer + connection->write_length, data, length);
+        connection->write_length += (uint32_t)length;
+        return;
+    }
+
+    if (length > SIZE_MAX - connection->aux_length) {
+        connection->close_after_write = 1;
+        return;
+    }
+
+    char *grown = realloc(connection->aux_buffer, connection->aux_length + length);
+    if (grown == NULL) {
+        connection->close_after_write = 1;
+        return;
+    }
+    connection->aux_buffer = grown;
+    memcpy(connection->aux_buffer + connection->aux_length, data, length);
+    connection->aux_length += length;
+}
+
 static inline void flush_write(int epoll_fd, conn_t *connection) {
-    if (connection->write_length > connection->write_offset) {
-        size_t bytes_to_send = connection->write_length - connection->write_offset;
-        ssize_t bytes_sent =
-            send(connection->fd, connection->write_buffer + connection->write_offset, bytes_to_send, MSG_NOSIGNAL);
-        if (bytes_sent > 0) {
-            connection->write_offset += (uint32_t)bytes_sent;
-            if (connection->write_offset == connection->write_length) {
-                connection->write_offset = 0;
-                connection->write_length = 0;
-                if (connection->close_after_write) {
-                    close_conn(epoll_fd, connection);
-                    return;
+    while (connection->fd >= 0) {
+        ssize_t bytes_sent = 0;
+
+        if (connection->write_length > connection->write_offset) {
+            size_t bytes_to_send = connection->write_length - connection->write_offset;
+            bytes_sent = send(connection->fd, connection->write_buffer + connection->write_offset, bytes_to_send,
+                              MSG_NOSIGNAL);
+            if (bytes_sent > 0) {
+                connection->write_offset += (uint32_t)bytes_sent;
+                if (connection->write_offset == connection->write_length) {
+                    connection->write_offset = 0;
+                    connection->write_length = 0;
                 }
             }
-        } else if (bytes_sent < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            close_conn(epoll_fd, connection);
-            return;
+        } else if (connection->aux_length > connection->aux_offset) {
+            size_t bytes_to_send = connection->aux_length - connection->aux_offset;
+            bytes_sent = send(connection->fd, connection->aux_buffer + connection->aux_offset, bytes_to_send,
+                              MSG_NOSIGNAL);
+            if (bytes_sent > 0) {
+                connection->aux_offset += (size_t)bytes_sent;
+                if (connection->aux_offset == connection->aux_length) {
+                    free(connection->aux_buffer);
+                    connection->aux_buffer = NULL;
+                    connection->aux_length = 0;
+                    connection->aux_offset = 0;
+                }
+            }
+        } else {
+            break;
         }
+
+        if (bytes_sent > 0 || (bytes_sent < 0 && errno == EINTR)) {
+            continue;
+        }
+        if (bytes_sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            break;
+        }
+        close_conn(epoll_fd, connection);
+        return;
     }
 
     if (connection->fd < 0) {
         return;
     }
 
-    if (connection->write_length > connection->write_offset) {
-        if (!connection->epollout_active) {
-            struct epoll_event event_config;
-            event_config.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
-            event_config.data.fd = connection->fd;
-            epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config);
-            connection->epollout_active = 1;
-        }
-    } else if (connection->epollout_active) {
+    bool pending = connection->write_length > connection->write_offset ||
+                   connection->aux_length > connection->aux_offset;
+
+    if (!pending && connection->close_after_write) {
+        close_conn(epoll_fd, connection);
+        return;
+    }
+
+    if (pending && !connection->epollout_active) {
+        struct epoll_event event_config;
+        event_config.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+        event_config.data.fd = connection->fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config);
+        connection->epollout_active = 1;
+    } else if (!pending && connection->epollout_active) {
         struct epoll_event event_config;
         event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
         event_config.data.fd = connection->fd;
@@ -200,6 +260,9 @@ static void *worker_main(void *arg) {
                     client_connection->write_offset = 0;
                     client_connection->close_after_write = 0;
                     client_connection->epollout_active = 0;
+                    client_connection->aux_buffer = NULL;
+                    client_connection->aux_length = 0;
+                    client_connection->aux_offset = 0;
 
                     struct epoll_event client_event;
                     client_event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
@@ -316,6 +379,16 @@ int apex_run(apex_app_t *app, int port) {
     signal(SIGINT, apex_handle_sig);
     signal(SIGTERM, apex_handle_sig);
     signal(SIGPIPE, SIG_IGN);
+
+    if (port <= 0 && app != NULL && app->owned_config != NULL) {
+        int configured_port = apex_config_first_listen_port(app->owned_config);
+        if (configured_port > 0) {
+            port = configured_port;
+        }
+    }
+    if (port <= 0) {
+        port = 8080;
+    }
 
     const char *port_env = getenv("PORT");
     if (port_env) {

@@ -1,6 +1,8 @@
 #ifndef APEX_H
 #define APEX_H
 
+#include "apex/config.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -35,6 +37,10 @@ void apex_route(apex_app_t *app, const char *method, const char *pattern, apex_h
 
 void apex_res_send(apex_res_t *res, int status, const void *body, size_t body_len);
 void apex_res_header(apex_res_t *res, const char *key, const char *value);
+
+/* Attaches a compiled configuration. On success the app owns config. On
+ * failure the caller keeps ownership and error describes the reason. */
+int apex_app_attach_config(apex_app_t *app, apex_config_t *config, apex_config_error_t *error);
 
 int apex_run(apex_app_t *app, int port);
 

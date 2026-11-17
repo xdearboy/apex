@@ -1,13 +1,21 @@
 CC ?= cc
-CFLAGS ?= -std=gnu2x -O3 -flto -D_GNU_SOURCE -pthread -Wall -Wextra -Werror -Iinclude -Isrc
+CSTD ?= -std=c2x
+CFLAGS ?= $(CSTD) -O3 -flto -D_GNU_SOURCE -pthread -Wall -Wextra -Werror -Iinclude -Isrc
 AR ?= ar
 LDFLAGS ?= -pthread -flto
 
-LIB = libapex.a
-SRCS = src/core.c src/router.c src/proxy.c
-OBJS = $(SRCS:.c=.o)
+ifdef SANITIZE
+CFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer -g
+LDFLAGS += -fsanitize=address,undefined
+endif
 
-EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo
+LIB = libapex.a
+SRCS = src/core.c src/router.c src/proxy.c src/config.c
+OBJS = $(SRCS:.c=.o)
+HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal.h
+
+EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
+           examples/config_demo
 
 all: $(LIB) $(EXAMPLES)
 
@@ -23,18 +31,21 @@ examples/hello_world: examples/hello_world.o $(LIB)
 examples/proxy_demo: examples/proxy_demo.o src/proxy.o
 	$(CC) $(CFLAGS) -o $@ examples/proxy_demo.o src/proxy.o $(LDFLAGS)
 
+examples/config_demo: examples/config_demo.o $(LIB)
+	$(CC) $(CFLAGS) -o $@ examples/config_demo.o $(LIB) $(LDFLAGS)
+
 proxy: examples/proxy_demo
 
-%.o: %.c include/apex.h
-	$(CC) $(CFLAGS) -c $< -o $@
+test: all
+	./examples/config_demo --selftest
+	./examples/proxy_demo
 
-src/proxy.o: src/proxy.c include/apex/proxy.h
-	$(CC) $(CFLAGS) -c $< -o $@
+check: test
 
-examples/proxy_demo.o: examples/proxy_demo.c include/apex/proxy.h
+%.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(OBJS) $(LIB) examples/*.o $(EXAMPLES)
 
-.PHONY: all clean proxy
+.PHONY: all clean proxy test check

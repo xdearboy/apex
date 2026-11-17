@@ -38,7 +38,12 @@ typedef struct conn {
     uint8_t epollout_active;
     char read_buffer[BUF_SIZE];
     char write_buffer[BUF_SIZE];
+    char *aux_buffer;
+    size_t aux_length;
+    size_t aux_offset;
 } conn_t;
+
+void apex_conn_write(conn_t *connection, const void *data, size_t length);
 
 struct apex_res {
     conn_t *conn;
@@ -59,6 +64,8 @@ struct apex_app {
     apex_handler_t fast_get_root;
     apex_handler_t fast_get_user_id;
     apex_handler_t fast_post_user;
+    apex_config_t *owned_config;
+    apex_runtime_t *runtime;
 };
 
 void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,

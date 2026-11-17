@@ -1,0 +1,2727 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include "apex/config.h"
+
+#include <ctype.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define APEX_CONFIG_DEFAULT_WORKER_CONNECTIONS 10240u
+#define APEX_CONFIG_DEFAULT_KEEPALIVE_MS 75000u
+#define APEX_CONFIG_DEFAULT_CLIENT_HEADER_MS 15000u
+#define APEX_CONFIG_DEFAULT_CLIENT_BODY_MS 30000u
+#define APEX_CONFIG_DEFAULT_UPSTREAM_KEEPALIVE 32u
+#define APEX_CONFIG_DEFAULT_CONNECT_MS 2000u
+#define APEX_CONFIG_DEFAULT_READ_MS 10000u
+#define APEX_CONFIG_DEFAULT_IDLE_MS 60000u
+#define APEX_CONFIG_MAX_WEIGHT 1000000u
+#define APEX_CONFIG_MAX_KEEPALIVE 65535u
+#define APEX_CONFIG_MAX_CONNS 1000000000u
+
+typedef struct {
+    char *data;
+    size_t length;
+    size_t capacity;
+} config_buffer_t;
+
+static bool config_oom(apex_config_error_t *error);
+
+static void config_error_set(apex_config_error_t *error, apex_config_status_t code, const char *file, int line,
+                             int column, const char *format, ...) {
+    if (error == NULL) {
+        return;
+    }
+
+    error->code = code;
+    error->line = line;
+    error->column = column;
+    error->message[0] = '\0';
+    error->hint[0] = '\0';
+    if (file != NULL) {
+        snprintf(error->file, sizeof(error->file), "%s", file);
+    } else {
+        error->file[0] = '\0';
+    }
+
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(error->message, sizeof(error->message), format, arguments);
+    va_end(arguments);
+}
+
+static bool config_buffer_reserve(config_buffer_t *buffer, size_t extra) {
+    if (extra > SIZE_MAX - buffer->length - 1u) {
+        return false;
+    }
+
+    size_t needed = buffer->length + extra + 1u;
+    if (needed <= buffer->capacity) {
+        return true;
+    }
+
+    size_t capacity = buffer->capacity ? buffer->capacity : 64u;
+    while (capacity < needed) {
+        if (capacity > SIZE_MAX / 2u) {
+            capacity = needed;
+            break;
+        }
+        capacity *= 2u;
+    }
+
+    char *grown = realloc(buffer->data, capacity);
+    if (grown == NULL) {
+        return false;
+    }
+    buffer->data = grown;
+    buffer->capacity = capacity;
+    return true;
+}
+
+static bool config_buffer_append(config_buffer_t *buffer, const void *data, size_t length) {
+    if (length == 0) {
+        return true;
+    }
+    if (!config_buffer_reserve(buffer, length)) {
+        return false;
+    }
+    memcpy(buffer->data + buffer->length, data, length);
+    buffer->length += length;
+    buffer->data[buffer->length] = '\0';
+    return true;
+}
+
+static bool config_buffer_append_char(config_buffer_t *buffer, char value) {
+    return config_buffer_append(buffer, &value, 1u);
+}
+
+static bool config_buffer_append_string(config_buffer_t *buffer, const char *text) {
+    return config_buffer_append(buffer, text, strlen(text));
+}
+
+static char *config_buffer_release(config_buffer_t *buffer, size_t *length) {
+    if (buffer->data == NULL) {
+        if (!config_buffer_reserve(buffer, 0u)) {
+            return NULL;
+        }
+        buffer->data[0] = '\0';
+    }
+    if (length != NULL) {
+        *length = buffer->length;
+    }
+    char *data = buffer->data;
+    buffer->data = NULL;
+    buffer->length = 0;
+    buffer->capacity = 0;
+    return data;
+}
+
+static void config_buffer_free(config_buffer_t *buffer) {
+    free(buffer->data);
+    buffer->data = NULL;
+    buffer->length = 0;
+    buffer->capacity = 0;
+}
+
+static char *config_strdup_range(const char *text, size_t length) {
+    char *copy = malloc(length + 1u);
+    if (copy == NULL) {
+        return NULL;
+    }
+    if (length > 0) {
+        memcpy(copy, text, length);
+    }
+    copy[length] = '\0';
+    return copy;
+}
+
+static bool config_oom(apex_config_error_t *error) {
+    config_error_set(error, APEX_CONFIG_ERR_MEMORY, NULL, 0, 0, "out of memory");
+    return false;
+}
+
+typedef enum {
+    TOKEN_WORD = 0,
+    TOKEN_STRING,
+    TOKEN_LBRACE,
+    TOKEN_RBRACE,
+    TOKEN_SEMICOLON,
+    TOKEN_EOF,
+} token_kind_t;
+
+typedef struct {
+    token_kind_t kind;
+    char *text;
+    size_t length;
+    int file_index;
+    int line;
+    int column;
+} token_t;
+
+typedef struct {
+    token_t *items;
+    size_t count;
+    size_t capacity;
+    char **files;
+    size_t file_count;
+    size_t file_capacity;
+} token_list_t;
+
+typedef struct {
+    const char *data;
+    size_t length;
+    size_t position;
+    int line;
+    int column;
+    int file_index;
+    token_list_t *tokens;
+    apex_config_error_t *error;
+} lexer_t;
+
+static void token_list_init(token_list_t *list) {
+    memset(list, 0, sizeof(*list));
+}
+
+static void token_list_free(token_list_t *list) {
+    for (size_t index = 0; index < list->count; index++) {
+        free(list->items[index].text);
+    }
+    for (size_t index = 0; index < list->file_count; index++) {
+        free(list->files[index]);
+    }
+    free(list->items);
+    free(list->files);
+    memset(list, 0, sizeof(*list));
+}
+
+static int token_list_register_file(token_list_t *list, const char *path, apex_config_error_t *error) {
+    for (size_t index = 0; index < list->file_count; index++) {
+        if (strcmp(list->files[index], path) == 0) {
+            return (int)index;
+        }
+    }
+
+    if (list->file_count >= (size_t)INT_MAX) {
+        config_error_set(error, APEX_CONFIG_ERR_MEMORY, path, 0, 0, "too many source files");
+        return -1;
+    }
+
+    if (list->file_count == list->file_capacity) {
+        size_t capacity = list->file_capacity ? list->file_capacity * 2u : 8u;
+        char **grown = realloc(list->files, capacity * sizeof(char *));
+        if (grown == NULL) {
+            config_oom(error);
+            return -1;
+        }
+        list->files = grown;
+        list->file_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(path, strlen(path));
+    if (copy == NULL) {
+        config_oom(error);
+        return -1;
+    }
+    list->files[list->file_count] = copy;
+    return (int)list->file_count++;
+}
+
+static bool token_list_push(token_list_t *list, token_t token, apex_config_error_t *error) {
+    if (list->count >= APEX_CONFIG_MAX_TOKENS) {
+        config_error_set(error, APEX_CONFIG_ERR_SYNTAX, list->files[token.file_index], token.line, token.column,
+                         "configuration contains too many tokens");
+        free(token.text);
+        return false;
+    }
+
+    if (list->count == list->capacity) {
+        size_t capacity = list->capacity ? list->capacity * 2u : 64u;
+        token_t *grown = realloc(list->items, capacity * sizeof(token_t));
+        if (grown == NULL) {
+            free(token.text);
+            config_oom(error);
+            return false;
+        }
+        list->items = grown;
+        list->capacity = capacity;
+    }
+
+    list->items[list->count++] = token;
+    return true;
+}
+
+static const char *lexer_file(const lexer_t *lexer) {
+    return lexer->tokens->files[lexer->file_index];
+}
+
+static bool lexer_error(lexer_t *lexer, int line, int column, const char *format, ...) {
+    if (lexer->error != NULL) {
+        lexer->error->code = APEX_CONFIG_ERR_SYNTAX;
+        lexer->error->line = line;
+        lexer->error->column = column;
+        lexer->error->message[0] = '\0';
+        lexer->error->hint[0] = '\0';
+        snprintf(lexer->error->file, sizeof(lexer->error->file), "%s", lexer_file(lexer));
+
+        va_list arguments;
+        va_start(arguments, format);
+        vsnprintf(lexer->error->message, sizeof(lexer->error->message), format, arguments);
+        va_end(arguments);
+    }
+    return false;
+}
+
+static int hex_value(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+static bool is_identifier_name(const char *text, size_t length) {
+    if (length == 0) {
+        return false;
+    }
+    for (size_t index = 0; index < length; index++) {
+        unsigned char byte = (unsigned char)text[index];
+        if (!(isalnum(byte) || byte == '_' || byte == '-' || byte == '.')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool is_environment_name(const char *text, size_t length) {
+    if (length == 0) {
+        return false;
+    }
+    unsigned char first = (unsigned char)text[0];
+    if (!(isalpha(first) || first == '_')) {
+        return false;
+    }
+    for (size_t index = 1; index < length; index++) {
+        unsigned char byte = (unsigned char)text[index];
+        if (!(isalnum(byte) || byte == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *expand_environment(lexer_t *lexer, int line, int column, const char *text, size_t length,
+                                size_t *expanded_length) {
+    config_buffer_t output = {0};
+    size_t index = 0;
+
+    while (index < length) {
+        if (text[index] == '$' && index + 1u < length && text[index + 1u] == '{') {
+            size_t close = index + 2u;
+            while (close < length && text[close] != '}') {
+                close++;
+            }
+            if (close == length) {
+                lexer_error(lexer, line, column, "unterminated environment expansion");
+                config_buffer_free(&output);
+                return NULL;
+            }
+
+            size_t content_start = index + 2u;
+            size_t content_length = close - content_start;
+            size_t name_length = content_length;
+            const char *default_value = NULL;
+            size_t default_length = 0;
+
+            for (size_t cursor = content_start; cursor + 1u < close; cursor++) {
+                if (text[cursor] == ':' && text[cursor + 1u] == '-') {
+                    name_length = cursor - content_start;
+                    default_value = text + cursor + 2u;
+                    default_length = close - (cursor + 2u);
+                    break;
+                }
+            }
+
+            if (!is_environment_name(text + content_start, name_length)) {
+                lexer_error(lexer, line, column, "invalid environment variable name in expansion");
+                config_buffer_free(&output);
+                return NULL;
+            }
+
+            char name[128];
+            if (name_length >= sizeof(name)) {
+                lexer_error(lexer, line, column, "environment variable name is too long");
+                config_buffer_free(&output);
+                return NULL;
+            }
+            memcpy(name, text + content_start, name_length);
+            name[name_length] = '\0';
+
+            const char *value = getenv(name);
+            if (value != NULL) {
+                if (strchr(value, '\n') != NULL || strchr(value, '\r') != NULL) {
+                    lexer_error(lexer, line, column, "environment variable '%s' contains a line break", name);
+                    config_buffer_free(&output);
+                    return NULL;
+                }
+                if (!config_buffer_append_string(&output, value)) {
+                    config_oom(lexer->error);
+                    config_buffer_free(&output);
+                    return NULL;
+                }
+            } else if (default_value != NULL) {
+                if (!config_buffer_append(&output, default_value, default_length)) {
+                    config_oom(lexer->error);
+                    config_buffer_free(&output);
+                    return NULL;
+                }
+            } else {
+                lexer_error(lexer, line, column, "environment variable '%s' is not set", name);
+                config_buffer_free(&output);
+                return NULL;
+            }
+
+            index = close + 1u;
+            continue;
+        }
+
+        if (!config_buffer_append_char(&output, text[index])) {
+            config_oom(lexer->error);
+            config_buffer_free(&output);
+            return NULL;
+        }
+        index++;
+    }
+
+    char *result = config_buffer_release(&output, expanded_length);
+    if (result == NULL) {
+        config_oom(lexer->error);
+        config_buffer_free(&output);
+    }
+    return result;
+}
+
+static bool lexer_emit(lexer_t *lexer, token_kind_t kind, char *text, size_t length, int line, int column) {
+    if (text != NULL) {
+        size_t expanded_length = length;
+        char *expanded = expand_environment(lexer, line, column, text, length, &expanded_length);
+        if (expanded == NULL) {
+            free(text);
+            return false;
+        }
+        free(text);
+        text = expanded;
+        length = expanded_length;
+    }
+
+    token_t token = {
+        .kind = kind,
+        .text = text,
+        .length = length,
+        .file_index = lexer->file_index,
+        .line = line,
+        .column = column,
+    };
+    return token_list_push(lexer->tokens, token, lexer->error);
+}
+
+static bool lexer_read_string(lexer_t *lexer) {
+    char quote = lexer->data[lexer->position];
+    int line = lexer->line;
+    int column = lexer->column;
+    lexer->position++;
+    lexer->column++;
+
+    config_buffer_t value = {0};
+    bool closed = false;
+
+    while (lexer->position < lexer->length) {
+        char byte = lexer->data[lexer->position];
+        if (byte == '\n' || byte == '\r') {
+            break;
+        }
+        if (byte == quote) {
+            lexer->position++;
+            lexer->column++;
+            closed = true;
+            break;
+        }
+
+        if (quote == '"' && byte == '\\') {
+            lexer->position++;
+            lexer->column++;
+            if (lexer->position >= lexer->length) {
+                break;
+            }
+            char escaped = lexer->data[lexer->position];
+            lexer->position++;
+            lexer->column++;
+
+            char decoded;
+            switch (escaped) {
+            case '"':
+            case '\\':
+                decoded = escaped;
+                break;
+            case 'n':
+                decoded = '\n';
+                break;
+            case 'r':
+                decoded = '\r';
+                break;
+            case 't':
+                decoded = '\t';
+                break;
+            case 'x': {
+                if (lexer->position + 1u >= lexer->length) {
+                    config_buffer_free(&value);
+                    return lexer_error(lexer, line, column, "truncated hexadecimal escape");
+                }
+                int high = hex_value(lexer->data[lexer->position]);
+                int low = hex_value(lexer->data[lexer->position + 1u]);
+                if (high < 0 || low < 0) {
+                    config_buffer_free(&value);
+                    return lexer_error(lexer, line, column, "invalid hexadecimal escape");
+                }
+                decoded = (char)((high << 4) | low);
+                lexer->position += 2u;
+                lexer->column += 2;
+                break;
+            }
+            default:
+                config_buffer_free(&value);
+                return lexer_error(lexer, line, column, "invalid escape sequence '\\%c'", escaped);
+            }
+
+            if (!config_buffer_append_char(&value, decoded)) {
+                config_buffer_free(&value);
+                config_oom(lexer->error);
+                return false;
+            }
+            continue;
+        }
+
+        if (!config_buffer_append_char(&value, byte)) {
+            config_buffer_free(&value);
+            config_oom(lexer->error);
+            return false;
+        }
+        lexer->position++;
+        lexer->column++;
+    }
+
+    if (!closed) {
+        config_buffer_free(&value);
+        return lexer_error(lexer, line, column, "unterminated string literal");
+    }
+
+    size_t length = 0;
+    char *text = config_buffer_release(&value, &length);
+    if (text == NULL) {
+        config_oom(lexer->error);
+        config_buffer_free(&value);
+        return false;
+    }
+    return lexer_emit(lexer, TOKEN_STRING, text, length, line, column);
+}
+
+static bool lexer_read_word(lexer_t *lexer) {
+    int line = lexer->line;
+    int column = lexer->column;
+    config_buffer_t value = {0};
+
+    while (lexer->position < lexer->length) {
+        char byte = lexer->data[lexer->position];
+        if (byte == '$' && lexer->position + 1u < lexer->length &&
+            lexer->data[lexer->position + 1u] == '{') {
+            if (!config_buffer_append_char(&value, '$') ||
+                !config_buffer_append_char(&value, '{')) {
+                config_buffer_free(&value);
+                config_oom(lexer->error);
+                return false;
+            }
+            lexer->position += 2u;
+            lexer->column += 2;
+
+            bool closed = false;
+            while (lexer->position < lexer->length) {
+                char inner = lexer->data[lexer->position];
+                if (inner == '\n' || inner == '\r') {
+                    break;
+                }
+                if (!config_buffer_append_char(&value, inner)) {
+                    config_buffer_free(&value);
+                    config_oom(lexer->error);
+                    return false;
+                }
+                lexer->position++;
+                lexer->column++;
+                if (inner == '}') {
+                    closed = true;
+                    break;
+                }
+            }
+            if (!closed) {
+                config_buffer_free(&value);
+                return lexer_error(lexer, line, column, "unterminated environment expansion");
+            }
+            continue;
+        }
+        if (isspace((unsigned char)byte) || byte == '{' || byte == '}' || byte == ';' || byte == '#' ||
+            byte == '"' || byte == '\'') {
+            break;
+        }
+        if (!config_buffer_append_char(&value, byte)) {
+            config_buffer_free(&value);
+            config_oom(lexer->error);
+            return false;
+        }
+        lexer->position++;
+        lexer->column++;
+    }
+
+    size_t length = 0;
+    char *text = config_buffer_release(&value, &length);
+    if (text == NULL) {
+        config_oom(lexer->error);
+        config_buffer_free(&value);
+        return false;
+    }
+    return lexer_emit(lexer, TOKEN_WORD, text, length, line, column);
+}
+
+static bool lexer_run(lexer_t *lexer) {
+    while (lexer->position < lexer->length) {
+        char byte = lexer->data[lexer->position];
+
+        if (byte == '\n') {
+            lexer->line++;
+            lexer->column = 1;
+            lexer->position++;
+            continue;
+        }
+        if (byte == ' ' || byte == '\t' || byte == '\r' || byte == '\f' || byte == '\v') {
+            lexer->column++;
+            lexer->position++;
+            continue;
+        }
+        if (byte == '#') {
+            while (lexer->position < lexer->length && lexer->data[lexer->position] != '\n') {
+                lexer->position++;
+                lexer->column++;
+            }
+            continue;
+        }
+        if (byte == '{' || byte == '}' || byte == ';') {
+            int line = lexer->line;
+            int column = lexer->column;
+            lexer->position++;
+            lexer->column++;
+            token_kind_t kind = byte == '{' ? TOKEN_LBRACE : (byte == '}' ? TOKEN_RBRACE : TOKEN_SEMICOLON);
+            if (!lexer_emit(lexer, kind, NULL, 0, line, column)) {
+                return false;
+            }
+            continue;
+        }
+        if (byte == '"' || byte == '\'') {
+            if (!lexer_read_string(lexer)) {
+                return false;
+            }
+            continue;
+        }
+        if (!lexer_read_word(lexer)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool read_file(const char *path, char **data, size_t *length, apex_config_error_t *error) {
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) {
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot open configuration file");
+        return false;
+    }
+
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fclose(file);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot seek configuration file");
+        return false;
+    }
+    long size = ftell(file);
+    if (size < 0) {
+        fclose(file);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot determine configuration file size");
+        return false;
+    }
+    if ((unsigned long)size > APEX_CONFIG_MAX_FILE_BYTES) {
+        fclose(file);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "configuration file exceeds %u bytes",
+                         (unsigned)APEX_CONFIG_MAX_FILE_BYTES);
+        return false;
+    }
+    if (fseek(file, 0, SEEK_SET) != 0) {
+        fclose(file);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot rewind configuration file");
+        return false;
+    }
+
+    char *buffer = malloc((size_t)size + 1u);
+    if (buffer == NULL) {
+        fclose(file);
+        config_oom(error);
+        return false;
+    }
+
+    size_t read_length = fread(buffer, 1, (size_t)size, file);
+    if (read_length != (size_t)size && ferror(file)) {
+        free(buffer);
+        fclose(file);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot read configuration file");
+        return false;
+    }
+    fclose(file);
+
+    buffer[read_length] = '\0';
+    *data = buffer;
+    *length = read_length;
+    return true;
+}
+
+static bool canonical_path(const char *path, char *output, size_t capacity, apex_config_error_t *error) {
+    char *resolved = realpath(path, NULL);
+    if (resolved == NULL) {
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "cannot resolve configuration path");
+        return false;
+    }
+    if (strlen(resolved) >= capacity) {
+        free(resolved);
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "configuration path is too long");
+        return false;
+    }
+    snprintf(output, capacity, "%s", resolved);
+    free(resolved);
+    return true;
+}
+
+static bool resolve_include_path(const char *base_file, const char *include, char *output, size_t capacity,
+                                 apex_config_error_t *error) {
+    char combined[APEX_CONFIG_PATH_MAX];
+    if (include[0] == '/') {
+        if (strlen(include) >= sizeof(combined)) {
+            config_error_set(error, APEX_CONFIG_ERR_IO, base_file, 0, 0, "include path is too long");
+            return false;
+        }
+        snprintf(combined, sizeof(combined), "%s", include);
+    } else {
+        const char *slash = strrchr(base_file, '/');
+        size_t directory_length = slash != NULL ? (size_t)(slash - base_file) : 0u;
+        if (directory_length == 0) {
+            directory_length = 1u;
+        }
+        if (directory_length + 1u + strlen(include) >= sizeof(combined)) {
+            config_error_set(error, APEX_CONFIG_ERR_IO, base_file, 0, 0, "include path is too long");
+            return false;
+        }
+        if (slash != NULL) {
+            memcpy(combined, base_file, directory_length);
+            combined[directory_length] = '\0';
+        } else {
+            combined[0] = '.';
+            combined[1] = '\0';
+        }
+        snprintf(combined + strlen(combined), sizeof(combined) - strlen(combined), "/%s", include);
+    }
+    return canonical_path(combined, output, capacity, error);
+}
+
+static bool tokenize_source(const char *path, token_list_t *output, char **stack, size_t depth,
+                            apex_config_error_t *error) {
+    if (depth >= APEX_CONFIG_MAX_INCLUDE_DEPTH) {
+        config_error_set(error, APEX_CONFIG_ERR_SYNTAX, path, 0, 0, "include nesting is too deep");
+        return false;
+    }
+
+    char canonical[APEX_CONFIG_PATH_MAX];
+    if (!canonical_path(path, canonical, sizeof(canonical), error)) {
+        return false;
+    }
+
+    for (size_t index = 0; index < depth; index++) {
+        if (stack[index] != NULL && strcmp(stack[index], canonical) == 0) {
+            config_error_set(error, APEX_CONFIG_ERR_SYNTAX, canonical, 0, 0, "include cycle detected");
+            return false;
+        }
+    }
+
+    char *stack_copy = config_strdup_range(canonical, strlen(canonical));
+    if (stack_copy == NULL) {
+        config_oom(error);
+        return false;
+    }
+    stack[depth] = stack_copy;
+
+    char *data = NULL;
+    size_t length = 0;
+    if (!read_file(canonical, &data, &length, error)) {
+        free(stack[depth]);
+        stack[depth] = NULL;
+        return false;
+    }
+
+    token_list_t local;
+    token_list_init(&local);
+    int file_index = token_list_register_file(&local, canonical, error);
+    if (file_index < 0) {
+        free(data);
+        free(stack[depth]);
+        stack[depth] = NULL;
+        token_list_free(&local);
+        return false;
+    }
+
+    lexer_t lexer = {
+        .data = data,
+        .length = length,
+        .position = 0,
+        .line = 1,
+        .column = 1,
+        .file_index = file_index,
+        .tokens = &local,
+        .error = error,
+    };
+
+    bool ok = lexer_run(&lexer);
+    free(data);
+
+    if (!ok) {
+        token_list_free(&local);
+        free(stack[depth]);
+        stack[depth] = NULL;
+        return false;
+    }
+
+    bool statement_start = true;
+    for (size_t index = 0; index < local.count; index++) {
+        token_t *token = &local.items[index];
+
+        if (statement_start && token->kind == TOKEN_WORD && token->text != NULL &&
+            strcmp(token->text, "include") == 0) {
+            if (index + 2u >= local.count || (local.items[index + 1u].kind != TOKEN_WORD &&
+                                              local.items[index + 1u].kind != TOKEN_STRING) ||
+                local.items[index + 2u].kind != TOKEN_SEMICOLON) {
+                config_error_set(error, APEX_CONFIG_ERR_SYNTAX, canonical, token->line, token->column,
+                                 "include requires a quoted path followed by ';'");
+                token_list_free(&local);
+                free(stack[depth]);
+                stack[depth] = NULL;
+                return false;
+            }
+
+            char include_path[APEX_CONFIG_PATH_MAX];
+            if (!resolve_include_path(canonical, local.items[index + 1u].text, include_path, sizeof(include_path),
+                                      error)) {
+                token_list_free(&local);
+                free(stack[depth]);
+                stack[depth] = NULL;
+                return false;
+            }
+
+            if (!tokenize_source(include_path, output, stack, depth + 1u, error)) {
+                token_list_free(&local);
+                free(stack[depth]);
+                stack[depth] = NULL;
+                return false;
+            }
+
+            index += 2u;
+            statement_start = true;
+            continue;
+        }
+
+        const char *token_file = local.files[token->file_index];
+        int file = token_list_register_file(output, token_file, error);
+        if (file < 0) {
+            token_list_free(&local);
+            free(stack[depth]);
+            stack[depth] = NULL;
+            return false;
+        }
+
+        token_t moved = *token;
+        moved.file_index = file;
+        token->text = NULL;
+        if (!token_list_push(output, moved, error)) {
+            token_list_free(&local);
+            free(stack[depth]);
+            stack[depth] = NULL;
+            return false;
+        }
+
+        statement_start = token->kind == TOKEN_LBRACE || token->kind == TOKEN_SEMICOLON ||
+                          token->kind == TOKEN_RBRACE;
+    }
+
+    token_list_free(&local);
+    free(stack[depth]);
+    stack[depth] = NULL;
+    return true;
+}
+
+typedef struct {
+    token_list_t *tokens;
+    size_t index;
+    apex_config_t *config;
+    apex_config_error_t *error;
+} parser_t;
+
+static const char *token_file_name(const parser_t *parser, const token_t *token) {
+    if (token->file_index < 0 || (size_t)token->file_index >= parser->tokens->file_count) {
+        return parser->config->source;
+    }
+    return parser->tokens->files[token->file_index];
+}
+
+static void parser_error(parser_t *parser, apex_config_status_t code, const token_t *token, const char *format, ...) {
+    if (parser->error == NULL) {
+        return;
+    }
+
+    parser->error->code = code;
+    parser->error->line = token != NULL ? token->line : 0;
+    parser->error->column = token != NULL ? token->column : 0;
+    parser->error->message[0] = '\0';
+    parser->error->hint[0] = '\0';
+    snprintf(parser->error->file, sizeof(parser->error->file), "%s",
+             token != NULL ? token_file_name(parser, token) : parser->config->source);
+
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(parser->error->message, sizeof(parser->error->message), format, arguments);
+    va_end(arguments);
+}
+
+static void parser_hint(parser_t *parser, const char *format, ...) {
+    if (parser->error == NULL) {
+        return;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(parser->error->hint, sizeof(parser->error->hint), format, arguments);
+    va_end(arguments);
+}
+
+static const token_t *parser_peek(const parser_t *parser) {
+    return &parser->tokens->items[parser->index < parser->tokens->count ? parser->index
+                                                                       : parser->tokens->count - 1u];
+}
+
+static const token_t *parser_advance(parser_t *parser) {
+    const token_t *token = parser_peek(parser);
+    if (token->kind != TOKEN_EOF) {
+        parser->index++;
+    }
+    return token;
+}
+
+static bool token_is_word(const token_t *token, const char *word) {
+    return token->kind == TOKEN_WORD && token->text != NULL && strcmp(token->text, word) == 0;
+}
+
+static bool parser_expect(parser_t *parser, token_kind_t kind, const char *description) {
+    const token_t *token = parser_peek(parser);
+    if (token->kind != kind) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, token, "expected %s", description);
+        return false;
+    }
+    parser_advance(parser);
+    return true;
+}
+
+static bool parser_expect_semicolon(parser_t *parser) {
+    return parser_expect(parser, TOKEN_SEMICOLON, "';'");
+}
+
+static bool parser_expect_lbrace(parser_t *parser) {
+    return parser_expect(parser, TOKEN_LBRACE, "'{'");
+}
+
+static bool parser_expect_rbrace(parser_t *parser) {
+    return parser_expect(parser, TOKEN_RBRACE, "'}'");
+}
+
+static const token_t *parser_scalar(parser_t *parser, const char *description) {
+    const token_t *token = parser_peek(parser);
+    if (token->kind != TOKEN_WORD && token->kind != TOKEN_STRING) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, token, "expected %s", description);
+        return NULL;
+    }
+    parser_advance(parser);
+    return token;
+}
+
+static const token_t *parser_identifier(parser_t *parser, const char *description) {
+    const token_t *token = parser_peek(parser);
+    if (token->kind != TOKEN_WORD || !is_identifier_name(token->text, token->length)) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, token, "expected %s", description);
+        return NULL;
+    }
+    parser_advance(parser);
+    return token;
+}
+
+static bool token_to_u64(const token_t *token, uint64_t minimum, uint64_t maximum, uint64_t *value) {
+    if (token->length == 0) {
+        return false;
+    }
+
+    uint64_t parsed = 0;
+    for (size_t index = 0; index < token->length; index++) {
+        char byte = token->text[index];
+        if (byte < '0' || byte > '9') {
+            return false;
+        }
+        unsigned int digit = (unsigned int)(byte - '0');
+        if (parsed > (UINT64_MAX - digit) / 10u) {
+            return false;
+        }
+        parsed = parsed * 10u + digit;
+    }
+
+    if (parsed < minimum || parsed > maximum) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+static bool token_to_duration_ms(const token_t *token, uint64_t *value_ms) {
+    if (token->length == 0) {
+        return false;
+    }
+
+    size_t digits = 0;
+    uint64_t value = 0;
+    while (digits < token->length && token->text[digits] >= '0' && token->text[digits] <= '9') {
+        unsigned int digit = (unsigned int)(token->text[digits] - '0');
+        if (value > (UINT64_MAX - digit) / 10u) {
+            return false;
+        }
+        value = value * 10u + digit;
+        digits++;
+    }
+    if (digits == 0) {
+        return false;
+    }
+
+    size_t unit_length = token->length - digits;
+    const char *unit = token->text + digits;
+    uint64_t multiplier;
+    if (unit_length == 0) {
+        if (value != 0) {
+            return false;
+        }
+        multiplier = 1u;
+    } else if (unit_length == 2u && unit[0] == 'm' && unit[1] == 's') {
+        multiplier = 1u;
+    } else if (unit_length == 1u && unit[0] == 's') {
+        multiplier = 1000u;
+    } else if (unit_length == 1u && unit[0] == 'm') {
+        multiplier = 60u * 1000u;
+    } else if (unit_length == 1u && unit[0] == 'h') {
+        multiplier = 60u * 60u * 1000u;
+    } else {
+        return false;
+    }
+
+    if (value > UINT64_MAX / multiplier) {
+        return false;
+    }
+    *value_ms = value * multiplier;
+    return true;
+}
+
+static bool parse_host_port(const char *text, bool allow_empty_host, bool allow_zero_port, char *host,
+                            size_t host_capacity, uint16_t *port) {
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+
+    const char *port_text = NULL;
+    const char *host_start = text;
+    size_t host_length = 0;
+
+    if (text[0] == '[') {
+        const char *close = strchr(text, ']');
+        if (close == NULL) {
+            return false;
+        }
+        host_start = text + 1;
+        host_length = (size_t)(close - host_start);
+        if (close[1] != ':') {
+            return false;
+        }
+        port_text = close + 2;
+    } else {
+        const char *first_colon = strchr(text, ':');
+        const char *last_colon = strrchr(text, ':');
+        if (first_colon == NULL || first_colon != last_colon) {
+            return false;
+        }
+        host_length = (size_t)(last_colon - text);
+        port_text = last_colon + 1;
+    }
+
+    if (host_length >= host_capacity) {
+        return false;
+    }
+    if (host_length == 0 && !allow_empty_host) {
+        return false;
+    }
+
+    if (host_length > 0) {
+        memcpy(host, host_start, host_length);
+    }
+    host[host_length] = '\0';
+
+    if (port_text == NULL || port_text[0] == '\0') {
+        return false;
+    }
+    uint64_t parsed_port = 0;
+    for (const char *cursor = port_text; cursor[0] != '\0'; cursor++) {
+        if (cursor[0] < '0' || cursor[0] > '9') {
+            return false;
+        }
+        parsed_port = parsed_port * 10u + (uint64_t)(cursor[0] - '0');
+        if (parsed_port > 65535u) {
+            return false;
+        }
+    }
+    if (parsed_port == 0 && !allow_zero_port) {
+        return false;
+    }
+
+    *port = (uint16_t)parsed_port;
+    return true;
+}
+
+static bool token_to_header_name(const token_t *token) {
+    if (token->length == 0) {
+        return false;
+    }
+    for (size_t index = 0; index < token->length; index++) {
+        unsigned char byte = (unsigned char)token->text[index];
+        if (byte <= 0x20 || byte >= 0x7f || byte == ':' || byte == '(' || byte == ')' || byte == '<' ||
+            byte == '>' || byte == '@' || byte == ',' || byte == ';' || byte == '\\' || byte == '"' ||
+            byte == '/' || byte == '[' || byte == ']' || byte == '?' || byte == '=' || byte == '{' ||
+            byte == '}') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool token_to_header_value(const token_t *token) {
+    for (size_t index = 0; index < token->length; index++) {
+        if (token->text[index] == '\r' || token->text[index] == '\n') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *const reserved_words[] = {
+    "http",       "upstream",      "server",         "listen",       "server_name",  "location",
+    "tls",        "modules",       "include",        "policy",       "weight",       "max_conns",
+    "keepalive",  "connect_timeout", "read_timeout", "idle_timeout", "certificate",  "private_key",
+    "protocols",  "ciphers",       "client_auth",    "proxy_pass",   "proxy_set_header",
+    "proxy_connect_timeout", "proxy_read_timeout", "proxy_http_version", "round_robin", "p2c",
+    "on",         "off",           "optional",       "required",
+};
+
+static bool is_reserved_word(const char *text) {
+    size_t count = sizeof(reserved_words) / sizeof(reserved_words[0]);
+    for (size_t index = 0; index < count; index++) {
+        if (strcmp(text, reserved_words[index]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool config_reserve_upstreams(parser_t *parser, size_t needed) {
+    apex_config_t *config = parser->config;
+    if (needed <= config->upstream_capacity) {
+        return true;
+    }
+    size_t capacity = config->upstream_capacity ? config->upstream_capacity * 2u : 8u;
+    while (capacity < needed) {
+        capacity *= 2u;
+    }
+    apex_upstream_config_t *grown = realloc(config->upstreams, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+    config->upstreams = grown;
+    config->upstream_capacity = capacity;
+    return true;
+}
+
+static apex_upstream_config_t *config_add_upstream(parser_t *parser, const token_t *name) {
+    apex_config_t *config = parser->config;
+    if (!config_reserve_upstreams(parser, config->upstream_count + 1u)) {
+        return NULL;
+    }
+
+    apex_upstream_config_t *upstream = &config->upstreams[config->upstream_count];
+    memset(upstream, 0, sizeof(*upstream));
+    upstream->name = config_strdup_range(name->text, name->length);
+    if (upstream->name == NULL) {
+        config_oom(parser->error);
+        return NULL;
+    }
+    upstream->line = name->line;
+    upstream->policy = APEX_BALANCE_ROUND_ROBIN;
+    upstream->keepalive = APEX_CONFIG_DEFAULT_UPSTREAM_KEEPALIVE;
+    upstream->connect_timeout_ms = APEX_CONFIG_DEFAULT_CONNECT_MS;
+    upstream->read_timeout_ms = APEX_CONFIG_DEFAULT_READ_MS;
+    upstream->idle_timeout_ms = APEX_CONFIG_DEFAULT_IDLE_MS;
+    config->upstream_count++;
+    return upstream;
+}
+
+static bool upstream_add_server(parser_t *parser, apex_upstream_config_t *upstream,
+                                const apex_upstream_server_config_t *server) {
+    if (upstream->server_count >= APEX_CONFIG_MAX_UPSTREAM_SERVERS) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, NULL, "upstream '%s' has too many servers", upstream->name);
+        return false;
+    }
+
+    if (upstream->server_count == upstream->server_capacity) {
+        size_t capacity = upstream->server_capacity ? upstream->server_capacity * 2u : 4u;
+        apex_upstream_server_config_t *grown =
+            realloc(upstream->servers, capacity * sizeof(*upstream->servers));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        upstream->servers = grown;
+        upstream->server_capacity = capacity;
+    }
+
+    upstream->servers[upstream->server_count++] = *server;
+    return true;
+}
+
+static bool config_reserve_servers(parser_t *parser, size_t needed) {
+    apex_config_t *config = parser->config;
+    if (needed <= config->server_capacity) {
+        return true;
+    }
+    size_t capacity = config->server_capacity ? config->server_capacity * 2u : 4u;
+    while (capacity < needed) {
+        capacity *= 2u;
+    }
+    apex_server_config_t *grown = realloc(config->servers, capacity * sizeof(*grown));
+    if (grown == NULL) {
+        return config_oom(parser->error);
+    }
+    config->servers = grown;
+    config->server_capacity = capacity;
+    return true;
+}
+
+static apex_server_config_t *config_add_server(parser_t *parser, const token_t *begin) {
+    apex_config_t *config = parser->config;
+    if (!config_reserve_servers(parser, config->server_count + 1u)) {
+        return NULL;
+    }
+
+    apex_server_config_t *server = &config->servers[config->server_count];
+    memset(server, 0, sizeof(*server));
+    server->line = begin->line;
+    server->tls.client_auth = APEX_TLS_CLIENT_AUTH_OFF;
+    config->server_count++;
+    return server;
+}
+
+static bool server_add_name(parser_t *parser, apex_server_config_t *server, const token_t *name) {
+    if (server->server_name_count >= APEX_CONFIG_MAX_SERVER_NAMES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "server declares too many names");
+        return false;
+    }
+    for (size_t index = 0; index < name->length; index++) {
+        unsigned char byte = (unsigned char)name->text[index];
+        if (isspace(byte) || byte < 0x21 || byte >= 0x7f || byte == '/' || byte == '\r' || byte == '\n') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "invalid server name");
+            return false;
+        }
+    }
+
+    if (server->server_name_count == server->server_name_capacity) {
+        size_t capacity = server->server_name_capacity ? server->server_name_capacity * 2u : 4u;
+        char **grown = realloc(server->server_names, capacity * sizeof(char *));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        server->server_names = grown;
+        server->server_name_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(name->text, name->length);
+    if (copy == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+    server->server_names[server->server_name_count++] = copy;
+    return true;
+}
+
+static apex_location_config_t *server_add_location(parser_t *parser, apex_server_config_t *server,
+                                                    const token_t *begin) {
+    if (server->location_count >= APEX_CONFIG_MAX_LOCATIONS) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server declares too many locations");
+        return NULL;
+    }
+
+    if (server->location_count == server->location_capacity) {
+        size_t capacity = server->location_capacity ? server->location_capacity * 2u : 4u;
+        apex_location_config_t *grown = realloc(server->locations, capacity * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return NULL;
+        }
+        server->locations = grown;
+        server->location_capacity = capacity;
+    }
+
+    apex_location_config_t *location = &server->locations[server->location_count];
+    memset(location, 0, sizeof(*location));
+    location->line = begin->line;
+    location->target = APEX_PROXY_TARGET_NONE;
+    location->upstream_index = SIZE_MAX;
+    location->http_version = 11;
+    server->location_count++;
+    return location;
+}
+
+static bool location_add_header(parser_t *parser, apex_location_config_t *location, const token_t *name,
+                                const token_t *value) {
+    if (!token_to_header_name(name)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "invalid header name");
+        return false;
+    }
+    if (!token_to_header_value(value)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "header value contains a line break");
+        return false;
+    }
+    if (location->header_count >= APEX_CONFIG_MAX_HEADERS) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "location declares too many headers");
+        return false;
+    }
+
+    if (location->header_count == location->header_capacity) {
+        size_t capacity = location->header_capacity ? location->header_capacity * 2u : 4u;
+        apex_config_header_t *grown = realloc(location->headers, capacity * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        location->headers = grown;
+        location->header_capacity = capacity;
+    }
+
+    char *name_copy = config_strdup_range(name->text, name->length);
+    char *value_copy = config_strdup_range(value->text, value->length);
+    if (name_copy == NULL || value_copy == NULL) {
+        free(name_copy);
+        free(value_copy);
+        config_oom(parser->error);
+        return false;
+    }
+
+    apex_config_header_t *header = &location->headers[location->header_count++];
+    header->name = name_copy;
+    header->value = value_copy;
+    header->line = name->line;
+    return true;
+}
+
+static bool tls_add_protocol(parser_t *parser, apex_tls_config_t *tls, const token_t *protocol) {
+    if (tls->protocol_count == tls->protocol_capacity) {
+        size_t capacity = tls->protocol_capacity ? tls->protocol_capacity * 2u : 4u;
+        char **grown = realloc(tls->protocols, capacity * sizeof(char *));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        tls->protocols = grown;
+        tls->protocol_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(protocol->text, protocol->length);
+    if (copy == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+    tls->protocols[tls->protocol_count++] = copy;
+    return true;
+}
+
+static bool config_add_module(parser_t *parser, const token_t *name) {
+    apex_config_t *config = parser->config;
+    if (config->module_count >= APEX_CONFIG_MAX_MODULE_NAMES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "too many modules declared");
+        return false;
+    }
+
+    if (config->module_count == config->module_capacity) {
+        size_t capacity = config->module_capacity ? config->module_capacity * 2u : 4u;
+        char **grown = realloc(config->modules, capacity * sizeof(char *));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        config->modules = grown;
+        config->module_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(name->text, name->length);
+    if (copy == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+    config->modules[config->module_count++] = copy;
+    return true;
+}
+
+static bool parse_tls_block(parser_t *parser, apex_server_config_t *server) {
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+    server->tls.enabled = true;
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'tls' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a tls directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "certificate") || token_is_word(directive, "private_key") ||
+            token_is_word(directive, "ciphers")) {
+            const token_t *value = parser_scalar(parser, "a value");
+            if (value == NULL) {
+                return false;
+            }
+            char **field = token_is_word(directive, "certificate")   ? &server->tls.certificate
+                           : token_is_word(directive, "private_key") ? &server->tls.private_key
+                                                                     : &server->tls.ciphers;
+            free(*field);
+            *field = config_strdup_range(value->text, value->length);
+            if (*field == NULL) {
+                return config_oom(parser->error);
+            }
+        } else if (token_is_word(directive, "protocols")) {
+            size_t count = 0;
+            while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
+                const token_t *protocol = parser_scalar(parser, "a protocol name");
+                if (protocol == NULL) {
+                    return false;
+                }
+                if (!tls_add_protocol(parser, &server->tls, protocol)) {
+                    return false;
+                }
+                count++;
+            }
+            if (count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "expected at least one protocol");
+                return false;
+            }
+        } else if (token_is_word(directive, "client_auth")) {
+            const token_t *value = parser_scalar(parser, "a client authentication mode");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "off")) {
+                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_OFF;
+            } else if (token_is_word(value, "optional")) {
+                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_OPTIONAL;
+            } else if (token_is_word(value, "required")) {
+                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_REQUIRED;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "client_auth must be off, optional, or required");
+                return false;
+            }
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown tls directive '%s'", directive->text);
+            parser_hint(parser, "tls accepts certificate, private_key, protocols, ciphers, client_auth");
+            return false;
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (server->tls.certificate == NULL || server->tls.private_key == NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, NULL, "tls block requires certificate and private_key");
+        return false;
+    }
+    return true;
+}
+
+static bool token_is_endpoint(const token_t *token) {
+    if (token->text == NULL) {
+        return false;
+    }
+    if (strncmp(token->text, "http://", 7) == 0) {
+        return true;
+    }
+    return strchr(token->text, ':') != NULL || strchr(token->text, '/') != NULL;
+}
+
+static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *location, const token_t *value) {
+    if (location->target != APEX_PROXY_TARGET_NONE) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "location declares proxy_pass more than once");
+        return false;
+    }
+    if (location->root != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "location cannot combine proxy_pass with root");
+        return false;
+    }
+
+    if (!token_is_endpoint(value)) {
+        if (value->kind != TOKEN_WORD || !is_identifier_name(value->text, value->length) ||
+            is_reserved_word(value->text)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid proxy_pass target");
+            return false;
+        }
+        location->target = APEX_PROXY_TARGET_UPSTREAM;
+        location->upstream_name = config_strdup_range(value->text, value->length);
+        if (location->upstream_name == NULL) {
+            return config_oom(parser->error);
+        }
+        return true;
+    }
+
+    const char *endpoint = value->text;
+    size_t length = value->length;
+    if (length >= 7u && strncmp(endpoint, "http://", 7) == 0) {
+        endpoint += 7;
+        length -= 7u;
+    }
+    if (memchr(endpoint, '/', length) != NULL || memchr(endpoint, '?', length) != NULL ||
+        memchr(endpoint, '#', length) != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass endpoint must be host:port");
+        return false;
+    }
+
+    char endpoint_text[APEX_CONFIG_HOST_MAX * 2u];
+    if (length >= sizeof(endpoint_text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass endpoint is too long");
+        return false;
+    }
+    memcpy(endpoint_text, endpoint, length);
+    endpoint_text[length] = '\0';
+
+    char host[APEX_CONFIG_HOST_MAX];
+    uint16_t port = 0;
+    if (!parse_host_port(endpoint_text, false, false, host, sizeof(host), &port)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid proxy_pass endpoint '%s'", value->text);
+        return false;
+    }
+
+    location->endpoint_host = config_strdup_range(host, strlen(host));
+    if (location->endpoint_host == NULL) {
+        return config_oom(parser->error);
+    }
+    location->endpoint_port = port;
+    location->target = APEX_PROXY_TARGET_ENDPOINT;
+    return true;
+}
+
+static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
+    const token_t *begin = parser_peek(parser);
+    bool exact = false;
+    const token_t *match = parser_peek(parser);
+    if ((match->kind == TOKEN_WORD || match->kind == TOKEN_STRING) && match->text != NULL &&
+        strcmp(match->text, "=") == 0) {
+        exact = true;
+        parser_advance(parser);
+    }
+
+    const token_t *path = parser_scalar(parser, "a location path");
+    if (path == NULL) {
+        return false;
+    }
+    if (path->length == 0 || path->text[0] != '/') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path must start with '/'");
+        return false;
+    }
+    if (path->text[0] == '~' || path->text[0] == '@') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "regex and named locations are not supported");
+        return false;
+    }
+    for (size_t index = 0; index < path->length; index++) {
+        unsigned char byte = (unsigned char)path->text[index];
+        if (byte <= 0x20 || byte == '\r' || byte == '\n') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path contains whitespace");
+            return false;
+        }
+    }
+
+    apex_location_config_t *location = server_add_location(parser, server, begin);
+    if (location == NULL) {
+        return false;
+    }
+    location->path = config_strdup_range(path->text, path->length);
+    if (location->path == NULL) {
+        return config_oom(parser->error);
+    }
+    location->exact = exact;
+
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'location' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a location directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "proxy_pass")) {
+            const token_t *value = parser_scalar(parser, "an upstream name or host:port");
+            if (value == NULL || !location_set_proxy_pass(parser, location, value)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "root")) {
+            if (location->target != APEX_PROXY_TARGET_NONE || location->root != NULL) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive,
+                             "location cannot declare more than one terminal action");
+                return false;
+            }
+            const token_t *value = parser_scalar(parser, "a filesystem path");
+            if (value == NULL) {
+                return false;
+            }
+            location->root = config_strdup_range(value->text, value->length);
+            if (location->root == NULL) {
+                return config_oom(parser->error);
+            }
+        } else if (token_is_word(directive, "proxy_set_header")) {
+            const token_t *name = parser_scalar(parser, "a header name");
+            const token_t *value = parser_scalar(parser, "a header value");
+            if (name == NULL || value == NULL || !location_add_header(parser, location, name, value)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "proxy_connect_timeout") ||
+                   token_is_word(directive, "proxy_read_timeout")) {
+            const token_t *value = parser_scalar(parser, "a duration");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t milliseconds = 0;
+            if (!token_to_duration_ms(value, &milliseconds)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
+                return false;
+            }
+            if (token_is_word(directive, "proxy_connect_timeout")) {
+                location->has_connect_timeout = true;
+                location->connect_timeout_ms = milliseconds;
+            } else {
+                location->has_read_timeout = true;
+                location->read_timeout_ms = milliseconds;
+            }
+        } else if (token_is_word(directive, "proxy_http_version")) {
+            const token_t *value = parser_scalar(parser, "1.0 or 1.1");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "1.0")) {
+                location->http_version = 10;
+            } else if (token_is_word(value, "1.1")) {
+                location->http_version = 11;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_http_version must be 1.0 or 1.1");
+                return false;
+            }
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
+                         directive->text);
+            parser_hint(parser, "location accepts proxy_pass, root, proxy_set_header, proxy_*_timeout, "
+                                "proxy_http_version");
+            return false;
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass or root");
+        return false;
+    }
+    return true;
+}
+
+static bool parse_server_block(parser_t *parser) {
+    const token_t *begin = parser_peek(parser);
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    apex_server_config_t *server = config_add_server(parser, begin);
+    if (server == NULL) {
+        return false;
+    }
+    bool have_listen = false;
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'server' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a server directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "listen")) {
+            if (have_listen) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "server declares listen more than once");
+                return false;
+            }
+            const token_t *value = parser_scalar(parser, "a listen address");
+            if (value == NULL) {
+                return false;
+            }
+
+            char listen_text[APEX_CONFIG_HOST_MAX * 2u];
+            if (value->length >= sizeof(listen_text)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "listen address is too long");
+                return false;
+            }
+            memcpy(listen_text, value->text, value->length);
+            listen_text[value->length] = '\0';
+
+            uint16_t port = 0;
+            if (listen_text[0] == ':' || listen_text[0] == '[') {
+                if (!parse_host_port(listen_text, true, true, server->listen_host, sizeof(server->listen_host),
+                                     &port)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'",
+                                 value->text);
+                    return false;
+                }
+            } else if (strchr(listen_text, ':') == NULL) {
+                uint64_t parsed = 0;
+                const token_t *port_token = value;
+                if (!token_to_u64(port_token, 0, 65535, &parsed)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen port");
+                    return false;
+                }
+                server->listen_host[0] = '\0';
+                port = (uint16_t)parsed;
+            } else {
+                if (!parse_host_port(listen_text, false, true, server->listen_host, sizeof(server->listen_host),
+                                     &port)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'",
+                                 value->text);
+                    return false;
+                }
+            }
+
+            server->listen_port = port;
+            have_listen = true;
+
+            if (token_is_word(parser_peek(parser), "tls")) {
+                parser_advance(parser);
+                server->listen_tls = true;
+            }
+        } else if (token_is_word(directive, "server_name")) {
+            size_t count = 0;
+            while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
+                const token_t *name = parser_scalar(parser, "a server name");
+                if (name == NULL || !server_add_name(parser, server, name)) {
+                    return false;
+                }
+                count++;
+            }
+            if (count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "server_name requires a name");
+                return false;
+            }
+        } else if (token_is_word(directive, "tls")) {
+            if (server->tls.enabled) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "server declares tls more than once");
+                return false;
+            }
+            if (!parse_tls_block(parser, server)) {
+                return false;
+            }
+            continue;
+        } else if (token_is_word(directive, "location")) {
+            if (!parse_location_block(parser, server)) {
+                return false;
+            }
+            continue;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+            parser_hint(parser, "server accepts listen, server_name, tls, location");
+            return false;
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (!have_listen) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
+        return false;
+    }
+    if (server->listen_tls && !server->tls.enabled) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "listen tls requires a tls block");
+        return false;
+    }
+    return true;
+}
+
+static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t *upstream) {
+    const token_t *endpoint = parser_scalar(parser, "a backend address");
+    if (endpoint == NULL) {
+        return false;
+    }
+
+    char endpoint_text[APEX_CONFIG_HOST_MAX * 2u];
+    if (endpoint->length >= sizeof(endpoint_text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "backend address is too long");
+        return false;
+    }
+    memcpy(endpoint_text, endpoint->text, endpoint->length);
+    endpoint_text[endpoint->length] = '\0';
+
+    apex_upstream_server_config_t server;
+    memset(&server, 0, sizeof(server));
+    server.weight = 1u;
+    server.line = endpoint->line;
+    if (!parse_host_port(endpoint_text, false, false, server.host, sizeof(server.host), &server.port)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "invalid backend address '%s'", endpoint->text);
+        parser_hint(parser, "backend addresses use host:port or [ipv6]:port");
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *attribute = parser_peek(parser);
+        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected ';' after backend address");
+            return false;
+        }
+
+        const char *name = attribute->text;
+        size_t name_length = attribute->length;
+        const char *equals = memchr(name, '=', name_length);
+        size_t key_length = name_length;
+
+        if (equals != NULL) {
+            key_length = (size_t)(equals - name);
+        }
+        parser_advance(parser);
+
+        char option_text[64];
+        const token_t *value_token = NULL;
+        token_t inline_value;
+        if (equals != NULL) {
+            size_t value_length = name_length - key_length - 1u;
+            if (value_length >= sizeof(option_text)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "backend option value is too long");
+                return false;
+            }
+            memcpy(option_text, equals + 1, value_length);
+            option_text[value_length] = '\0';
+            memset(&inline_value, 0, sizeof(inline_value));
+            inline_value.kind = TOKEN_WORD;
+            inline_value.text = option_text;
+            inline_value.length = value_length;
+            inline_value.line = attribute->line;
+            inline_value.column = attribute->column;
+            inline_value.file_index = attribute->file_index;
+            value_token = &inline_value;
+        } else {
+            const token_t *equals_token = parser_peek(parser);
+            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
+                             "backend option '%s' requires '=' and a value", name);
+                return false;
+            }
+            parser_advance(parser);
+            value_token = parser_scalar(parser, "an option value");
+            if (value_token == NULL) {
+                return false;
+            }
+        }
+
+        uint64_t parsed = 0;
+        if (key_length == 6u && strncmp(name, "weight", 6u) == 0) {
+            if (!token_to_u64(value_token, 1u, APEX_CONFIG_MAX_WEIGHT, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "weight must be between 1 and %u",
+                             (unsigned)APEX_CONFIG_MAX_WEIGHT);
+                return false;
+            }
+            server.weight = (uint32_t)parsed;
+        } else if (key_length == 9u && strncmp(name, "max_conns", 9u) == 0) {
+            if (!token_to_u64(value_token, 0u, APEX_CONFIG_MAX_CONNS, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_conns is out of range");
+                return false;
+            }
+            server.max_conns = (uint32_t)parsed;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown backend option");
+            parser_hint(parser, "backend options are weight=<n> and max_conns=<n>");
+            return false;
+        }
+    }
+
+    if (!parser_expect_semicolon(parser)) {
+        return false;
+    }
+    return upstream_add_server(parser, upstream, &server);
+}
+
+static bool parse_upstream_block(parser_t *parser) {
+    const token_t *name = parser_identifier(parser, "an upstream name");
+    if (name == NULL) {
+        return false;
+    }
+    if (is_reserved_word(name->text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "reserved word '%s' cannot name an upstream",
+                     name->text);
+        return false;
+    }
+    if (apex_config_find_upstream(parser->config, name->text) != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "duplicate upstream '%s'", name->text);
+        return false;
+    }
+
+    apex_upstream_config_t *upstream = config_add_upstream(parser, name);
+    if (upstream == NULL) {
+        return false;
+    }
+
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'upstream' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected an upstream directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "server")) {
+            if (!parse_upstream_server_item(parser, upstream)) {
+                return false;
+            }
+            continue;
+        }
+        if (token_is_word(directive, "policy") || token_is_word(directive, "algorithm")) {
+            const token_t *value = parser_scalar(parser, "round_robin or p2c");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "round_robin") || token_is_word(value, "round-robin")) {
+                upstream->policy = APEX_BALANCE_ROUND_ROBIN;
+            } else if (token_is_word(value, "p2c")) {
+                upstream->policy = APEX_BALANCE_P2C;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "policy must be round_robin or p2c");
+                return false;
+            }
+        } else if (token_is_word(directive, "keepalive")) {
+            const token_t *value = parser_scalar(parser, "a connection count");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t parsed = 0;
+            if (!token_to_u64(value, 0u, APEX_CONFIG_MAX_KEEPALIVE, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "keepalive is out of range");
+                return false;
+            }
+            upstream->keepalive = (uint32_t)parsed;
+        } else if (token_is_word(directive, "connect_timeout") || token_is_word(directive, "read_timeout") ||
+                   token_is_word(directive, "idle_timeout")) {
+            const token_t *value = parser_scalar(parser, "a duration");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t milliseconds = 0;
+            if (!token_to_duration_ms(value, &milliseconds)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
+                return false;
+            }
+            if (token_is_word(directive, "connect_timeout")) {
+                upstream->connect_timeout_ms = milliseconds;
+            } else if (token_is_word(directive, "read_timeout")) {
+                upstream->read_timeout_ms = milliseconds;
+            } else {
+                upstream->idle_timeout_ms = milliseconds;
+            }
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown upstream directive '%s'",
+                         directive->text);
+            parser_hint(parser, "upstream accepts server, policy, keepalive, connect_timeout, read_timeout, "
+                                "idle_timeout");
+            return false;
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (upstream->server_count == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "upstream '%s' requires at least one server",
+                     upstream->name);
+        return false;
+    }
+    return true;
+}
+
+static bool parse_http_directive(parser_t *parser, const token_t *directive) {
+    if (token_is_word(directive, "worker_connections")) {
+        const token_t *value = parser_scalar(parser, "a connection count");
+        if (value == NULL) {
+            return false;
+        }
+        uint64_t parsed = 0;
+        if (!token_to_u64(value, 1u, 10000000u, &parsed)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "worker_connections is out of range");
+            return false;
+        }
+        parser->config->http.worker_connections = (uint32_t)parsed;
+    } else if (token_is_word(directive, "keepalive_timeout") ||
+               token_is_word(directive, "client_header_timeout") ||
+               token_is_word(directive, "client_body_timeout")) {
+        const token_t *value = parser_scalar(parser, "a duration");
+        if (value == NULL) {
+            return false;
+        }
+        uint64_t milliseconds = 0;
+        if (!token_to_duration_ms(value, &milliseconds)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
+            return false;
+        }
+        if (token_is_word(directive, "keepalive_timeout")) {
+            parser->config->http.keepalive_timeout_ms = milliseconds;
+        } else if (token_is_word(directive, "client_header_timeout")) {
+            parser->config->http.client_header_timeout_ms = milliseconds;
+        } else {
+            parser->config->http.client_body_timeout_ms = milliseconds;
+        }
+    } else if (token_is_word(directive, "server_tokens")) {
+        const token_t *value = parser_scalar(parser, "on or off");
+        if (value == NULL) {
+            return false;
+        }
+        if (token_is_word(value, "on")) {
+            parser->config->http.server_tokens = true;
+        } else if (token_is_word(value, "off")) {
+            parser->config->http.server_tokens = false;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "server_tokens must be on or off");
+            return false;
+        }
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
+        parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
+                            "client_body_timeout, server_tokens, upstream, server");
+        return false;
+    }
+    return true;
+}
+
+static bool parse_http_block(parser_t *parser) {
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'http' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected an http item");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "upstream")) {
+            if (!parse_upstream_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "server")) {
+            if (!parse_server_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "http") || token_is_word(directive, "modules") ||
+                   token_is_word(directive, "include")) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "'%s' is not allowed inside http",
+                         directive->text);
+            return false;
+        } else {
+            if (!parse_http_directive(parser, directive) || !parser_expect_semicolon(parser)) {
+                return false;
+            }
+        }
+    }
+
+    return parser_expect_rbrace(parser);
+}
+
+static bool parse_modules_block(parser_t *parser) {
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'modules' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a modules directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(directive, "load") || token_is_word(directive, "enable")) {
+            const token_t *name = parser_scalar(parser, "a module name");
+            if (name == NULL) {
+                return false;
+            }
+            if (!config_add_module(parser, name)) {
+                return false;
+            }
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown modules directive '%s'",
+                         directive->text);
+            parser_hint(parser, "modules accepts load <name> and enable <name>");
+            return false;
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    return parser_expect_rbrace(parser);
+}
+
+static bool validate_config(parser_t *parser) {
+    apex_config_t *config = parser->config;
+
+    for (size_t server_index = 0; server_index < config->server_count; server_index++) {
+        apex_server_config_t *server = &config->servers[server_index];
+        for (size_t location_index = 0; location_index < server->location_count; location_index++) {
+            apex_location_config_t *location = &server->locations[location_index];
+            if (location->target != APEX_PROXY_TARGET_UPSTREAM) {
+                continue;
+            }
+
+            const apex_upstream_config_t *upstream =
+                apex_config_find_upstream(config, location->upstream_name);
+            if (upstream == NULL) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, NULL, "unresolved upstream '%s'",
+                             location->upstream_name);
+                parser->error->line = location->line;
+                return false;
+            }
+            location->upstream_index = (size_t)(upstream - config->upstreams);
+        }
+    }
+
+    return true;
+}
+
+static bool parse_tokens(parser_t *parser) {
+    while (parser_peek(parser)->kind != TOKEN_EOF) {
+        const token_t *item = parser_peek(parser);
+        if (item->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item, "expected a top-level directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(item, "http")) {
+            if (!parse_http_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(item, "modules")) {
+            if (!parse_modules_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(item, "include")) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item,
+                         "include is only available when parsing a file");
+            return false;
+        } else if (token_is_word(item, "upstream") || token_is_word(item, "server") ||
+                   token_is_word(item, "location") || token_is_word(item, "tls")) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item, "'%s' must be declared inside http", item->text);
+            return false;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item, "unknown top-level directive '%s'", item->text);
+            parser_hint(parser, "top-level items are http and modules");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void config_init_defaults(apex_config_t *config) {
+    memset(config, 0, sizeof(*config));
+    config->http.worker_connections = APEX_CONFIG_DEFAULT_WORKER_CONNECTIONS;
+    config->http.keepalive_timeout_ms = APEX_CONFIG_DEFAULT_KEEPALIVE_MS;
+    config->http.client_header_timeout_ms = APEX_CONFIG_DEFAULT_CLIENT_HEADER_MS;
+    config->http.client_body_timeout_ms = APEX_CONFIG_DEFAULT_CLIENT_BODY_MS;
+    config->http.server_tokens = false;
+}
+
+int apex_config_parse_string(const char *name, const char *text, size_t length, apex_config_t **config_out,
+                             apex_config_error_t *error) {
+    if (config_out == NULL || text == NULL) {
+        config_error_set(error, APEX_CONFIG_ERR_IO, name, 0, 0, "invalid configuration input");
+        return APEX_CONFIG_ERR_IO;
+    }
+    *config_out = NULL;
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+
+    const char *source_name = name != NULL ? name : "<memory>";
+
+    apex_config_t *config = calloc(1, sizeof(*config));
+    if (config == NULL) {
+        config_oom(error);
+        return APEX_CONFIG_ERR_MEMORY;
+    }
+    config_init_defaults(config);
+    snprintf(config->source, sizeof(config->source), "%s", source_name);
+
+    token_list_t tokens;
+    token_list_init(&tokens);
+    if (token_list_register_file(&tokens, source_name, error) < 0) {
+        apex_config_free(config);
+        return APEX_CONFIG_ERR_MEMORY;
+    }
+
+    lexer_t lexer = {
+        .data = text,
+        .length = length,
+        .position = 0,
+        .line = 1,
+        .column = 1,
+        .file_index = 0,
+        .tokens = &tokens,
+        .error = error,
+    };
+
+    bool ok = lexer_run(&lexer);
+    if (ok) {
+        token_t eof = {
+            .kind = TOKEN_EOF,
+            .text = NULL,
+            .length = 0,
+            .file_index = 0,
+            .line = lexer.line,
+            .column = lexer.column,
+        };
+        ok = token_list_push(&tokens, eof, error);
+    }
+
+    if (ok) {
+        parser_t parser = {
+            .tokens = &tokens,
+            .index = 0,
+            .config = config,
+            .error = error,
+        };
+        ok = parse_tokens(&parser) && validate_config(&parser);
+    }
+
+    token_list_free(&tokens);
+
+    if (!ok) {
+        apex_config_free(config);
+        return error != NULL && error->code != APEX_CONFIG_OK ? error->code : APEX_CONFIG_ERR_SYNTAX;
+    }
+
+    *config_out = config;
+    return APEX_CONFIG_OK;
+}
+
+int apex_config_parse_file(const char *path, apex_config_t **config_out, apex_config_error_t *error) {
+    if (config_out == NULL || path == NULL) {
+        config_error_set(error, APEX_CONFIG_ERR_IO, path, 0, 0, "invalid configuration path");
+        return APEX_CONFIG_ERR_IO;
+    }
+    *config_out = NULL;
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+
+    token_list_t tokens;
+    token_list_init(&tokens);
+    char *stack[APEX_CONFIG_MAX_INCLUDE_DEPTH];
+    memset(stack, 0, sizeof(stack));
+
+    bool ok = tokenize_source(path, &tokens, stack, 0, error);
+    for (size_t index = 0; index < APEX_CONFIG_MAX_INCLUDE_DEPTH; index++) {
+        free(stack[index]);
+    }
+
+    if (ok) {
+        token_t eof = {
+            .kind = TOKEN_EOF,
+            .text = NULL,
+            .length = 0,
+            .file_index = 0,
+            .line = 0,
+            .column = 0,
+        };
+        ok = token_list_push(&tokens, eof, error);
+    }
+
+    apex_config_t *config = NULL;
+    if (ok) {
+        config = calloc(1, sizeof(*config));
+        if (config == NULL) {
+            config_oom(error);
+            ok = false;
+        } else {
+            config_init_defaults(config);
+            char canonical[APEX_CONFIG_PATH_MAX];
+            if (canonical_path(path, canonical, sizeof(canonical), error)) {
+                snprintf(config->source, sizeof(config->source), "%s", canonical);
+            } else {
+                snprintf(config->source, sizeof(config->source), "%s", path);
+                ok = false;
+            }
+        }
+    }
+
+    if (ok) {
+        parser_t parser = {
+            .tokens = &tokens,
+            .index = 0,
+            .config = config,
+            .error = error,
+        };
+        ok = parse_tokens(&parser) && validate_config(&parser);
+    }
+
+    token_list_free(&tokens);
+
+    if (!ok) {
+        apex_config_free(config);
+        return error != NULL && error->code != APEX_CONFIG_OK ? error->code : APEX_CONFIG_ERR_SYNTAX;
+    }
+
+    if (config->server_count == 0) {
+        config_error_set(error, APEX_CONFIG_ERR_SEMANTIC, config->source, 0, 0,
+                         "configuration declares no server blocks");
+        apex_config_free(config);
+        return APEX_CONFIG_ERR_SEMANTIC;
+    }
+
+    *config_out = config;
+    return APEX_CONFIG_OK;
+}
+
+int apex_config_check_file(const char *path, apex_config_error_t *error) {
+    apex_config_t *config = NULL;
+    int status = apex_config_parse_file(path, &config, error);
+    apex_config_free(config);
+    return status;
+}
+
+void apex_config_free(apex_config_t *config) {
+    if (config == NULL) {
+        return;
+    }
+
+    for (size_t upstream_index = 0; upstream_index < config->upstream_count; upstream_index++) {
+        apex_upstream_config_t *upstream = &config->upstreams[upstream_index];
+        free(upstream->name);
+        free(upstream->servers);
+    }
+    free(config->upstreams);
+
+    for (size_t server_index = 0; server_index < config->server_count; server_index++) {
+        apex_server_config_t *server = &config->servers[server_index];
+        for (size_t name_index = 0; name_index < server->server_name_count; name_index++) {
+            free(server->server_names[name_index]);
+        }
+        free(server->server_names);
+
+        free(server->tls.certificate);
+        free(server->tls.private_key);
+        free(server->tls.ciphers);
+        for (size_t protocol_index = 0; protocol_index < server->tls.protocol_count; protocol_index++) {
+            free(server->tls.protocols[protocol_index]);
+        }
+        free(server->tls.protocols);
+
+        for (size_t location_index = 0; location_index < server->location_count; location_index++) {
+            apex_location_config_t *location = &server->locations[location_index];
+            free(location->path);
+            free(location->upstream_name);
+            free(location->endpoint_host);
+            free(location->root);
+            for (size_t header_index = 0; header_index < location->header_count; header_index++) {
+                free(location->headers[header_index].name);
+                free(location->headers[header_index].value);
+            }
+            free(location->headers);
+        }
+        free(server->locations);
+    }
+    free(config->servers);
+
+    for (size_t module_index = 0; module_index < config->module_count; module_index++) {
+        free(config->modules[module_index]);
+    }
+    free(config->modules);
+
+    free(config);
+}
+
+const char *apex_config_strerror(apex_config_status_t code) {
+    switch (code) {
+    case APEX_CONFIG_OK:
+        return "success";
+    case APEX_CONFIG_ERR_IO:
+        return "configuration I/O error";
+    case APEX_CONFIG_ERR_SYNTAX:
+        return "configuration syntax error";
+    case APEX_CONFIG_ERR_SEMANTIC:
+        return "configuration validation error";
+    case APEX_CONFIG_ERR_MEMORY:
+        return "out of memory";
+    case APEX_CONFIG_ERR_RUNTIME:
+        return "configuration runtime error";
+    default:
+        return "unknown configuration error";
+    }
+}
+
+const apex_upstream_config_t *apex_config_find_upstream(const apex_config_t *config, const char *name) {
+    if (config == NULL || name == NULL) {
+        return NULL;
+    }
+    for (size_t index = 0; index < config->upstream_count; index++) {
+        if (config->upstreams[index].name != NULL && strcmp(config->upstreams[index].name, name) == 0) {
+            return &config->upstreams[index];
+        }
+    }
+    return NULL;
+}
+
+int apex_config_first_listen_port(const apex_config_t *config) {
+    if (config == NULL) {
+        return -1;
+    }
+    for (size_t index = 0; index < config->server_count; index++) {
+        if (config->servers[index].listen_port != 0) {
+            return (int)config->servers[index].listen_port;
+        }
+    }
+    return -1;
+}
+
+static bool runtime_error_at(apex_config_error_t *error, const char *file, int line, const char *format, ...) {
+    if (error == NULL) {
+        return false;
+    }
+    error->code = APEX_CONFIG_ERR_RUNTIME;
+    error->line = line;
+    error->column = 0;
+    error->message[0] = '\0';
+    error->hint[0] = '\0';
+    snprintf(error->file, sizeof(error->file), "%s", file != NULL ? file : "");
+    va_list arguments;
+    va_start(arguments, format);
+    vsnprintf(error->message, sizeof(error->message), format, arguments);
+    va_end(arguments);
+    return false;
+}
+
+apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_error_t *error) {
+    if (config == NULL) {
+        runtime_error_at(error, NULL, 0, "configuration is null");
+        return NULL;
+    }
+    if (error != NULL) {
+        memset(error, 0, sizeof(*error));
+    }
+
+    apex_runtime_t *runtime = calloc(1, sizeof(*runtime));
+    if (runtime == NULL) {
+        config_oom(error);
+        return NULL;
+    }
+    runtime->config = config;
+
+    if (config->upstream_count > 0) {
+        runtime->groups = calloc(config->upstream_count, sizeof(*runtime->groups));
+        if (runtime->groups == NULL) {
+            config_oom(error);
+            apex_runtime_destroy(runtime);
+            return NULL;
+        }
+    }
+
+    for (size_t index = 0; index < config->upstream_count; index++) {
+        const apex_upstream_config_t *source = &config->upstreams[index];
+        upstream_group_t *group = &runtime->groups[index];
+        apex_upstream_group_init(group);
+        group->keepalive_capacity = source->keepalive;
+        group->connect_timeout_ms = source->connect_timeout_ms;
+        group->io_timeout_ms = source->read_timeout_ms;
+        group->idle_timeout_ms = source->idle_timeout_ms;
+        apex_upstream_set_policy(group, source->policy);
+
+        for (size_t server_index = 0; server_index < source->server_count; server_index++) {
+            const apex_upstream_server_config_t *server = &source->servers[server_index];
+            if (apex_upstream_add_server(group, server->host, server->port, server->weight) < 0) {
+                runtime_error_at(error, config->source, server->line, "cannot resolve upstream '%s' server %s:%u",
+                                 source->name, server->host, (unsigned)server->port);
+                apex_runtime_destroy(runtime);
+                return NULL;
+            }
+        }
+        runtime->group_count++;
+    }
+
+    size_t endpoint_count = 0;
+    for (size_t server_index = 0; server_index < config->server_count; server_index++) {
+        const apex_server_config_t *server = &config->servers[server_index];
+        for (size_t location_index = 0; location_index < server->location_count; location_index++) {
+            if (server->locations[location_index].target == APEX_PROXY_TARGET_ENDPOINT) {
+                endpoint_count++;
+            }
+        }
+    }
+
+    if (endpoint_count > 0) {
+        runtime->endpoint_groups = calloc(endpoint_count, sizeof(*runtime->endpoint_groups));
+        if (runtime->endpoint_groups == NULL) {
+            config_oom(error);
+            apex_runtime_destroy(runtime);
+            return NULL;
+        }
+    }
+
+    for (size_t server_index = 0; server_index < config->server_count; server_index++) {
+        const apex_server_config_t *server = &config->servers[server_index];
+        for (size_t location_index = 0; location_index < server->location_count; location_index++) {
+            const apex_location_config_t *location = &server->locations[location_index];
+            if (location->target != APEX_PROXY_TARGET_ENDPOINT) {
+                continue;
+            }
+
+            apex_endpoint_group_t *entry = &runtime->endpoint_groups[runtime->endpoint_group_count];
+            entry->location = location;
+            apex_upstream_group_init(&entry->group);
+            entry->group.connect_timeout_ms =
+                location->has_connect_timeout ? location->connect_timeout_ms : APEX_CONFIG_DEFAULT_CONNECT_MS;
+            entry->group.io_timeout_ms =
+                location->has_read_timeout ? location->read_timeout_ms : APEX_CONFIG_DEFAULT_READ_MS;
+
+            if (apex_upstream_add_server(&entry->group, location->endpoint_host, location->endpoint_port, 1u) <
+                0) {
+                runtime_error_at(error, config->source, location->line, "cannot resolve proxy endpoint %s:%u",
+                                 location->endpoint_host, (unsigned)location->endpoint_port);
+                apex_runtime_destroy(runtime);
+                return NULL;
+            }
+            runtime->endpoint_group_count++;
+        }
+    }
+
+    return runtime;
+}
+
+void apex_runtime_destroy(apex_runtime_t *runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    free(runtime->groups);
+    free(runtime->endpoint_groups);
+    free(runtime);
+}
+
+const upstream_group_t *apex_runtime_upstream(const apex_runtime_t *runtime, size_t index) {
+    if (runtime == NULL || index >= runtime->group_count) {
+        return NULL;
+    }
+    return &runtime->groups[index];
+}
+
+const upstream_group_t *apex_runtime_endpoint_group(const apex_runtime_t *runtime,
+                                                    const apex_location_config_t *location) {
+    if (runtime == NULL || location == NULL) {
+        return NULL;
+    }
+    for (size_t index = 0; index < runtime->endpoint_group_count; index++) {
+        if (runtime->endpoint_groups[index].location == location) {
+            return &runtime->endpoint_groups[index].group;
+        }
+    }
+    return NULL;
+}
+
+static bool host_matches_name(const char *name, const char *host, size_t host_length) {
+    return strlen(name) == host_length && strncasecmp(name, host, host_length) == 0;
+}
+
+static void strip_host_port(const char *host, size_t host_length, const char **name, size_t *name_length) {
+    *name = host;
+    *name_length = host_length;
+    if (host_length == 0) {
+        return;
+    }
+    if (host[0] == '[') {
+        const char *close = memchr(host, ']', host_length);
+        if (close != NULL) {
+            *name = host + 1;
+            *name_length = (size_t)(close - (host + 1));
+        }
+        return;
+    }
+    const char *colon = memchr(host, ':', host_length);
+    if (colon != NULL && memchr(colon + 1, ':', (size_t)((host + host_length) - (colon + 1))) == NULL) {
+        *name_length = (size_t)(colon - host);
+    }
+}
+
+static bool server_matches_host(const apex_server_config_t *server, const char *host, size_t host_length) {
+    const char *name = NULL;
+    size_t name_length = 0;
+    strip_host_port(host, host_length, &name, &name_length);
+    for (size_t index = 0; index < server->server_name_count; index++) {
+        if (host_matches_name(server->server_names[index], name, name_length)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const apex_location_config_t *select_location(const apex_server_config_t *server, const char *path,
+                                                     size_t path_length) {
+    const apex_location_config_t *best_prefix = NULL;
+    size_t best_length = 0;
+
+    for (size_t index = 0; index < server->location_count; index++) {
+        const apex_location_config_t *location = &server->locations[index];
+        size_t length = strlen(location->path);
+        if (location->exact) {
+            if (length == path_length && memcmp(location->path, path, path_length) == 0) {
+                return location;
+            }
+            continue;
+        }
+        if (length <= path_length && memcmp(location->path, path, length) == 0 && length > best_length) {
+            best_prefix = location;
+            best_length = length;
+        }
+    }
+
+    return best_prefix;
+}
+
+bool apex_runtime_match(const apex_runtime_t *runtime, const char *host, size_t host_length, const char *path,
+                        size_t path_length, apex_config_route_t *route) {
+    if (runtime == NULL || runtime->config == NULL || route == NULL || path == NULL) {
+        return false;
+    }
+
+    const apex_config_t *config = runtime->config;
+    if (config->server_count == 0) {
+        return false;
+    }
+
+    const apex_server_config_t *server = NULL;
+    for (size_t index = 0; index < config->server_count; index++) {
+        if (server_matches_host(&config->servers[index], host, host_length)) {
+            server = &config->servers[index];
+            break;
+        }
+    }
+    if (server == NULL) {
+        server = &config->servers[0];
+    }
+
+    const apex_location_config_t *location = select_location(server, path, path_length);
+    if (location == NULL) {
+        return false;
+    }
+
+    memset(route, 0, sizeof(*route));
+    route->server = server;
+    route->location = location;
+    route->upstream_index = location->upstream_index;
+
+    if (location->target == APEX_PROXY_TARGET_UPSTREAM) {
+        route->group = apex_runtime_upstream(runtime, location->upstream_index);
+    } else if (location->target == APEX_PROXY_TARGET_ENDPOINT) {
+        route->group = apex_runtime_endpoint_group(runtime, location);
+    }
+
+    return true;
+}
