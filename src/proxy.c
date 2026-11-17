@@ -48,6 +48,7 @@ typedef struct {
     size_t capacity;
     size_t position;
     size_t limit;
+    uint64_t deadline_ms;
     bool eof;
 } reader_t;
 
@@ -76,7 +77,7 @@ static uint64_t monotonic_us(void) {
 }
 
 static const char *find_bytes(const char *haystack, size_t haystack_len, const char *needle, size_t needle_len) {
-    if (needle_len == 0 || haystack_len < needle_len) {
+    if (haystack == NULL || needle_len == 0 || haystack_len < needle_len) {
         return NULL;
     }
 
@@ -650,9 +651,12 @@ static int send_all(int fd, const void *data, size_t len) {
         if (sent < 0 && errno == EINTR) {
             continue;
         }
-        return -1;
+        if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return APEX_PROXY_ERR_TIMEOUT;
+        }
+        return APEX_PROXY_ERR_IO;
     }
-    return 0;
+    return APEX_PROXY_OK;
 }
 
 static int build_request(buffer_t *wire, const apex_proxy_request_t *request, const upstream_server_t *server) {
@@ -753,6 +757,9 @@ static int reader_pull(reader_t *reader) {
     if (reader->eof) {
         return 0;
     }
+    if (reader->deadline_ms != 0 && monotonic_ms() >= reader->deadline_ms) {
+        return APEX_PROXY_ERR_TIMEOUT;
+    }
     if (!reader_reserve(reader, 8192u)) {
         return APEX_PROXY_ERR_TOO_LARGE;
     }
@@ -804,8 +811,10 @@ static void reader_free(reader_t *reader) {
 static int reader_read_headers(reader_t *reader, size_t max_header, char **headers, size_t *headers_len) {
     size_t search_from = reader->position;
     for (;;) {
-        const char *delimiter =
-            find_bytes(reader->data + search_from, reader->len - search_from, "\r\n\r\n", 4u);
+        const char *delimiter = NULL;
+        if (reader->len - search_from >= 4u) {
+            delimiter = find_bytes(reader->data + search_from, reader->len - search_from, "\r\n\r\n", 4u);
+        }
         if (delimiter != NULL) {
             size_t end = (size_t)(delimiter - reader->data) + 4u;
             size_t length = end - reader->position;
@@ -945,10 +954,15 @@ static int read_chunked_body(reader_t *reader, size_t max_body, apex_proxy_respo
             buffer_free(&body);
             return APEX_PROXY_ERR_TOO_LARGE;
         }
+        if (chunk_size > (uint64_t)SIZE_MAX - 2u) {
+            buffer_free(&body);
+            return APEX_PROXY_ERR_TOO_LARGE;
+        }
+        size_t chunk_total = (size_t)chunk_size + 2u;
 
         reader_compact(reader);
 
-        while (reader->len < (size_t)chunk_size + 2u) {
+        while (reader->len < chunk_total) {
             int pulled = reader_pull(reader);
             if (pulled == 0) {
                 buffer_free(&body);
@@ -968,7 +982,7 @@ static int read_chunked_body(reader_t *reader, size_t max_body, apex_proxy_respo
             buffer_free(&body);
             return APEX_PROXY_ERR_PROTOCOL;
         }
-        reader->position = (size_t)chunk_size + 2u;
+        reader->position = chunk_total;
     }
 
     reader_compact(reader);
@@ -1258,6 +1272,8 @@ void apex_proxy_response_free(apex_proxy_response_t *response) {
 
 int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *request,
                        apex_proxy_response_t *response) {
+    apex_proxy_response_init(response);
+
     if (group == NULL || request == NULL || response == NULL) {
         return APEX_PROXY_ERR_INVALID;
     }
@@ -1280,8 +1296,6 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         request->headers_len > APEX_PROXY_MAX_REQUEST_BYTES - request->body_len) {
         return APEX_PROXY_ERR_TOO_LARGE;
     }
-
-    apex_proxy_response_init(response);
 
     ssize_t selected = apex_upstream_select(group);
     if (selected < 0) {
@@ -1318,8 +1332,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
 
     apply_io_timeouts(fd, group);
 
-    if (send_all(fd, wire.data, wire.len) < 0) {
-        result = APEX_PROXY_ERR_IO;
+    result = send_all(fd, wire.data, wire.len);
+    if (result != APEX_PROXY_OK) {
         goto finish;
     }
     atomic_fetch_add_explicit(&server->bytes_sent, wire.len, memory_order_relaxed);
@@ -1329,8 +1343,13 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                        (uint64_t)(group->max_body_bytes ? group->max_body_bytes
                                                         : APEX_PROXY_DEFAULT_MAX_BODY_BYTES) +
                        65536u;
+    uint64_t io_timeout = group->io_timeout_ms ? group->io_timeout_ms : APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
+    if (io_timeout > 3600000u) {
+        io_timeout = 3600000u;
+    }
     reader.fd = fd;
     reader.limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
+    reader.deadline_ms = monotonic_ms() + io_timeout;
 
     result = read_response(&reader, group, request, response);
     if (result != APEX_PROXY_OK) {
