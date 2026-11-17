@@ -393,6 +393,37 @@ apex_generation_t *apex_generation_create(apex_config_t *config, apex_config_err
     atomic_init(&generation->references, 1u);
     generation->config = config;
     generation->runtime = runtime;
+    generation->tls_context = NULL;
+
+    /* The standalone core serves exactly one listening endpoint shared by all
+     * virtual hosts, so the endpoint must not mix TLS and plaintext servers:
+     * a single connection could not speak both. Build one SSL_CTX up front. */
+    bool tls_listener = false;
+    for (size_t index = 0; index < config->server_count; index++) {
+        if (config->servers[index].listen_tls != config->servers[0].listen_tls) {
+            if (error != NULL) {
+                memset(error, 0, sizeof(*error));
+                error->code = APEX_CONFIG_ERR_SEMANTIC;
+                error->line = config->servers[index].line;
+                snprintf(error->file, sizeof(error->file), "%s", config->source);
+                snprintf(error->message, sizeof(error->message),
+                         "cannot mix tls and plaintext servers on one listen endpoint");
+            }
+            free(generation);
+            apex_runtime_destroy(runtime);
+            return NULL;
+        }
+        tls_listener = tls_listener || config->servers[index].listen_tls;
+    }
+    if (tls_listener) {
+        generation->tls_context = apex_tls_context_create(config, &config->servers[0], error);
+        if (generation->tls_context == NULL) {
+            free(generation);
+            apex_runtime_destroy(runtime);
+            return NULL;
+        }
+    }
+
     return generation;
 }
 
@@ -407,6 +438,7 @@ void apex_generation_release(apex_generation_t *generation) {
         atomic_fetch_sub_explicit(&generation->references, 1u, memory_order_acq_rel) == 1u) {
         apex_runtime_destroy(generation->runtime);
         apex_config_free(generation->config);
+        apex_tls_context_destroy(generation->tls_context);
         free(generation);
     }
 }

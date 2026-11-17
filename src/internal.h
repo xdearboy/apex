@@ -24,10 +24,15 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <openssl/ssl.h>
+
 #define MAX_FDS 65536
 #define MAX_EVENTS 512
 #define BUF_SIZE 4096
 #define MAX_ROUTES 128
+
+typedef enum { APEX_TRANSPORT_PLAIN, APEX_TRANSPORT_TLS } transport_kind_t;
+typedef enum { APEX_TLS_HANDSHAKE, APEX_TLS_READY } tls_phase_t;
 
 typedef struct conn {
     int fd;
@@ -37,6 +42,11 @@ typedef struct conn {
     uint32_t write_offset;
     uint8_t close_after_write;
     uint8_t epollout_active;
+    transport_kind_t transport;
+    SSL *ssl;
+    tls_phase_t tls_phase;
+    uint8_t tls_want_write;
+    uint8_t alpn_h2;
     char read_buffer[BUF_SIZE];
     char write_buffer[BUF_SIZE];
     char *aux_buffer;
@@ -63,11 +73,20 @@ typedef struct {
     _Atomic unsigned references;
     apex_config_t *config;
     apex_runtime_t *runtime;
+    SSL_CTX *tls_context;
 } apex_generation_t;
 
 apex_generation_t *apex_generation_create(apex_config_t *config, apex_config_error_t *error);
 void apex_generation_retain(apex_generation_t *generation);
 void apex_generation_release(apex_generation_t *generation);
+
+/* TLS transport (src/tls.c). A generation owns its SSL_CTX when the
+ * configuration enables a TLS listener; plaintext configurations keep NULL. */
+SSL_CTX *apex_tls_context_create(const apex_config_t *config, const apex_server_config_t *server,
+                                 apex_config_error_t *error);
+void apex_tls_context_destroy(SSL_CTX *context);
+bool apex_tls_config_has_listener(const apex_config_t *config);
+bool apex_tls_validate_config(const apex_config_t *config, apex_config_error_t *error);
 
 struct apex_app {
     apex_route_t routes[MAX_ROUTES];

@@ -13,9 +13,14 @@ endif
 
 LIB = libapex.a
 BIN = apex
-SRCS = src/core.c src/router.c src/proxy.c src/config.c
+SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c
 OBJS = $(SRCS:.c=.o)
 HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal.h
+
+TLS_CFLAGS := $(shell pkg-config --cflags libssl libcrypto 2>/dev/null)
+TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s ' -lssl -lcrypto)
+CFLAGS += $(TLS_CFLAGS)
+LDLIBS = $(TLS_LIBS)
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo
@@ -37,22 +42,22 @@ $(BUILD_META_H): Makefile
 	&& mv -f $@.tmp $@
 
 $(BIN): src/main.o $(BUILD_META_H) $(LIB)
-	$(CC) $(CFLAGS) -o $@ src/main.o $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ src/main.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
 src/main.o: src/main.c $(HEADERS) $(BUILD_META_H) Makefile
 	$(CC) $(CFLAGS) -c $< -o $@
 
 examples/web_frameworks: examples/web_frameworks.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ examples/web_frameworks.o $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ examples/web_frameworks.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
 examples/hello_world: examples/hello_world.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ examples/hello_world.o $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ examples/hello_world.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
 examples/proxy_demo: examples/proxy_demo.o src/proxy.o
 	$(CC) $(CFLAGS) -o $@ examples/proxy_demo.o src/proxy.o $(LDFLAGS)
 
 examples/config_demo: examples/config_demo.o $(LIB)
-	$(CC) $(CFLAGS) -o $@ examples/config_demo.o $(LIB) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ examples/config_demo.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
 proxy: examples/proxy_demo
 
@@ -60,6 +65,7 @@ test: all
 	./examples/config_demo --selftest
 	./examples/proxy_demo
 	$(PYTHON) tests/test_cli.py ./$(BIN)
+	$(PYTHON) tests/test_tls.py ./$(BIN)
 
 check: test
 

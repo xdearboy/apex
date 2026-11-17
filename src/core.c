@@ -2,6 +2,7 @@
 
 #include <limits.h>
 #include <netdb.h>
+#include <openssl/err.h>
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
@@ -21,6 +22,7 @@ typedef struct {
     int wake_fd;
     int highest_fd;
     size_t connection_count;
+    bool listener_tls;
     conn_t *connections;
     apex_app_t *app;
     run_control_t *control;
@@ -33,12 +35,19 @@ typedef struct {
 typedef struct {
     char host[APEX_CONFIG_HOST_MAX];
     uint16_t port;
+    bool tls;
+    char certificate[APEX_CONFIG_PATH_MAX];
+    char private_key[APEX_CONFIG_PATH_MAX];
     struct sockaddr_storage address;
     socklen_t address_length;
 } listen_endpoint_t;
 
 static int close_fd(int *fd);
 static bool configure_client(int fd);
+static void register_connection(worker_arg_t *worker, int fd);
+static bool tls_handshake_step(worker_arg_t *worker, conn_t *connection);
+static void process_read_event(worker_arg_t *worker, conn_t *connection);
+static inline void flush_write(worker_arg_t *worker, conn_t *connection);
 
 static int close_fd(int *fd) {
     if (*fd < 0) {
@@ -86,6 +95,16 @@ static int drain_notification(int fd) {
 }
 
 static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
+    if (connection->ssl != NULL) {
+        /* Best-effort close_notify: sends FIN-path bytes while the socket is
+         * still open so peers observe an orderly TLS close, not a RST. */
+        SSL_shutdown(connection->ssl);
+        SSL_free(connection->ssl);
+        connection->ssl = NULL;
+        connection->tls_phase = APEX_TLS_HANDSHAKE;
+        connection->tls_want_write = 0;
+    }
+
     free(connection->aux_buffer);
     connection->aux_buffer = NULL;
     connection->aux_length = 0;
@@ -105,6 +124,185 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
         connection->write_offset = 0;
         connection->close_after_write = 0;
         connection->epollout_active = 0;
+        connection->transport = APEX_TRANSPORT_PLAIN;
+    }
+}
+
+/* Transport write: bytes written (>0), -1 retry with errno EAGAIN/EINTR,
+ * -2 fatal (caller closes). Plain sockets keep send(2) semantics; TLS wraps
+ * SSL_write with WANT_* mapped onto the same retry contract. */
+static int transport_write(conn_t *connection, const void *data, size_t length) {
+    if (length > (size_t)INT_MAX) {
+        length = (size_t)INT_MAX;
+    }
+    if (connection->transport == APEX_TRANSPORT_PLAIN) {
+        ssize_t written = send(connection->fd, data, length, MSG_NOSIGNAL);
+        if (written > 0) {
+            return (int)written;
+        }
+        if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return -1;
+        }
+        return -2;
+    }
+    ERR_clear_error();
+    int written = SSL_write(connection->ssl, data, (int)length);
+    if (written > 0) {
+        return written;
+    }
+    int ssl_error = SSL_get_error(connection->ssl, written);
+    if (ssl_error == SSL_ERROR_WANT_WRITE || ssl_error == SSL_ERROR_WANT_READ) {
+        errno = EAGAIN;
+        return -1;
+    }
+    if (ssl_error == SSL_ERROR_SYSCALL && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+        return -1;
+    }
+    if (errno == 0) {
+        errno = EIO;
+    }
+    return -2;
+}
+
+/* Transport read: bytes received (>0), 0 clean EOF, -1 retry
+ * (errno EAGAIN/EINTR; WANT_WRITE also arms tls_want_write), -2 fatal. */
+static ssize_t transport_read(conn_t *connection) {
+    size_t space = sizeof(connection->read_buffer) - connection->read_length;
+    if (space == 0) {
+        return -1;
+    }
+    if (connection->transport == APEX_TRANSPORT_PLAIN) {
+        ssize_t received = recv(connection->fd, connection->read_buffer + connection->read_length, space, 0);
+        if (received >= 0) {
+            return received;
+        }
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1;
+        }
+        return -2;
+    }
+    ERR_clear_error();
+    int received = SSL_read(connection->ssl, connection->read_buffer + connection->read_length, (int)space);
+    if (received > 0) {
+        return received;
+    }
+    int ssl_error = SSL_get_error(connection->ssl, received);
+    switch (ssl_error) {
+    case SSL_ERROR_ZERO_RETURN:
+        return 0;
+    case SSL_ERROR_WANT_READ:
+        errno = EAGAIN;
+        return -1;
+    case SSL_ERROR_WANT_WRITE:
+        connection->tls_want_write = 1;
+        errno = EAGAIN;
+        return -1;
+    case SSL_ERROR_SYSCALL:
+        if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            return -1;
+        }
+        if (errno == 0) {
+            errno = ECONNRESET;
+        }
+        return -2;
+    default:
+        errno = EIO;
+        return -2;
+    }
+}
+
+static void tls_log_error(const char *message) {
+    const unsigned long code = ERR_get_error();
+    if (code != 0) {
+        char reason[128];
+        ERR_error_string_n(code, reason, sizeof(reason));
+        fprintf(stderr, "apex: %s: %s\n", message, reason);
+    } else {
+        fprintf(stderr, "apex: %s\n", message);
+    }
+}
+
+static bool tls_accept_connection(worker_arg_t *worker, conn_t *connection) {
+    SSL *ssl = SSL_new(worker->generation->tls_context);
+    if (ssl == NULL) {
+        return false;
+    }
+    if (SSL_set_fd(ssl, connection->fd) != 1) {
+        SSL_free(ssl);
+        return false;
+    }
+    SSL_set_accept_state(ssl);
+    connection->transport = APEX_TRANSPORT_TLS;
+    connection->ssl = ssl;
+    connection->tls_phase = APEX_TLS_HANDSHAKE;
+    return true;
+}
+
+/* Returns true while the handshake is still progressing or just completed;
+ * false means the connection was closed. */
+static bool tls_handshake_step(worker_arg_t *worker, conn_t *connection) {
+    ERR_clear_error();
+    int result = SSL_do_handshake(connection->ssl);
+    if (result == 1) {
+        connection->tls_phase = APEX_TLS_READY;
+        const unsigned char *protocol = NULL;
+        unsigned int length = 0;
+        SSL_get0_alpn_selected(connection->ssl, &protocol, &length);
+        /* Milestone 2b serves "h2"; until then the ALPN callback never
+         * selects it, so this flag stays clear. */
+        connection->alpn_h2 = (protocol != NULL && length == 2u && memcmp(protocol, "h2", 2u) == 0);
+        return true;
+    }
+    int ssl_error = SSL_get_error(connection->ssl, result);
+    if (ssl_error == SSL_ERROR_WANT_READ) {
+        return true;
+    }
+    if (ssl_error == SSL_ERROR_WANT_WRITE) {
+        connection->tls_want_write = 1;
+        if (!connection->epollout_active) {
+            struct epoll_event event_config;
+            event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT | EPOLLET;
+            event_config.data.fd = connection->fd;
+            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+                perror("apex: epoll_ctl handshake output");
+                close_conn(worker, connection);
+                return false;
+            }
+        }
+        return true;
+    }
+    tls_log_error("tls handshake failed");
+    close_conn(worker, connection);
+    return false;
+}
+
+static void register_connection(worker_arg_t *worker, int fd) {
+    if (fd >= MAX_FDS) {
+        if (close_fd(&fd) != 0) {
+            atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+        }
+        return;
+    }
+    conn_t *connection = &worker->connections[fd];
+    memset(connection, 0, sizeof(*connection));
+    connection->fd = fd;
+    connection->active = 1;
+    worker->connection_count++;
+    if (fd > worker->highest_fd) {
+        worker->highest_fd = fd;
+    }
+    if (worker->listener_tls && (worker->generation->tls_context == NULL ||
+                                 !tls_accept_connection(worker, connection))) {
+        tls_log_error("tls accept setup failed");
+        close_conn(worker, connection);
+        return;
+    }
+    struct epoll_event client_event;
+    client_event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+    client_event.data.fd = fd;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, fd, &client_event) != 0) {
+        perror("apex: epoll_ctl add connection");
+        close_conn(worker, connection);
     }
 }
 
@@ -138,12 +336,12 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
 
 static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
     while (connection->fd >= 0) {
-        ssize_t bytes_sent = 0;
+        int bytes_sent = 0;
 
         if (connection->write_length > connection->write_offset) {
             size_t bytes_to_send = connection->write_length - connection->write_offset;
-            bytes_sent = send(connection->fd, connection->write_buffer + connection->write_offset, bytes_to_send,
-                              MSG_NOSIGNAL);
+            bytes_sent = transport_write(connection, connection->write_buffer + connection->write_offset,
+                                         bytes_to_send);
             if (bytes_sent > 0) {
                 connection->write_offset += (uint32_t)bytes_sent;
                 if (connection->write_offset == connection->write_length) {
@@ -153,8 +351,7 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
             }
         } else if (connection->aux_length > connection->aux_offset) {
             size_t bytes_to_send = connection->aux_length - connection->aux_offset;
-            bytes_sent = send(connection->fd, connection->aux_buffer + connection->aux_offset, bytes_to_send,
-                              MSG_NOSIGNAL);
+            bytes_sent = transport_write(connection, connection->aux_buffer + connection->aux_offset, bytes_to_send);
             if (bytes_sent > 0) {
                 connection->aux_offset += (size_t)bytes_sent;
                 if (connection->aux_offset == connection->aux_length) {
@@ -216,6 +413,114 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
     }
 }
 
+/* Reads available transport bytes, runs the pipelined h1 parser over them
+ * and flushes any generated output. The EPOLLIN and EPOLLOUT handlers both
+ * funnel here so a TLS read that wants a write resumes without a peer kick. */
+static void process_read_event(worker_arg_t *worker, conn_t *connection) {
+    while (connection->fd >= 0) {
+        ssize_t bytes_received = transport_read(connection);
+        if (bytes_received > 0) {
+            connection->read_length += (uint32_t)bytes_received;
+            if (memmem(connection->read_buffer, connection->read_length, "\r\n\r\n", 4) != NULL) {
+                break;
+            }
+        } else if (bytes_received == 0) {
+            close_conn(worker, connection);
+            return;
+        } else if (errno == EINTR) {
+            continue;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        } else {
+            close_conn(worker, connection);
+            return;
+        }
+
+        if (connection->read_length == sizeof(connection->read_buffer)) {
+            break;
+        }
+    }
+
+    if (connection->fd < 0) {
+        return;
+    }
+
+    char *buffer_cursor = connection->read_buffer;
+    size_t remaining_bytes = connection->read_length;
+
+    while (remaining_bytes >= 4) {
+        char *crlf_delimiter = (char *)memmem(buffer_cursor, remaining_bytes, "\r\n\r\n", 4);
+        if (!crlf_delimiter) {
+            break;
+        }
+
+        size_t header_length = (size_t)((crlf_delimiter + 4) - buffer_cursor);
+        size_t content_length = 0;
+
+        if (buffer_cursor[0] == 'P' && buffer_cursor[1] == 'O' && buffer_cursor[2] == 'S' &&
+            buffer_cursor[3] == 'T') {
+            char *content_length_header =
+                (char *)memmem(buffer_cursor, header_length, "Content-Length:", 15);
+            if (!content_length_header) {
+                content_length_header = (char *)memmem(buffer_cursor, header_length, "content-length:", 15);
+            }
+            if (content_length_header) {
+                content_length = strtoul(content_length_header + 15, NULL, 10);
+            }
+        }
+
+        if (content_length > sizeof(connection->read_buffer) - header_length) {
+            close_conn(worker, connection);
+            return;
+        }
+        if (remaining_bytes - header_length < content_length) {
+            break;
+        }
+
+        if (memmem(buffer_cursor, header_length, "close", 5)) {
+            connection->close_after_write = 1;
+        }
+
+        apex_res_t response = {.conn = connection};
+        const apex_runtime_t *runtime = worker->generation != NULL ? worker->generation->runtime : NULL;
+        apex_dispatch_runtime(worker->app, runtime, buffer_cursor, header_length,
+                              buffer_cursor + header_length, content_length, &response);
+
+        size_t total_request_length = header_length + content_length;
+        buffer_cursor += total_request_length;
+        remaining_bytes -= total_request_length;
+        if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING) {
+            connection->close_after_write = 1;
+            remaining_bytes = 0;
+            break;
+        }
+    }
+
+    if (connection->fd < 0) {
+        return;
+    }
+
+    if (remaining_bytes > 0 && buffer_cursor != connection->read_buffer) {
+        memmove(connection->read_buffer, buffer_cursor, remaining_bytes);
+    }
+    connection->read_length = (uint32_t)remaining_bytes;
+
+    /* A TLS read may need a write first (renegotiation, key update): the
+     * socket must then also watch EPOLLOUT or the connection stalls. */
+    if (connection->tls_want_write && !connection->epollout_active) {
+        struct epoll_event event_config;
+        event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT | EPOLLET;
+        event_config.data.fd = connection->fd;
+        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+            perror("apex: epoll_ctl read output interest");
+            close_conn(worker, connection);
+            return;
+        }
+    }
+
+    flush_write(worker, connection);
+}
+
 static void adopt_generation(worker_arg_t *worker) {
     apex_generation_t *generation =
         atomic_exchange_explicit(&worker->pending_generation, NULL, memory_order_acq_rel);
@@ -240,19 +545,8 @@ static void begin_drain(worker_arg_t *worker) {
             break;
         }
         if (queued_fd < MAX_FDS && configure_client(queued_fd)) {
-            conn_t *queued_connection = &worker->connections[queued_fd];
-            memset(queued_connection, 0, sizeof(*queued_connection));
-            queued_connection->fd = queued_fd;
-            queued_connection->active = 1;
-            worker->connection_count++;
-            if (queued_fd > worker->highest_fd) {
-                worker->highest_fd = queued_fd;
-            }
-            struct epoll_event queued_event = {.events = EPOLLIN | EPOLLRDHUP | EPOLLET, .data.fd = queued_fd};
-            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, queued_fd, &queued_event) == 0) {
-                continue;
-            }
-            perror("apex: epoll_ctl add draining connection");
+            register_connection(worker, queued_fd);
+            continue;
         }
         if (close_fd(&queued_fd) != 0) {
             atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
@@ -375,22 +669,7 @@ static void *worker_main(void *arg) {
                         continue;
                     }
 
-                    conn_t *client_connection = &connections[client_socket_fd];
-                    memset(client_connection, 0, sizeof(*client_connection));
-                    client_connection->fd = client_socket_fd;
-                    client_connection->active = 1;
-                    worker->connection_count++;
-                    if (client_socket_fd > worker->highest_fd) {
-                        worker->highest_fd = client_socket_fd;
-                    }
-
-                    struct epoll_event client_event;
-                    client_event.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-                    client_event.data.fd = client_socket_fd;
-                    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_socket_fd, &client_event) != 0) {
-                        perror("apex: epoll_ctl add connection");
-                        close_conn(worker, client_connection);
-                    }
+                    register_connection(worker, client_socket_fd);
                 }
                 continue;
             }
@@ -403,103 +682,43 @@ static void *worker_main(void *arg) {
                 continue;
             }
 
-            if (active_event_flags & (EPOLLRDHUP | EPOLLERR | EPOLLHUP)) {
+            if (active_event_flags & (EPOLLERR | EPOLLHUP)) {
+                close_conn(worker, connection);
+                continue;
+            }
+            /* TLS peers signal orderly close via close_notify, which surfaces
+             * as readable bytes; a bare EPOLLRDHUP must not pre-empt them. */
+            if ((active_event_flags & EPOLLRDHUP) && connection->transport == APEX_TRANSPORT_PLAIN) {
                 close_conn(worker, connection);
                 continue;
             }
 
             if ((active_event_flags & EPOLLIN) && !draining) {
-                while (1) {
-                    ssize_t bytes_received = recv(connection->fd, connection->read_buffer + connection->read_length,
-                                                  sizeof(connection->read_buffer) - connection->read_length, 0);
-                    if (bytes_received > 0) {
-                        connection->read_length += (uint32_t)bytes_received;
-                        if (memmem(connection->read_buffer, connection->read_length, "\r\n\r\n", 4)) {
-                            break;
-                        }
-                    } else if (bytes_received == 0) {
-                        close_conn(worker, connection);
-                        goto next_event;
-                    } else {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-                        close_conn(worker, connection);
-                        goto next_event;
+                if (connection->transport == APEX_TRANSPORT_TLS && connection->tls_phase == APEX_TLS_HANDSHAKE) {
+                    if (!tls_handshake_step(worker, connection)) {
+                        continue;
                     }
-
-                    if (connection->read_length == sizeof(connection->read_buffer)) {
-                        break;
+                    if (connection->tls_phase != APEX_TLS_READY) {
+                        continue;
                     }
                 }
-
-                char *buffer_cursor = connection->read_buffer;
-                size_t remaining_bytes = connection->read_length;
-
-                while (remaining_bytes >= 4) {
-                    char *crlf_delimiter = (char *)memmem(buffer_cursor, remaining_bytes, "\r\n\r\n", 4);
-                    if (!crlf_delimiter) {
-                        break;
-                    }
-
-                    size_t header_length = (size_t)((crlf_delimiter + 4) - buffer_cursor);
-                    size_t content_length = 0;
-
-                    if (buffer_cursor[0] == 'P' && buffer_cursor[1] == 'O' && buffer_cursor[2] == 'S' &&
-                        buffer_cursor[3] == 'T') {
-                        char *content_length_header =
-                            (char *)memmem(buffer_cursor, header_length, "Content-Length:", 15);
-                        if (!content_length_header) {
-                            content_length_header = (char *)memmem(buffer_cursor, header_length, "content-length:", 15);
-                        }
-                        if (content_length_header) {
-                            content_length = strtoul(content_length_header + 15, NULL, 10);
-                        }
-                    }
-
-                    if (content_length > sizeof(connection->read_buffer) - header_length) {
-                        close_conn(worker, connection);
-                        goto next_event;
-                    }
-                    if (remaining_bytes - header_length < content_length) {
-                        break;
-                    }
-
-                    if (memmem(buffer_cursor, header_length, "close", 5)) {
-                        connection->close_after_write = 1;
-                    }
-
-                    apex_res_t response = {.conn = connection};
-                    const apex_runtime_t *runtime = worker->generation != NULL ? worker->generation->runtime : NULL;
-                    apex_dispatch_runtime(worker->app, runtime, buffer_cursor, header_length,
-                                          buffer_cursor + header_length, content_length, &response);
-
-                    size_t total_request_length = header_length + content_length;
-                    buffer_cursor += total_request_length;
-                    remaining_bytes -= total_request_length;
-                    if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING) {
-                        connection->close_after_write = 1;
-                        remaining_bytes = 0;
-                        break;
-                    }
-                }
-
-                if (remaining_bytes > 0 && buffer_cursor != connection->read_buffer) {
-                    memmove(connection->read_buffer, buffer_cursor, remaining_bytes);
-                }
-                connection->read_length = (uint32_t)remaining_bytes;
-
-                flush_write(worker, connection);
+                process_read_event(worker, connection);
             }
 
             if ((active_event_flags & EPOLLOUT) && connection->fd >= 0) {
                 flush_write(worker, connection);
+                if (connection->fd >= 0 && connection->tls_want_write) {
+                    connection->tls_want_write = 0;
+                    bool ready = connection->tls_phase == APEX_TLS_READY;
+                    if (!ready && !tls_handshake_step(worker, connection)) {
+                        continue;
+                    }
+                    if (connection->fd >= 0) {
+                        process_read_event(worker, connection);
+                    }
+                }
             }
 
-        next_event:;
         }
     }
 
@@ -535,8 +754,9 @@ static int config_listener(const apex_config_t *config, listen_endpoint_t *endpo
     const apex_server_config_t *first = &config->servers[0];
     for (size_t index = 0; index < config->server_count; index++) {
         const apex_server_config_t *server = &config->servers[index];
-        if (server->listen_tls || server->tls.enabled) {
-            return listener_error(config, server->line, error, "the standalone core does not support TLS listeners");
+        if (server->listen_tls != first->listen_tls) {
+            return listener_error(config, server->line, error,
+                                  "cannot mix tls and plaintext servers on one listen endpoint");
         }
         if (server->listen_port == 0) {
             return listener_error(config, server->line, error, "the standalone core requires a nonzero listen port");
@@ -548,6 +768,11 @@ static int config_listener(const apex_config_t *config, listen_endpoint_t *endpo
     }
     snprintf(endpoint->host, sizeof(endpoint->host), "%s", first->listen_host);
     endpoint->port = first->listen_port;
+    endpoint->tls = first->listen_tls;
+    if (first->listen_tls) {
+        snprintf(endpoint->certificate, sizeof(endpoint->certificate), "%s", first->tls.certificate);
+        snprintf(endpoint->private_key, sizeof(endpoint->private_key), "%s", first->tls.private_key);
+    }
     return 0;
 }
 
@@ -646,6 +871,7 @@ static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoin
      * connection page merely to initialize a file-descriptor sentinel. */
     worker->generation = worker->app->generation;
     apex_generation_retain(worker->generation);
+    worker->listener_tls = endpoint->tls;
     return 0;
 }
 
@@ -673,7 +899,9 @@ static int reload_config(apex_app_t *app, const char *path, const listen_endpoin
         apex_config_free(config);
         return 0;
     }
-    if (candidate.port != listener->port || strcmp(candidate.host, listener->host) != 0) {
+    if (candidate.port != listener->port || strcmp(candidate.host, listener->host) != 0 || candidate.tls != listener->tls ||
+        (candidate.tls && (strcmp(candidate.certificate, listener->certificate) != 0 ||
+                           strcmp(candidate.private_key, listener->private_key) != 0))) {
         listener_error(config, config->servers[0].line, &error, "changing the listening endpoint requires a restart");
         report_config_error("reload rejected; keeping previous configuration", &error);
         apex_config_free(config);
