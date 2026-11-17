@@ -13,7 +13,7 @@ struct context_s {
     void *user_data;
     bool async_parked;
 
-    const middleware_fn_t *middlewares;
+    middleware_fn_t *middlewares;
     size_t num_middlewares;
     size_t mw_index;
     handler_fn_t handler;
