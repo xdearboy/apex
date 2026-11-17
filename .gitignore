@@ -19,3 +19,4 @@ tests/test_http
 *.log
 /scratch/
 .system_generated/
+OPENCODE_GUIDE.md
