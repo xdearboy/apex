@@ -304,12 +304,16 @@ static void router_error_details(int status, const char *default_reason,
     }
 }
 
-void router_send_error(conn_t *connection, const apex_server_config_t *server,
-                       const char *request, size_t request_length,
-                       int status, const char *reason, const char *message) {
+void router_send_error_ex(conn_t *connection, const apex_server_config_t *server,
+                          const char *request, size_t request_length,
+                          int status, const char *reason, const char *message,
+                          const char *extra_headers, size_t extra_headers_len) {
     if (connection == NULL || connection->fd < 0) {
         return;
     }
+
+    const char *extra = (extra_headers != NULL && extra_headers_len > 0) ? extra_headers : "";
+    int extra_len = (extra_headers != NULL && extra_headers_len > 0) ? (int)extra_headers_len : 0;
 
     /* 1. Custom error_page if configured */
     if (server != NULL && server->error_pages != NULL) {
@@ -328,16 +332,18 @@ void router_send_error(conn_t *connection, const apex_server_config_t *server,
                             close(file_fd);
                             if (n == (ssize_t)file_size) {
                                 const char *content_type = router_determine_content_type(path);
-                                char header[512];
+                                char header[1024];
                                 int written = snprintf(header, sizeof(header),
                                                        "HTTP/1.1 %d %s\r\n"
                                                        "Server: apex\r\n"
                                                        "Content-Type: %s\r\n"
                                                        "Content-Length: %zu\r\n"
                                                        "Connection: %s\r\n"
+                                                       "%.*s"
                                                        "\r\n",
                                                        status, reason, content_type, file_size,
-                                                       connection->close_after_write ? "close" : "keep-alive");
+                                                       connection->close_after_write ? "close" : "keep-alive",
+                                                       extra_len, extra);
                                 if (written > 0 && (size_t)written < sizeof(header)) {
                                     apex_conn_write(connection, header, (size_t)written);
                                     apex_conn_write(connection, file_buf, file_size);
@@ -380,16 +386,18 @@ void router_send_error(conn_t *connection, const apex_server_config_t *server,
                                 "{\"error\":%d,\"status\":\"%s\",\"message\":\"%s\"}\n",
                                 status, title, desc);
         if (body_len > 0) {
-            char header[512];
+            char header[1024];
             int written = snprintf(header, sizeof(header),
                                    "HTTP/1.1 %d %s\r\n"
                                    "Server: apex\r\n"
                                    "Content-Type: application/json\r\n"
                                    "Content-Length: %d\r\n"
                                    "Connection: %s\r\n"
+                                   "%.*s"
                                    "\r\n",
                                    status, reason, body_len,
-                                   connection->close_after_write ? "close" : "keep-alive");
+                                   connection->close_after_write ? "close" : "keep-alive",
+                                   extra_len, extra);
             if (written > 0 && (size_t)written < sizeof(header)) {
                 apex_conn_write(connection, header, (size_t)written);
                 apex_conn_write(connection, json_body, (size_t)body_len);
@@ -404,16 +412,18 @@ void router_send_error(conn_t *connection, const apex_server_config_t *server,
                                 status, status, title, desc);
     if (body_written <= 0 || (size_t)body_written >= sizeof(html_body)) {
         size_t message_length = strlen(message);
-        char header[256];
+        char header[1024];
         int written = snprintf(header, sizeof(header),
                                "HTTP/1.1 %d %s\r\n"
                                "Server: apex\r\n"
                                "Content-Type: text/plain\r\n"
                                "Content-Length: %zu\r\n"
                                "Connection: %s\r\n"
+                               "%.*s"
                                "\r\n",
                                status, reason, message_length,
-                               connection->close_after_write ? "close" : "keep-alive");
+                               connection->close_after_write ? "close" : "keep-alive",
+                               extra_len, extra);
         if (written > 0 && (size_t)written < sizeof(header)) {
             apex_conn_write(connection, header, (size_t)written);
             apex_conn_write(connection, message, message_length);
@@ -421,22 +431,30 @@ void router_send_error(conn_t *connection, const apex_server_config_t *server,
         return;
     }
 
-    char header[512];
+    char header[1024];
     int written = snprintf(header, sizeof(header),
                            "HTTP/1.1 %d %s\r\n"
                            "Server: apex\r\n"
                            "Content-Type: text/html; charset=utf-8\r\n"
                            "Content-Length: %d\r\n"
                            "Connection: %s\r\n"
+                           "%.*s"
                            "\r\n",
                            status, reason, body_written,
-                           connection->close_after_write ? "close" : "keep-alive");
+                           connection->close_after_write ? "close" : "keep-alive",
+                           extra_len, extra);
     if (written < 0 || (size_t)written >= sizeof(header)) {
         connection->close_after_write = 1;
         return;
     }
     apex_conn_write(connection, header, (size_t)written);
     apex_conn_write(connection, html_body, (size_t)body_written);
+}
+
+void router_send_error(conn_t *connection, const apex_server_config_t *server,
+                       const char *request, size_t request_length,
+                       int status, const char *reason, const char *message) {
+    router_send_error_ex(connection, server, request, request_length, status, reason, message, NULL, 0);
 }
 
 static void router_write_proxy_response(conn_t *connection, const apex_server_config_t *server,
@@ -988,7 +1006,11 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         /* Phase 1: PRE_ROUTING */
         apex_action_t action = apex_pipeline_run_phase(&ctx, APEX_PHASE_PRE_ROUTING);
         if (action == APEX_ACTION_DENY) {
-            router_send_error(res->conn, NULL, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+            int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
+            router_send_error_ex(res->conn, NULL, req_buf, header_len,
+                                 deny_status, "Forbidden", "Forbidden\n",
+                                 ctx.extra_headers, ctx.extra_headers_len);
+            apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
             return;
         }
         if (action == APEX_ACTION_DONE) {
@@ -1004,7 +1026,11 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             /* Phase 3: HEADER_FILTER */
             action = apex_pipeline_run_phase(&ctx, APEX_PHASE_HEADER_FILTER);
             if (action == APEX_ACTION_DENY) {
-                router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+                int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
+                router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                     deny_status, "Forbidden", "Forbidden\n",
+                                     ctx.extra_headers, ctx.extra_headers_len);
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                 return;
             }
             if (action == APEX_ACTION_DONE) {
@@ -1014,7 +1040,11 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             /* Phase 4: ACCESS_CONTROL */
             action = apex_pipeline_run_phase(&ctx, APEX_PHASE_ACCESS_CONTROL);
             if (action == APEX_ACTION_DENY) {
-                router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Access Denied by Policy\n");
+                int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
+                router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                     deny_status, "Forbidden", "Access Denied by Policy\n",
+                                     ctx.extra_headers, ctx.extra_headers_len);
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                 return;
             }
             if (action == APEX_ACTION_DONE) {

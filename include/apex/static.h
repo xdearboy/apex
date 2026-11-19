@@ -34,6 +34,8 @@ void apex_static_serve(const apex_server_config_t *server,
                          apex_res_t *res,
                          const char *extra_headers, size_t extra_headers_len);
 
+void apex_static_cache_flush(void);
+
 #ifdef __cplusplus
 }
 #endif

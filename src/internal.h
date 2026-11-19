@@ -62,6 +62,7 @@ typedef struct conn {
     int sendfile_fd;
     off_t sendfile_offset;
     size_t sendfile_remain;
+    uint8_t corked;
 } conn_t;
 
 void apex_conn_write(conn_t *connection, const void *data, size_t length);
@@ -69,6 +70,10 @@ void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t le
 void router_send_error(conn_t *connection, const apex_server_config_t *server,
                        const char *request, size_t request_length,
                        int status, const char *reason, const char *message);
+void router_send_error_ex(conn_t *connection, const apex_server_config_t *server,
+                          const char *request, size_t request_length,
+                          int status, const char *reason, const char *message,
+                          const char *extra_headers, size_t extra_headers_len);
 
 struct apex_res {
     conn_t *conn;

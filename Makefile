@@ -27,7 +27,9 @@ LDLIBS = $(TLS_LIBS) $(H2_LIBS) -ldl
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo examples/mod_security_headers.so
 
-all: $(LIB) $(BIN) $(EXAMPLES)
+MODULES = modules/mod_coraza/mod_coraza.so
+
+all: $(LIB) $(BIN) $(EXAMPLES) $(MODULES)
 
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
@@ -64,6 +66,12 @@ examples/config_demo: examples/config_demo.o $(LIB)
 examples/mod_security_headers.so: examples/mod_security_headers.c include/apex/module.h
 	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
 
+modules/mod_coraza/libcoraza_bridge.so: modules/mod_coraza/coraza_bridge.go modules/mod_coraza/go.mod
+	cd modules/mod_coraza && go build -buildvcs=false -buildmode=c-shared -o libcoraza_bridge.so coraza_bridge.go
+
+modules/mod_coraza/mod_coraza.so: modules/mod_coraza/mod_coraza.c include/apex/module.h modules/mod_coraza/libcoraza_bridge.so
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ modules/mod_coraza/mod_coraza.c -Lmodules/mod_coraza -lcoraza_bridge -Wl,-rpath,'$$ORIGIN'
+
 proxy: examples/proxy_demo
 
 test: all
@@ -72,6 +80,7 @@ test: all
 	$(PYTHON) tests/test_cli.py ./$(BIN)
 	$(PYTHON) tests/test_tls.py ./$(BIN)
 	$(PYTHON) tests/test_h2.py ./$(BIN)
+	$(PYTHON) tests/test_waf.py ./$(BIN)
 
 check: test
 
@@ -79,6 +88,6 @@ check: test
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) src/main.o $(LIB) $(BIN) examples/*.o examples/*.so $(EXAMPLES) $(BUILD_META_H)
+	rm -f $(OBJS) src/main.o $(LIB) $(BIN) examples/*.o examples/*.so $(EXAMPLES) $(MODULES) modules/mod_coraza/*.so modules/mod_coraza/*.h $(BUILD_META_H)
 
 .PHONY: all clean proxy test check

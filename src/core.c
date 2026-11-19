@@ -109,6 +109,7 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
         connection->write_offset = 0;
         connection->close_after_write = 0;
         connection->epollout_active = 0;
+        connection->corked = 0;
         connection->transport = APEX_TRANSPORT_PLAIN;
     }
 }
@@ -424,6 +425,13 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
 
 #if defined(__linux__)
     if (connection->fd >= 0 && connection->transport == APEX_TRANSPORT_PLAIN &&
+        connection->sendfile_remain > 0 && !connection->corked) {
+        int cork = 1;
+        setsockopt(connection->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+        connection->corked = 1;
+    }
+
+    if (connection->fd >= 0 && connection->transport == APEX_TRANSPORT_PLAIN &&
         connection->write_length == connection->write_offset &&
         connection->aux_length == connection->aux_offset &&
         connection->sendfile_remain > 0) {
@@ -451,6 +459,14 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
             close_conn(worker, connection);
             return;
         }
+    }
+
+    if (connection->corked && connection->sendfile_remain == 0 &&
+        connection->write_length == connection->write_offset &&
+        connection->aux_length == connection->aux_offset && connection->fd >= 0) {
+        int cork = 0;
+        setsockopt(connection->fd, IPPROTO_TCP, TCP_CORK, &cork, sizeof(cork));
+        connection->corked = 0;
     }
 #endif
 
@@ -491,6 +507,22 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
         }
         connection->epollout_active = 0;
     }
+}
+
+static inline bool request_has_connection_close(const char *headers, size_t len) {
+    const char *conn = memmem(headers, len, "Connection:", 11);
+    if (conn == NULL) {
+        conn = memmem(headers, len, "connection:", 11);
+    }
+    if (conn == NULL) {
+        return false;
+    }
+    size_t offset = (size_t)(conn - headers) + 11;
+    const char *p = headers + offset;
+    size_t rem = len - offset;
+    const char *crlf = memmem(p, rem, "\r\n", 2);
+    size_t line_len = crlf != NULL ? (size_t)(crlf - p) : rem;
+    return memmem(p, line_len, "close", 5) != NULL || memmem(p, line_len, "Close", 5) != NULL;
 }
 
 /* Reads available transport bytes, runs the pipelined h1 parser over them
@@ -575,7 +607,7 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
             break;
         }
 
-        if (memmem(buffer_cursor, header_length, "close", 5)) {
+        if (request_has_connection_close(buffer_cursor, header_length)) {
             connection->close_after_write = 1;
         }
 

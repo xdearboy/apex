@@ -78,6 +78,49 @@ const char *apex_mime_type(const char *path) {
     return "application/octet-stream";
 }
 
+#define APEX_STATIC_CACHE_SLOTS 512
+#define APEX_STATIC_CACHE_MAX_BYTES (64 * 1024) /* 64 KB */
+#define APEX_STATIC_CACHE_TTL 10 /* seconds */
+
+typedef struct {
+    char target_path[APEX_CONFIG_PATH_MAX * 2];
+    time_t expires_at;
+    time_t mtime;
+    size_t size;
+    char etag[64];
+    char last_modified[64];
+    const char *content_type;
+    const char *content_encoding;
+    char *in_memory_data;
+    size_t in_memory_len;
+} apex_static_cache_entry_t;
+
+typedef struct {
+    apex_static_cache_entry_t entries[APEX_STATIC_CACHE_SLOTS];
+} apex_static_cache_t;
+
+static __thread apex_static_cache_t s_thread_cache;
+
+static inline uint32_t static_cache_hash(const char *str, size_t len) {
+    uint32_t hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint8_t)str[i];
+        hash *= 16777619u;
+    }
+    return hash % APEX_STATIC_CACHE_SLOTS;
+}
+
+void apex_static_cache_flush(void) {
+    for (size_t i = 0; i < APEX_STATIC_CACHE_SLOTS; i++) {
+        if (s_thread_cache.entries[i].in_memory_data != NULL) {
+            free(s_thread_cache.entries[i].in_memory_data);
+            s_thread_cache.entries[i].in_memory_data = NULL;
+        }
+        s_thread_cache.entries[i].target_path[0] = '\0';
+        s_thread_cache.entries[i].expires_at = 0;
+    }
+}
+
 void apex_static_format_etag(time_t mtime, off_t size, char *out, size_t out_size) {
     if (out == NULL || out_size == 0) {
         return;
@@ -414,11 +457,62 @@ void apex_static_serve(const apex_server_config_t *server,
         }
     }
 
-    /* Cache Validation: ETag and Last-Modified */
+    /* Cache Validation: ETag and Last-Modified (using thread-local in-memory cache) */
+    time_t now = time(NULL);
+    size_t tpath_len = strlen(target_path);
+    uint32_t slot = static_cache_hash(target_path, tpath_len);
+    apex_static_cache_entry_t *cached = &s_thread_cache.entries[slot];
+
     char etag_str[64] = {0};
     char last_mod_str[64] = {0};
-    apex_static_format_etag(file_stat.st_mtime, file_stat.st_size, etag_str, sizeof(etag_str));
-    apex_static_format_http_date(file_stat.st_mtime, last_mod_str, sizeof(last_mod_str));
+    size_t total_size = 0;
+    char *cached_memory = NULL;
+
+    if (cached->target_path[0] != '\0' && strcmp(cached->target_path, target_path) == 0 &&
+        now < cached->expires_at) {
+        total_size = cached->size;
+        memcpy(etag_str, cached->etag, sizeof(etag_str));
+        memcpy(last_mod_str, cached->last_modified, sizeof(last_mod_str));
+        content_type = cached->content_type;
+        content_encoding = cached->content_encoding;
+        cached_memory = cached->in_memory_data;
+    } else {
+        apex_static_format_etag(file_stat.st_mtime, file_stat.st_size, etag_str, sizeof(etag_str));
+        apex_static_format_http_date(file_stat.st_mtime, last_mod_str, sizeof(last_mod_str));
+        total_size = (size_t)target_stat.st_size;
+
+        if (cached->in_memory_data != NULL) {
+            free(cached->in_memory_data);
+            cached->in_memory_data = NULL;
+        }
+        snprintf(cached->target_path, sizeof(cached->target_path), "%s", target_path);
+        cached->expires_at = now + APEX_STATIC_CACHE_TTL;
+        cached->mtime = file_stat.st_mtime;
+        cached->size = total_size;
+        memcpy(cached->etag, etag_str, sizeof(cached->etag));
+        memcpy(cached->last_modified, last_mod_str, sizeof(cached->last_modified));
+        cached->content_type = content_type;
+        cached->content_encoding = content_encoding;
+        cached->in_memory_len = 0;
+
+        if (total_size > 0 && total_size <= APEX_STATIC_CACHE_MAX_BYTES) {
+            int pre_fd = open(target_path, O_RDONLY | O_CLOEXEC);
+            if (pre_fd >= 0) {
+                char *buf = malloc(total_size);
+                if (buf != NULL) {
+                    ssize_t rd = read(pre_fd, buf, total_size);
+                    if (rd == (ssize_t)total_size) {
+                        cached->in_memory_data = buf;
+                        cached->in_memory_len = total_size;
+                        cached_memory = buf;
+                    } else {
+                        free(buf);
+                    }
+                }
+                close(pre_fd);
+            }
+        }
+    }
 
     if (location->etag && request != NULL && request_len > 0) {
         const char *if_none_match = NULL;
@@ -477,13 +571,6 @@ void apex_static_serve(const apex_server_config_t *server,
         }
     }
 
-    int file_fd = open(target_path, O_RDONLY | O_CLOEXEC);
-    if (file_fd < 0) {
-        router_send_error(connection, server, request, request_len, 403, "Forbidden", "Permission Denied\n");
-        return;
-    }
-
-    size_t total_size = (size_t)target_stat.st_size;
     off_t range_start = 0;
     size_t send_length = total_size;
     bool is_range = false;
@@ -526,7 +613,6 @@ void apex_static_serve(const apex_server_config_t *server,
                     is_range = true;
                 } else {
                     /* 416 Range Not Satisfiable */
-                    close(file_fd);
                     char h416[512];
                     int n416 = snprintf(h416, sizeof(h416),
                                        "HTTP/1.1 416 Range Not Satisfiable\r\n"
@@ -594,10 +680,17 @@ void apex_static_serve(const apex_server_config_t *server,
     if (header_len > 0 && (size_t)header_len < sizeof(header_buffer)) {
         apex_conn_write(connection, header_buffer, (size_t)header_len);
         if (!head_request && send_length > 0) {
-            apex_conn_sendfile(connection, file_fd, range_start, send_length);
+            if (cached_memory != NULL) {
+                apex_conn_write(connection, cached_memory + range_start, send_length);
+                return;
+            }
+            int file_fd = open(target_path, O_RDONLY | O_CLOEXEC);
+            if (file_fd >= 0) {
+                apex_conn_sendfile(connection, file_fd, range_start, send_length);
+                return;
+            }
+            router_send_error(connection, server, request, request_len, 403, "Forbidden", "Permission Denied\n");
             return;
         }
     }
-
-    close(file_fd);
 }
