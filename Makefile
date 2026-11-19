@@ -81,6 +81,11 @@ test: all
 	$(PYTHON) tests/test_tls.py ./$(BIN)
 	$(PYTHON) tests/test_h2.py ./$(BIN)
 	$(PYTHON) tests/test_waf.py ./$(BIN)
+	$(PYTHON) tests/test_redirect.py ./$(BIN)
+	$(PYTHON) tests/test_acl.py ./$(BIN)
+	$(PYTHON) tests/test_proxy_headers.py ./$(BIN)
+	$(PYTHON) tests/test_include_glob.py ./$(BIN)
+	$(PYTHON) tests/test_websocket.py ./$(BIN)
 
 check: test
 

@@ -5,7 +5,9 @@
 #include "apex/config.h"
 #include "apex/module.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <glob.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -827,20 +829,89 @@ static bool tokenize_source(const char *path, token_list_t *output, char **stack
                 return false;
             }
 
-            char include_path[APEX_CONFIG_PATH_MAX];
-            if (!resolve_include_path(canonical, local.items[index + 1u].text, include_path, sizeof(include_path),
-                                      error)) {
-                token_list_free(&local);
-                free(stack[depth]);
-                stack[depth] = NULL;
-                return false;
-            }
+            const char *include_pattern = local.items[index + 1u].text;
+            bool has_glob = (strchr(include_pattern, '*') != NULL || strchr(include_pattern, '?') != NULL);
+            if (has_glob) {
+                char pattern_combined[APEX_CONFIG_PATH_MAX];
+                if (include_pattern[0] == '/') {
+                    if (strlen(include_pattern) >= sizeof(pattern_combined)) {
+                        config_error_set(error, APEX_CONFIG_ERR_IO, canonical, token->line, token->column,
+                                         "include path is too long");
+                        token_list_free(&local);
+                        free(stack[depth]);
+                        stack[depth] = NULL;
+                        return false;
+                    }
+                    snprintf(pattern_combined, sizeof(pattern_combined), "%s", include_pattern);
+                } else {
+                    const char *slash = strrchr(canonical, '/');
+                    size_t directory_length = slash != NULL ? (size_t)(slash - canonical) : 0u;
+                    if (directory_length == 0) {
+                        directory_length = 1u;
+                    }
+                    if (directory_length + 1u + strlen(include_pattern) >= sizeof(pattern_combined)) {
+                        config_error_set(error, APEX_CONFIG_ERR_IO, canonical, token->line, token->column,
+                                         "include path is too long");
+                        token_list_free(&local);
+                        free(stack[depth]);
+                        stack[depth] = NULL;
+                        return false;
+                    }
+                    if (slash != NULL) {
+                        memcpy(pattern_combined, canonical, directory_length);
+                        pattern_combined[directory_length] = '\0';
+                    } else {
+                        pattern_combined[0] = '.';
+                        pattern_combined[1] = '\0';
+                    }
+                    snprintf(pattern_combined + strlen(pattern_combined),
+                             sizeof(pattern_combined) - strlen(pattern_combined), "/%s", include_pattern);
+                }
 
-            if (!tokenize_source(include_path, output, stack, depth + 1u, error)) {
-                token_list_free(&local);
-                free(stack[depth]);
-                stack[depth] = NULL;
-                return false;
+                glob_t globbuf;
+                memset(&globbuf, 0, sizeof(globbuf));
+                int gres = glob(pattern_combined, 0, NULL, &globbuf);
+                if (gres == 0) {
+                    for (size_t m = 0; m < globbuf.gl_pathc; m++) {
+                        char match_canonical[APEX_CONFIG_PATH_MAX];
+                        if (canonical_path(globbuf.gl_pathv[m], match_canonical, sizeof(match_canonical), error)) {
+                            if (!tokenize_source(match_canonical, output, stack, depth + 1u, error)) {
+                                globfree(&globbuf);
+                                token_list_free(&local);
+                                free(stack[depth]);
+                                stack[depth] = NULL;
+                                return false;
+                            }
+                        }
+                    }
+                    globfree(&globbuf);
+                } else if (gres == GLOB_NOMATCH) {
+                    globfree(&globbuf);
+                } else {
+                    globfree(&globbuf);
+                    config_error_set(error, APEX_CONFIG_ERR_IO, canonical, token->line, token->column,
+                                     "failed to glob include pattern '%s'", include_pattern);
+                    token_list_free(&local);
+                    free(stack[depth]);
+                    stack[depth] = NULL;
+                    return false;
+                }
+            } else {
+                char include_path[APEX_CONFIG_PATH_MAX];
+                if (!resolve_include_path(canonical, local.items[index + 1u].text, include_path, sizeof(include_path),
+                                          error)) {
+                    token_list_free(&local);
+                    free(stack[depth]);
+                    stack[depth] = NULL;
+                    return false;
+                }
+
+                if (!tokenize_source(include_path, output, stack, depth + 1u, error)) {
+                    token_list_free(&local);
+                    free(stack[depth]);
+                    stack[depth] = NULL;
+                    return false;
+                }
             }
 
             index += 2u;
@@ -1640,6 +1711,77 @@ static bool location_add_try_file(parser_t *parser, apex_location_config_t *loca
     return true;
 }
 
+static bool config_parse_cidr(const char *text, size_t len, apex_acl_rule_t *rule) {
+    if (text == NULL || len == 0 || rule == NULL) {
+        return false;
+    }
+    if (len == 3 && strncmp(text, "all", 3) == 0) {
+        rule->is_all = true;
+        return true;
+    }
+    char buf[128];
+    if (len >= sizeof(buf)) {
+        return false;
+    }
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    char *slash = strchr(buf, '/');
+    int prefix = -1;
+    if (slash != NULL) {
+        *slash = '\0';
+        char *endptr = NULL;
+        long p = strtol(slash + 1, &endptr, 10);
+        if (*endptr != '\0' || p < 0) {
+            return false;
+        }
+        prefix = (int)p;
+    }
+
+    /* Try IPv4 first */
+    struct in_addr addr4;
+    if (inet_pton(AF_INET, buf, &addr4) == 1) {
+        rule->is_ipv6 = false;
+        if (prefix < 0) {
+            prefix = 32;
+        }
+        if (prefix > 32) {
+            return false;
+        }
+        uint32_t mask_val = (prefix == 0) ? 0 : (uint32_t)(~0ULL << (32 - prefix));
+        rule->mask4.s_addr = htonl(mask_val);
+        rule->addr4.s_addr = addr4.s_addr & rule->mask4.s_addr;
+        return true;
+    }
+
+    /* Try IPv6 */
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET6, buf, &addr6) == 1) {
+        rule->is_ipv6 = true;
+        if (prefix < 0) {
+            prefix = 128;
+        }
+        if (prefix > 128) {
+            return false;
+        }
+        memset(&rule->mask6, 0, sizeof(rule->mask6));
+        int full_bytes = prefix / 8;
+        int rem_bits = prefix % 8;
+        for (int i = 0; i < full_bytes; i++) {
+            rule->mask6.s6_addr[i] = 0xFF;
+        }
+        if (rem_bits > 0 && full_bytes < 16) {
+            rule->mask6.s6_addr[full_bytes] = (uint8_t)(~0U << (8 - rem_bits));
+        }
+        for (int i = 0; i < 16; i++) {
+            rule->addr6.s6_addr[i] = addr6.s6_addr[i] & rule->mask6.s6_addr[i];
+        }
+        return true;
+    }
+
+    return false;
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -1809,11 +1951,65 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                 parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_http_version must be 1.0 or 1.1");
                 return false;
             }
+        } else if (token_is_word(directive, "return")) {
+            const token_t *first = parser_scalar(parser, "a redirect code or URL");
+            if (first == NULL) {
+                return false;
+            }
+            int code = 302;
+            const token_t *url_tok = NULL;
+            if (first->length > 0 && isdigit((unsigned char)first->text[0])) {
+                uint64_t cval = 0;
+                if (!token_to_u64(first, 200, 599, &cval)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, first, "invalid return status code");
+                    return false;
+                }
+                code = (int)cval;
+                if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                    url_tok = parser_scalar(parser, "a redirect URL or text");
+                    if (url_tok == NULL) {
+                        return false;
+                    }
+                }
+            } else {
+                url_tok = first;
+            }
+
+            location->return_code = code;
+            if (url_tok != NULL) {
+                if (url_tok->length >= sizeof(location->return_url)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, url_tok, "return URL is too long");
+                    return false;
+                }
+                memcpy(location->return_url, url_tok->text, url_tok->length);
+                location->return_url[url_tok->length] = '\0';
+            } else {
+                location->return_url[0] = '\0';
+            }
+        } else if (token_is_word(directive, "allow") || token_is_word(directive, "deny")) {
+            bool allow = token_is_word(directive, "allow");
+            const token_t *val = parser_scalar(parser, "a CIDR address or 'all'");
+            if (val == NULL) {
+                return false;
+            }
+            if (location->acl_rule_count >= APEX_CONFIG_MAX_ACL_RULES) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many allow/deny rules (max %u)",
+                             (unsigned)APEX_CONFIG_MAX_ACL_RULES);
+                return false;
+            }
+            apex_acl_rule_t *rule = &location->acl_rules[location->acl_rule_count];
+            memset(rule, 0, sizeof(*rule));
+            rule->allow = allow;
+            if (!config_parse_cidr(val->text, val->length, rule)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid CIDR address '%s'", val->text);
+                return false;
+            }
+            location->acl_rule_count++;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version");
+                                "proxy_http_version, return, allow, deny");
             return false;
         }
 
@@ -1825,8 +2021,8 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     if (!parser_expect_rbrace(parser)) {
         return false;
     }
-    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass or root");
+    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, root, or return");
         return false;
     }
     return true;
@@ -1965,9 +2161,63 @@ static bool parse_server_block(parser_t *parser) {
                     return false;
                 }
             }
+        } else if (token_is_word(directive, "return")) {
+            const token_t *first = parser_scalar(parser, "a redirect code or URL");
+            if (first == NULL) {
+                return false;
+            }
+            int code = 302;
+            const token_t *url_tok = NULL;
+            if (first->length > 0 && isdigit((unsigned char)first->text[0])) {
+                uint64_t cval = 0;
+                if (!token_to_u64(first, 200, 599, &cval)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, first, "invalid return status code");
+                    return false;
+                }
+                code = (int)cval;
+                if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                    url_tok = parser_scalar(parser, "a redirect URL or text");
+                    if (url_tok == NULL) {
+                        return false;
+                    }
+                }
+            } else {
+                url_tok = first;
+            }
+
+            server->return_code = code;
+            if (url_tok != NULL) {
+                if (url_tok->length >= sizeof(server->return_url)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, url_tok, "return URL is too long");
+                    return false;
+                }
+                memcpy(server->return_url, url_tok->text, url_tok->length);
+                server->return_url[url_tok->length] = '\0';
+            } else {
+                server->return_url[0] = '\0';
+            }
+        } else if (token_is_word(directive, "allow") || token_is_word(directive, "deny")) {
+            bool allow = token_is_word(directive, "allow");
+            const token_t *val = parser_scalar(parser, "a CIDR address or 'all'");
+            if (val == NULL) {
+                return false;
+            }
+            if (server->acl_rule_count >= APEX_CONFIG_MAX_ACL_RULES) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many allow/deny rules (max %u)",
+                             (unsigned)APEX_CONFIG_MAX_ACL_RULES);
+                return false;
+            }
+            apex_acl_rule_t *rule = &server->acl_rules[server->acl_rule_count];
+            memset(rule, 0, sizeof(*rule));
+            rule->allow = allow;
+            if (!config_parse_cidr(val->text, val->length, rule)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid CIDR address '%s'", val->text);
+                return false;
+            }
+            server->acl_rule_count++;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page");
+            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny");
             return false;
         }
 
@@ -2509,6 +2759,47 @@ static bool validate_config(parser_t *parser) {
     return true;
 }
 
+static bool parse_events_block(parser_t *parser) {
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *tok = parser_peek(parser);
+        if (tok->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, tok, "unterminated 'events' block");
+            return false;
+        }
+        if (tok->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, tok, "expected an events directive");
+            return false;
+        }
+        parser_advance(parser);
+        if (token_is_word(tok, "worker_connections")) {
+            const token_t *val = parser_scalar(parser, "number of worker connections");
+            if (val == NULL) {
+                return false;
+            }
+            uint64_t conns = 0;
+            if (token_to_u64(val, 1, 1000000, &conns)) {
+                parser->config->http.worker_connections = (size_t)conns;
+            }
+            if (!parser_expect_semicolon(parser)) {
+                return false;
+            }
+        } else {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON &&
+                   parser_peek(parser)->kind != TOKEN_RBRACE &&
+                   parser_peek(parser)->kind != TOKEN_EOF) {
+                parser_advance(parser);
+            }
+            if (!parser_expect_semicolon(parser)) {
+                return false;
+            }
+        }
+    }
+    return parser_expect_rbrace(parser);
+}
+
 static bool parse_tokens(parser_t *parser) {
     while (parser_peek(parser)->kind != TOKEN_EOF) {
         const token_t *item = parser_peek(parser);
@@ -2526,6 +2817,20 @@ static bool parse_tokens(parser_t *parser) {
             if (!parse_modules_block(parser)) {
                 return false;
             }
+        } else if (token_is_word(item, "events")) {
+            if (!parse_events_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(item, "worker_processes") || token_is_word(item, "pid") ||
+                   token_is_word(item, "error_log") || token_is_word(item, "user") ||
+                   token_is_word(item, "worker_rlimit_nofile")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON &&
+                   parser_peek(parser)->kind != TOKEN_EOF) {
+                parser_advance(parser);
+            }
+            if (!parser_expect_semicolon(parser)) {
+                return false;
+            }
         } else if (token_is_word(item, "include")) {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item,
                          "include is only available when parsing a file");
@@ -2536,7 +2841,7 @@ static bool parse_tokens(parser_t *parser) {
             return false;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item, "unknown top-level directive '%s'", item->text);
-            parser_hint(parser, "top-level items are http and modules");
+            parser_hint(parser, "top-level items are http, events, and modules");
             return false;
         }
     }
@@ -3067,6 +3372,12 @@ bool apex_runtime_match(const apex_runtime_t *runtime, const char *host, size_t 
 
     const apex_location_config_t *location = select_location(server, path, path_length);
     if (location == NULL) {
+        if (server->return_code > 0) {
+            memset(route, 0, sizeof(*route));
+            route->server = server;
+            route->location = NULL;
+            return true;
+        }
         return false;
     }
 

@@ -3,6 +3,7 @@
 
 #include "apex/proxy.h"
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -22,9 +23,20 @@ extern "C" {
 #define APEX_CONFIG_MAX_SERVER_NAMES 32u
 #define APEX_CONFIG_MAX_HEADERS 32u
 #define APEX_CONFIG_MAX_MODULE_NAMES 32u
+#define APEX_CONFIG_MAX_ACL_RULES 32u
 #define APEX_CONFIG_MAX_INCLUDE_DEPTH 16u
 #define APEX_CONFIG_MAX_FILE_BYTES (8u * 1024u * 1024u)
 #define APEX_CONFIG_MAX_TOKENS (1024u * 1024u)
+
+typedef struct {
+    bool allow;   /* true for allow, false for deny */
+    bool is_all;  /* true if matches all */
+    bool is_ipv6;
+    struct in_addr addr4;
+    struct in_addr mask4;
+    struct in6_addr addr6;
+    struct in6_addr mask6;
+} apex_acl_rule_t;
 
 typedef enum {
     APEX_CONFIG_OK = 0,
@@ -77,6 +89,12 @@ typedef struct {
     bool sendfile;
     bool etag;
     bool precompressed;
+
+    int return_code;
+    char return_url[APEX_CONFIG_PATH_MAX * 2];
+
+    apex_acl_rule_t acl_rules[APEX_CONFIG_MAX_ACL_RULES];
+    size_t acl_rule_count;
 
     apex_config_header_t *headers;
     size_t header_count;
@@ -157,6 +175,10 @@ typedef struct {
     apex_error_page_config_t *error_pages;
     size_t error_page_count;
     size_t error_page_capacity;
+    int return_code;
+    char return_url[APEX_CONFIG_PATH_MAX * 2];
+    apex_acl_rule_t acl_rules[APEX_CONFIG_MAX_ACL_RULES];
+    size_t acl_rule_count;
     int line;
 } apex_server_config_t;
 

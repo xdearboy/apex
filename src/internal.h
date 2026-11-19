@@ -74,6 +74,7 @@ void router_send_error_ex(conn_t *connection, const apex_server_config_t *server
                           const char *request, size_t request_length,
                           int status, const char *reason, const char *message,
                           const char *extra_headers, size_t extra_headers_len);
+void apex_proxy_ws_tunnel(conn_t *client_conn, int upstream_fd, uint64_t timeout_ms);
 
 struct apex_res {
     conn_t *conn;

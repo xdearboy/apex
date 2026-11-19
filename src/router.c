@@ -1,6 +1,8 @@
 #include "internal.h"
 
+#include <arpa/inet.h>
 #include <ctype.h>
+#include <poll.h>
 #include <strings.h>
 #include <sys/stat.h>
 
@@ -134,10 +136,267 @@ static bool router_header_is_overridden(const char *line, size_t line_length,
     return false;
 }
 
+static bool conn_get_peer_ip(const conn_t *connection, char *ip_buf, size_t ip_buf_len) {
+    if (connection == NULL || connection->fd < 0 || ip_buf == NULL || ip_buf_len == 0) {
+        return false;
+    }
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getpeername(connection->fd, (struct sockaddr *)&ss, &slen) != 0) {
+        return false;
+    }
+    if (ss.ss_family == AF_INET) {
+        struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+        return inet_ntop(AF_INET, &sin->sin_addr, ip_buf, (socklen_t)ip_buf_len) != NULL;
+    } else if (ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            return inet_ntop(AF_INET, &sin6->sin6_addr.s6_addr[12], ip_buf, (socklen_t)ip_buf_len) != NULL;
+        }
+        return inet_ntop(AF_INET6, &sin6->sin6_addr, ip_buf, (socklen_t)ip_buf_len) != NULL;
+    }
+    return false;
+}
+
+static bool acl_rule_matches(const apex_acl_rule_t *rule, const struct sockaddr_storage *ss) {
+    if (rule->is_all) {
+        return true;
+    }
+    if (ss->ss_family == AF_INET && !rule->is_ipv6) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+        return (sin->sin_addr.s_addr & rule->mask4.s_addr) == rule->addr4.s_addr;
+    }
+    if (ss->ss_family == AF_INET6 && rule->is_ipv6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        for (int i = 0; i < 16; i++) {
+            if ((sin6->sin6_addr.s6_addr[i] & rule->mask6.s6_addr[i]) != rule->addr6.s6_addr[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (ss->ss_family == AF_INET6 && !rule->is_ipv6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+            uint32_t ip4 = *(const uint32_t *)&sin6->sin6_addr.s6_addr[12];
+            return (ip4 & rule->mask4.s_addr) == rule->addr4.s_addr;
+        }
+    }
+    return false;
+}
+
+static bool router_check_acl(const apex_acl_rule_t *rules, size_t rule_count, int fd) {
+    if (rules == NULL || rule_count == 0) {
+        return true;
+    }
+    struct sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) {
+        return true;
+    }
+    for (size_t i = 0; i < rule_count; i++) {
+        if (acl_rule_matches(&rules[i], &ss)) {
+            return rules[i].allow;
+        }
+    }
+    return true;
+}
+
+static void router_expand_string(const char *src, char *dst, size_t dst_len,
+                                 const char *host, size_t host_len,
+                                 const char *uri, size_t uri_len,
+                                 const char *remote_addr, size_t remote_addr_len,
+                                 const char *scheme, size_t scheme_len,
+                                 const char *existing_xff, size_t existing_xff_len,
+                                 const char *upgrade, size_t upgrade_len,
+                                 const char *connection, size_t connection_len) {
+    if (dst == NULL || dst_len == 0) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+
+    size_t out_idx = 0;
+    size_t src_len = strlen(src);
+    for (size_t i = 0; i < src_len && out_idx + 1 < dst_len;) {
+        if (src[i] == '$') {
+            const char *var = src + i + 1;
+            bool braced = false;
+            if (*var == '{') {
+                braced = true;
+                var++;
+            }
+            size_t var_len = 0;
+            while (var[var_len] != '\0' && (isalnum((unsigned char)var[var_len]) || var[var_len] == '_')) {
+                var_len++;
+            }
+            size_t skip = 1 + (braced ? 1 : 0) + var_len + (braced && var[var_len] == '}' ? 1 : 0);
+
+            const char *subst = NULL;
+            size_t subst_len = 0;
+            char xff_buf[512];
+
+            if (var_len == 4 && strncmp(var, "host", 4) == 0) {
+                subst = host;
+                subst_len = host_len;
+            } else if (var_len == 9 && strncmp(var, "http_host", 9) == 0) {
+                subst = host;
+                subst_len = host_len;
+            } else if (var_len == 11 && strncmp(var, "request_uri", 11) == 0) {
+                subst = uri;
+                subst_len = uri_len;
+            } else if (var_len == 11 && strncmp(var, "remote_addr", 11) == 0) {
+                subst = remote_addr;
+                subst_len = remote_addr_len;
+            } else if (var_len == 6 && strncmp(var, "scheme", 6) == 0) {
+                subst = scheme;
+                subst_len = scheme_len;
+            } else if (var_len == 12 && strncmp(var, "http_upgrade", 12) == 0) {
+                subst = upgrade;
+                subst_len = upgrade_len;
+            } else if (var_len == 15 && strncmp(var, "http_connection", 15) == 0) {
+                subst = connection;
+                subst_len = connection_len;
+            } else if (var_len == 26 && strncmp(var, "proxy_add_x_forwarded_for", 26) == 0) {
+                if (existing_xff != NULL && existing_xff_len > 0) {
+                    int w = snprintf(xff_buf, sizeof(xff_buf), "%.*s, %.*s",
+                                     (int)existing_xff_len, existing_xff,
+                                     (int)remote_addr_len, remote_addr);
+                    if (w > 0 && (size_t)w < sizeof(xff_buf)) {
+                        subst = xff_buf;
+                        subst_len = (size_t)w;
+                    }
+                } else {
+                    subst = remote_addr;
+                    subst_len = remote_addr_len;
+                }
+            }
+
+            if (subst != NULL) {
+                size_t copy_len = subst_len;
+                if (out_idx + copy_len >= dst_len) {
+                    copy_len = dst_len - 1 - out_idx;
+                }
+                memcpy(dst + out_idx, subst, copy_len);
+                out_idx += copy_len;
+                i += skip;
+                continue;
+            }
+        }
+        dst[out_idx++] = src[i++];
+    }
+    dst[out_idx] = '\0';
+}
+
+static void router_send_redirect(conn_t *connection, int status_code, const char *location_url,
+                                 const char *extra_headers, size_t extra_headers_len) {
+    if (connection == NULL || connection->fd < 0) {
+        return;
+    }
+    const char *reason = "Moved Permanently";
+    switch (status_code) {
+    case 301: reason = "Moved Permanently"; break;
+    case 302: reason = "Found"; break;
+    case 303: reason = "See Other"; break;
+    case 307: reason = "Temporary Redirect"; break;
+    case 308: reason = "Permanent Redirect"; break;
+    case 200: reason = "OK"; break;
+    default:
+        if (status_code >= 300 && status_code < 400) {
+            reason = "Redirect";
+        } else if (status_code >= 400 && status_code < 500) {
+            reason = "Client Error";
+        } else {
+            reason = "Server Response";
+        }
+        break;
+    }
+
+    char header[1024];
+    int written = 0;
+    if (status_code >= 300 && status_code < 400) {
+        written = snprintf(header, sizeof(header),
+                           "HTTP/1.1 %d %s\r\n"
+                           "Location: %s\r\n"
+                           "Content-Length: 0\r\n"
+                           "Connection: %s\r\n",
+                           status_code, reason, location_url ? location_url : "/",
+                           connection->close_after_write ? "close" : "keep-alive");
+    } else {
+        size_t body_len = location_url ? strlen(location_url) : 0;
+        written = snprintf(header, sizeof(header),
+                           "HTTP/1.1 %d %s\r\n"
+                           "Content-Type: text/plain\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Connection: %s\r\n",
+                           status_code, reason, body_len,
+                           connection->close_after_write ? "close" : "keep-alive");
+    }
+
+    if (written > 0 && (size_t)written < sizeof(header)) {
+        apex_conn_write(connection, header, (size_t)written);
+        if (extra_headers != NULL && extra_headers_len > 0) {
+            apex_conn_write(connection, extra_headers, extra_headers_len);
+        }
+        apex_conn_write(connection, "\r\n", 2u);
+        if (status_code < 300 || status_code >= 400) {
+            if (location_url != NULL && location_url[0] != '\0') {
+                apex_conn_write(connection, location_url, strlen(location_url));
+            }
+        }
+    }
+}
+
+static bool router_location_has_header(const apex_location_config_t *location, const char *name) {
+    if (location == NULL) {
+        return false;
+    }
+    for (size_t i = 0; i < location->header_count; i++) {
+        if (strcasecmp(location->headers[i].name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool build_request_headers(const char *request, size_t request_length,
-                                  const apex_location_config_t *location, char **headers, size_t *headers_length) {
+                                  const apex_location_config_t *location,
+                                  conn_t *connection, const char *host,
+                                  const char *target, size_t target_len,
+                                  char **headers, size_t *headers_length) {
     *headers = NULL;
     *headers_length = 0;
+
+    char client_ip[INET6_ADDRSTRLEN];
+    if (!conn_get_peer_ip(connection, client_ip, sizeof(client_ip))) {
+        strcpy(client_ip, "127.0.0.1");
+    }
+    size_t client_ip_len = strlen(client_ip);
+
+    const char *scheme = (connection != NULL && connection->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
+    size_t scheme_len = strlen(scheme);
+
+    const char *host_val = host != NULL ? host : "";
+    size_t host_val_len = strlen(host_val);
+
+    const char *uri_val = target != NULL ? target : "/";
+    size_t uri_val_len = target_len ? target_len : strlen(uri_val);
+
+    const char *existing_xff = NULL;
+    size_t existing_xff_len = 0;
+    router_find_header(request, request_length, "X-Forwarded-For", &existing_xff, &existing_xff_len);
+
+    const char *upgrade_val = NULL;
+    size_t upgrade_val_len = 0;
+    bool has_upgrade = router_find_header(request, request_length, "Upgrade", &upgrade_val, &upgrade_val_len);
+
+    const char *conn_val = NULL;
+    size_t conn_val_len = 0;
+    router_find_header(request, request_length, "Connection", &conn_val, &conn_val_len);
+
+    bool is_ws = has_upgrade && (upgrade_val_len == 9 && strncasecmp(upgrade_val, "websocket", 9) == 0);
 
     router_buffer_t buffer = {0};
     const char *first_end = router_find_crlf(request, request_length);
@@ -153,7 +412,24 @@ static bool build_request_headers(const char *request, size_t request_length,
             if (line_length == 0) {
                 break;
             }
-            if (!router_header_is_overridden(line, line_length, location)) {
+
+            const char *colon = memchr(line, ':', line_length);
+            bool skip_header = false;
+            if (colon != NULL) {
+                size_t name_len = (size_t)(colon - line);
+                while (name_len > 0 && (line[name_len - 1u] == ' ' || line[name_len - 1u] == '\t')) {
+                    name_len--;
+                }
+                /* Skip client-provided X-Forwarded-* and X-Real-IP so we inject authoritative ones */
+                if (router_header_name_equal(line, name_len, "X-Real-IP") ||
+                    router_header_name_equal(line, name_len, "X-Forwarded-For") ||
+                    router_header_name_equal(line, name_len, "X-Forwarded-Proto") ||
+                    router_header_name_equal(line, name_len, "X-Forwarded-Host")) {
+                    skip_header = true;
+                }
+            }
+
+            if (!skip_header && !router_header_is_overridden(line, line_length, location)) {
                 if (!router_buffer_append(&buffer, line, line_length) ||
                     !router_buffer_append_string(&buffer, "\r\n")) {
                     router_buffer_free(&buffer);
@@ -164,14 +440,89 @@ static bool build_request_headers(const char *request, size_t request_length,
         }
     }
 
-    for (size_t index = 0; index < location->header_count; index++) {
-        const apex_config_header_t *header = &location->headers[index];
-        if (!router_buffer_append_string(&buffer, header->name) ||
-            !router_buffer_append_string(&buffer, ": ") ||
-            !router_buffer_append_string(&buffer, header->value) ||
+    /* Standard Proxy Headers (if not overridden in location) */
+    if (!router_location_has_header(location, "X-Real-IP")) {
+        if (!router_buffer_append_string(&buffer, "X-Real-IP: ") ||
+            !router_buffer_append_string(&buffer, client_ip) ||
             !router_buffer_append_string(&buffer, "\r\n")) {
             router_buffer_free(&buffer);
             return false;
+        }
+    }
+
+    if (!router_location_has_header(location, "X-Forwarded-For")) {
+        if (!router_buffer_append_string(&buffer, "X-Forwarded-For: ")) {
+            router_buffer_free(&buffer);
+            return false;
+        }
+        if (existing_xff != NULL && existing_xff_len > 0) {
+            if (!router_buffer_append(&buffer, existing_xff, existing_xff_len) ||
+                !router_buffer_append_string(&buffer, ", ")) {
+                router_buffer_free(&buffer);
+                return false;
+            }
+        }
+        if (!router_buffer_append_string(&buffer, client_ip) ||
+            !router_buffer_append_string(&buffer, "\r\n")) {
+            router_buffer_free(&buffer);
+            return false;
+        }
+    }
+
+    if (!router_location_has_header(location, "X-Forwarded-Proto")) {
+        if (!router_buffer_append_string(&buffer, "X-Forwarded-Proto: ") ||
+            !router_buffer_append_string(&buffer, scheme) ||
+            !router_buffer_append_string(&buffer, "\r\n")) {
+            router_buffer_free(&buffer);
+            return false;
+        }
+    }
+
+    if (host_val[0] != '\0' && !router_location_has_header(location, "X-Forwarded-Host")) {
+        if (!router_buffer_append_string(&buffer, "X-Forwarded-Host: ") ||
+            !router_buffer_append_string(&buffer, host_val) ||
+            !router_buffer_append_string(&buffer, "\r\n")) {
+            router_buffer_free(&buffer);
+            return false;
+        }
+    }
+
+    /* Custom location headers with variable expansion */
+    if (location != NULL) {
+        for (size_t index = 0; index < location->header_count; index++) {
+            const apex_config_header_t *header = &location->headers[index];
+            char expanded_val[1024];
+            router_expand_string(header->value, expanded_val, sizeof(expanded_val),
+                                 host_val, host_val_len,
+                                 uri_val, uri_val_len,
+                                 client_ip, client_ip_len,
+                                 scheme, scheme_len,
+                                 existing_xff, existing_xff_len,
+                                 upgrade_val, upgrade_val_len,
+                                 conn_val, conn_val_len);
+            if (!router_buffer_append_string(&buffer, header->name) ||
+                !router_buffer_append_string(&buffer, ": ") ||
+                !router_buffer_append_string(&buffer, expanded_val) ||
+                !router_buffer_append_string(&buffer, "\r\n")) {
+                router_buffer_free(&buffer);
+                return false;
+            }
+        }
+    }
+
+    /* For WebSocket, ensure Upgrade and Connection headers reach upstream if not already present */
+    if (is_ws) {
+        if (!router_location_has_header(location, "Upgrade")) {
+            if (!router_buffer_append_string(&buffer, "Upgrade: websocket\r\n")) {
+                router_buffer_free(&buffer);
+                return false;
+            }
+        }
+        if (!router_location_has_header(location, "Connection")) {
+            if (!router_buffer_append_string(&buffer, "Connection: Upgrade\r\n")) {
+                router_buffer_free(&buffer);
+                return false;
+            }
         }
     }
 
@@ -497,10 +848,14 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
             while (name_length > 0 && (line[name_length - 1u] == ' ' || line[name_length - 1u] == '\t')) {
                 name_length--;
             }
-            if (router_header_name_equal(line, name_length, "Transfer-Encoding") ||
-                router_header_name_equal(line, name_length, "Connection") ||
-                router_header_name_equal(line, name_length, "Keep-Alive") ||
-                router_header_name_equal(line, name_length, "Proxy-Connection")) {
+            if (status != 101 && (router_header_name_equal(line, name_length, "Transfer-Encoding") ||
+                                  router_header_name_equal(line, name_length, "Connection") ||
+                                  router_header_name_equal(line, name_length, "Keep-Alive") ||
+                                  router_header_name_equal(line, name_length, "Proxy-Connection"))) {
+                skip = true;
+            } else if (status == 101 && (router_header_name_equal(line, name_length, "Transfer-Encoding") ||
+                                         router_header_name_equal(line, name_length, "Keep-Alive") ||
+                                         router_header_name_equal(line, name_length, "Proxy-Connection"))) {
                 skip = true;
             } else if (router_header_name_equal(line, name_length, "Content-Length")) {
                 no_content_length = false;
@@ -528,9 +883,11 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
         apex_conn_write(connection, "Content-Length: 0\r\n", 19u);
     }
 
-    const char *connection_header = connection->close_after_write ? "Connection: close\r\n"
-                                                                  : "Connection: keep-alive\r\n";
-    apex_conn_write(connection, connection_header, strlen(connection_header));
+    if (status != 101) {
+        const char *connection_header = connection->close_after_write ? "Connection: close\r\n"
+                                                                      : "Connection: keep-alive\r\n";
+        apex_conn_write(connection, connection_header, strlen(connection_header));
+    }
     if (extra_headers != NULL && extra_headers_len > 0) {
         apex_conn_write(connection, extra_headers, extra_headers_len);
     }
@@ -539,6 +896,148 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
     if (!head_request && !no_body && response->body != NULL && response->body_len > 0) {
         apex_conn_write(connection, response->body, response->body_len);
     }
+}
+
+void apex_proxy_ws_tunnel(conn_t *client_conn, int upstream_fd, uint64_t timeout_ms) {
+    if (client_conn == NULL || client_conn->fd < 0 || upstream_fd < 0) {
+        if (upstream_fd >= 0) {
+            close(upstream_fd);
+        }
+        return;
+    }
+
+    if (timeout_ms == 0) {
+        timeout_ms = 60000u;
+    }
+
+    int client_fd = client_conn->fd;
+    char buffer[16384];
+    struct pollfd fds[2];
+
+    int flags = fcntl(upstream_fd, F_GETFL, 0);
+    if (flags >= 0) {
+        fcntl(upstream_fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    int poll_timeout = (timeout_ms > INT_MAX) ? INT_MAX : (int)timeout_ms;
+
+    for (;;) {
+        fds[0].fd = client_fd;
+        fds[0].events = POLLIN;
+        fds[0].revents = 0;
+
+        fds[1].fd = upstream_fd;
+        fds[1].events = POLLIN;
+        fds[1].revents = 0;
+
+        bool client_has_pending = false;
+        if (client_conn->transport == APEX_TRANSPORT_TLS && client_conn->ssl != NULL) {
+            if (SSL_pending(client_conn->ssl) > 0) {
+                client_has_pending = true;
+            }
+        }
+
+        int timeout = client_has_pending ? 0 : poll_timeout;
+        int ret = poll(fds, 2, timeout);
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (ret == 0 && !client_has_pending) {
+            break;
+        }
+
+        /* 1. Client -> Upstream */
+        if (client_has_pending || (fds[0].revents & (POLLIN | POLLERR | POLLHUP | POLLRDHUP))) {
+            ssize_t nread = 0;
+            if (client_conn->transport == APEX_TRANSPORT_TLS && client_conn->ssl != NULL) {
+                int r = SSL_read(client_conn->ssl, buffer, sizeof(buffer));
+                if (r > 0) {
+                    nread = r;
+                } else {
+                    int err = SSL_get_error(client_conn->ssl, r);
+                    if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                        nread = -1;
+                        errno = EAGAIN;
+                    } else {
+                        nread = 0;
+                    }
+                }
+            } else {
+                nread = recv(client_fd, buffer, sizeof(buffer), 0);
+            }
+
+            if (nread > 0) {
+                size_t total_sent = 0;
+                while (total_sent < (size_t)nread) {
+                    ssize_t sent = send(upstream_fd, buffer + total_sent, (size_t)nread - total_sent, MSG_NOSIGNAL);
+                    if (sent > 0) {
+                        total_sent += (size_t)sent;
+                    } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        struct pollfd out_fd = { .fd = upstream_fd, .events = POLLOUT, .revents = 0 };
+                        if (poll(&out_fd, 1, 5000) <= 0) {
+                            goto tunnel_done;
+                        }
+                    } else if (sent < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        goto tunnel_done;
+                    }
+                }
+            } else if (nread == 0 || (nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                goto tunnel_done;
+            }
+        }
+
+        /* 2. Upstream -> Client */
+        if (fds[1].revents & (POLLIN | POLLERR | POLLHUP | POLLRDHUP)) {
+            ssize_t nread = recv(upstream_fd, buffer, sizeof(buffer), 0);
+            if (nread > 0) {
+                size_t total_sent = 0;
+                while (total_sent < (size_t)nread) {
+                    ssize_t sent = 0;
+                    if (client_conn->transport == APEX_TRANSPORT_TLS && client_conn->ssl != NULL) {
+                        int w = SSL_write(client_conn->ssl, buffer + total_sent, (int)((size_t)nread - total_sent));
+                        if (w > 0) {
+                            sent = w;
+                        } else {
+                            int err = SSL_get_error(client_conn->ssl, w);
+                            if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                                sent = -1;
+                                errno = EAGAIN;
+                            } else {
+                                goto tunnel_done;
+                            }
+                        }
+                    } else {
+                        sent = send(client_fd, buffer + total_sent, (size_t)nread - total_sent, MSG_NOSIGNAL);
+                    }
+
+                    if (sent > 0) {
+                        total_sent += (size_t)sent;
+                    } else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        struct pollfd out_fd = { .fd = client_fd, .events = POLLOUT, .revents = 0 };
+                        if (poll(&out_fd, 1, 5000) <= 0) {
+                            goto tunnel_done;
+                        }
+                    } else if (sent < 0 && errno == EINTR) {
+                        continue;
+                    } else {
+                        goto tunnel_done;
+                    }
+                }
+            } else if (nread == 0 || (nread < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) {
+                goto tunnel_done;
+            }
+        }
+    }
+
+tunnel_done:
+    close(upstream_fd);
+    client_conn->close_after_write = 1;
+    client_conn->read_length = 0;
 }
 
 static void router_forward_request(apex_config_route_t *route, const char *request, size_t request_length,
@@ -589,7 +1088,8 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
 
     char *headers = NULL;
     size_t headers_length = 0;
-    if (!build_request_headers(request, request_length, route->location, &headers, &headers_length)) {
+    if (!build_request_headers(request, request_length, route->location, connection, host,
+                               target_text, target_length, &headers, &headers_length)) {
         free(target_text);
         router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
         return;
@@ -623,6 +1123,66 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
 
     router_write_proxy_response(connection, server, request, request_length, &proxy_response,
                                 strcasecmp(method_text, "HEAD") == 0, extra_headers, extra_headers_len);
+
+    if (proxy_response.status == 101 && proxy_response.upstream_fd >= 0) {
+        /* Flush written 101 response headers to client socket */
+        while (connection->write_length > connection->write_offset) {
+            int sent = apex_transport_write(connection, connection->write_buffer + connection->write_offset,
+                                            connection->write_length - connection->write_offset);
+            if (sent > 0) {
+                connection->write_offset += (uint32_t)sent;
+                if (connection->write_offset == connection->write_length) {
+                    connection->write_offset = 0;
+                    connection->write_length = 0;
+                }
+            } else if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                struct pollfd pfd = { .fd = connection->fd, .events = POLLOUT, .revents = 0 };
+                poll(&pfd, 1, 5000);
+            } else {
+                break;
+            }
+        }
+
+        /* Forward any leftover bytes from upstream to client */
+        if (proxy_response.leftover_len > 0 && proxy_response.leftover_data != NULL) {
+            size_t sent_leftover = 0;
+            while (sent_leftover < proxy_response.leftover_len) {
+                int sent = apex_transport_write(connection, proxy_response.leftover_data + sent_leftover,
+                                                proxy_response.leftover_len - sent_leftover);
+                if (sent > 0) {
+                    sent_leftover += (size_t)sent;
+                } else if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    struct pollfd pfd = { .fd = connection->fd, .events = POLLOUT, .revents = 0 };
+                    poll(&pfd, 1, 5000);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        /* Forward any unparsed client pipelined data to upstream */
+        const char *consumed_end = request + request_length + body_length;
+        const char *buf_end = connection->read_buffer + connection->read_length;
+        if (consumed_end < buf_end) {
+            size_t unparsed = (size_t)(buf_end - consumed_end);
+            size_t sent_client = 0;
+            while (sent_client < unparsed) {
+                ssize_t s = send(proxy_response.upstream_fd, consumed_end + sent_client, unparsed - sent_client, MSG_NOSIGNAL);
+                if (s > 0) {
+                    sent_client += (size_t)s;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        /* Run full-duplex tunnel until closure or idle timeout */
+        uint64_t timeout_ms = (route->location != NULL && route->location->has_read_timeout)
+                              ? route->location->read_timeout_ms : 60000u;
+        apex_proxy_ws_tunnel(connection, proxy_response.upstream_fd, timeout_ms);
+        proxy_response.upstream_fd = -1;
+    }
+
     apex_proxy_response_free(&proxy_response);
 }
 
@@ -1018,62 +1578,119 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         }
 
         apex_config_route_t route;
-        if (apex_runtime_match(runtime, host, host_length, path, match_path_length, &route) &&
-            route.location != NULL) {
+        if (apex_runtime_match(runtime, host, host_length, path, match_path_length, &route)) {
             ctx.server = route.server;
             ctx.location = route.location;
 
-            /* Phase 3: HEADER_FILTER */
-            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_HEADER_FILTER);
-            if (action == APEX_ACTION_DENY) {
-                int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
-                router_send_error_ex(res->conn, route.server, req_buf, header_len,
-                                     deny_status, "Forbidden", "Forbidden\n",
+            /* Server-level return redirect */
+            if (route.server != NULL && route.server->return_code > 0) {
+                char client_ip[INET6_ADDRSTRLEN];
+                if (!conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
+                    strcpy(client_ip, "127.0.0.1");
+                }
+                const char *scheme = (res->conn != NULL && res->conn->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
+                char expanded[APEX_CONFIG_PATH_MAX * 2];
+                router_expand_string(route.server->return_url, expanded, sizeof(expanded),
+                                     host, host_length, path, path_len,
+                                     client_ip, strlen(client_ip),
+                                     scheme, strlen(scheme),
+                                     NULL, 0, NULL, 0, NULL, 0);
+                router_send_redirect(res->conn, route.server->return_code, expanded,
                                      ctx.extra_headers, ctx.extra_headers_len);
                 apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                 return;
             }
-            if (action == APEX_ACTION_DONE) {
-                return;
+
+            /* Server-level ACL rules */
+            if (route.server != NULL && route.server->acl_rule_count > 0 && res->conn != NULL) {
+                if (!router_check_acl(route.server->acl_rules, route.server->acl_rule_count, res->conn->fd)) {
+                    router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
             }
 
-            /* Phase 4: ACCESS_CONTROL */
-            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_ACCESS_CONTROL);
-            if (action == APEX_ACTION_DENY) {
-                int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
-                router_send_error_ex(res->conn, route.server, req_buf, header_len,
-                                     deny_status, "Forbidden", "Access Denied by Policy\n",
-                                     ctx.extra_headers, ctx.extra_headers_len);
-                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
-                return;
-            }
-            if (action == APEX_ACTION_DONE) {
-                return;
-            }
+            if (route.location != NULL) {
+                /* Location-level return redirect */
+                if (route.location->return_code > 0) {
+                    char client_ip[INET6_ADDRSTRLEN];
+                    if (!conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
+                        strcpy(client_ip, "127.0.0.1");
+                    }
+                    const char *scheme = (res->conn != NULL && res->conn->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
+                    char expanded[APEX_CONFIG_PATH_MAX * 2];
+                    router_expand_string(route.location->return_url, expanded, sizeof(expanded),
+                                         host, host_length, path, path_len,
+                                         client_ip, strlen(client_ip),
+                                         scheme, strlen(scheme),
+                                         NULL, 0, NULL, 0, NULL, 0);
+                    router_send_redirect(res->conn, route.location->return_code, expanded,
+                                         ctx.extra_headers, ctx.extra_headers_len);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
 
-            /* Phase 5: CONTENT_HANDLER */
-            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_CONTENT_HANDLER);
-            if (action == APEX_ACTION_DONE) {
+                /* Location-level ACL rules */
+                if (route.location->acl_rule_count > 0 && res->conn != NULL) {
+                    if (!router_check_acl(route.location->acl_rules, route.location->acl_rule_count, res->conn->fd)) {
+                        router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        return;
+                    }
+                }
+
+                /* Phase 3: HEADER_FILTER */
+                action = apex_pipeline_run_phase(&ctx, APEX_PHASE_HEADER_FILTER);
+                if (action == APEX_ACTION_DENY) {
+                    int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
+                    router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                         deny_status, "Forbidden", "Forbidden\n",
+                                         ctx.extra_headers, ctx.extra_headers_len);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+                if (action == APEX_ACTION_DONE) {
+                    return;
+                }
+
+                /* Phase 4: ACCESS_CONTROL */
+                action = apex_pipeline_run_phase(&ctx, APEX_PHASE_ACCESS_CONTROL);
+                if (action == APEX_ACTION_DENY) {
+                    int deny_status = ctx.status_code >= 400 ? ctx.status_code : 403;
+                    router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                         deny_status, "Forbidden", "Access Denied by Policy\n",
+                                         ctx.extra_headers, ctx.extra_headers_len);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+                if (action == APEX_ACTION_DONE) {
+                    return;
+                }
+
+                /* Phase 5: CONTENT_HANDLER */
+                action = apex_pipeline_run_phase(&ctx, APEX_PHASE_CONTENT_HANDLER);
+                if (action == APEX_ACTION_DONE) {
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+
+                /* Phase 6: RESPONSE_FILTER */
                 apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
-                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
-                return;
-            }
 
-            /* Phase 6: RESPONSE_FILTER */
-            apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
-
-            if (route.location->target != APEX_PROXY_TARGET_NONE) {
-                router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
-                                       body_len, res, ctx.extra_headers, ctx.extra_headers_len);
-                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
-                return;
-            }
-            if (route.location->root != NULL) {
-                bool head_request = method_len == 4 && memcmp(req_buf, "HEAD", 4) == 0;
-                apex_static_serve(route.server, route.location, req_buf, header_len, path, match_path_length,
-                                  head_request, res, ctx.extra_headers, ctx.extra_headers_len);
-                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
-                return;
+                if (route.location->target != APEX_PROXY_TARGET_NONE) {
+                    router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
+                                           body_len, res, ctx.extra_headers, ctx.extra_headers_len);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+                if (route.location->root != NULL) {
+                    bool head_request = method_len == 4 && memcmp(req_buf, "HEAD", 4) == 0;
+                    apex_static_serve(route.server, route.location, req_buf, header_len, path, match_path_length,
+                                      head_request, res, ctx.extra_headers, ctx.extra_headers_len);
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
             }
         }
 

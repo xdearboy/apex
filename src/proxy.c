@@ -1347,6 +1347,7 @@ void apex_proxy_response_init(apex_proxy_response_t *response) {
         return;
     }
     memset(response, 0, sizeof(*response));
+    response->upstream_fd = -1;
 }
 
 void apex_proxy_response_free(apex_proxy_response_t *response) {
@@ -1355,7 +1356,13 @@ void apex_proxy_response_free(apex_proxy_response_t *response) {
     }
     free(response->headers);
     free(response->body);
+    free(response->leftover_data);
+    if (response->upstream_fd >= 0) {
+        close(response->upstream_fd);
+        response->upstream_fd = -1;
+    }
     memset(response, 0, sizeof(*response));
+    response->upstream_fd = -1;
 }
 
 int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *request,
@@ -1498,6 +1505,19 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         }
 
         apex_upstream_record_success(group, (size_t)selected);
+        if (response->status == 101) {
+            response->upstream_fd = fd;
+            size_t unread = reader.len - reader.position;
+            if (unread > 0) {
+                response->leftover_data = malloc(unread);
+                if (response->leftover_data != NULL) {
+                    memcpy(response->leftover_data, reader.data + reader.position, unread);
+                    response->leftover_len = unread;
+                }
+            }
+            fd = -1;
+        }
+
         bool reusable = response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
         response->keep_alive = reusable;
         response->server_index = (size_t)selected;

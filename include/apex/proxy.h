@@ -104,6 +104,9 @@ typedef struct {
     bool keep_alive;
     size_t server_index;
     uint64_t elapsed_us;
+    int upstream_fd;
+    char *leftover_data;
+    size_t leftover_len;
 } apex_proxy_response_t;
 typedef struct {
     size_t idle_connections;
