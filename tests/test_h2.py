@@ -13,6 +13,7 @@ built against nghttp2).
 """
 
 import os
+import re
 import shutil
 import signal
 import socket
@@ -42,6 +43,21 @@ TLS_CONFIG = """http {{
             certificate "{certificate}";
             private_key "{key}";
         }}
+        server_name localhost;
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+
+PLAIN_CONFIG = """http {{
+    upstream edge {{
+        server 127.0.0.1:{upstream_port};
+        keepalive 8;
+    }}
+    server {{
+        listen "127.0.0.1:{listen_port}";
         server_name localhost;
         location "/" {{
             proxy_pass edge;
@@ -178,13 +194,17 @@ class H2RawClient:
     PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
     EMPTY_SETTINGS = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 
-    def __init__(self, port, alpn=("h2",)):
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        context.check_hostname = False
-        context.verify_mode = ssl.CERT_NONE
-        context.set_alpn_protocols(list(alpn))
-        self.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=REQUEST_TIMEOUT))
-        if self.sock.selected_alpn_protocol() == "h2":
+    def __init__(self, port, alpn=("h2",), tls=True):
+        if tls:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.set_alpn_protocols(list(alpn))
+            self.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=REQUEST_TIMEOUT))
+            if self.sock.selected_alpn_protocol() == "h2":
+                self.sock.sendall(self.PREFACE + self.EMPTY_SETTINGS)
+        else:
+            self.sock = socket.create_connection(("127.0.0.1", port), timeout=REQUEST_TIMEOUT)
             self.sock.sendall(self.PREFACE + self.EMPTY_SETTINGS)
 
     def alpn(self):
@@ -234,6 +254,22 @@ class H2RawClient:
 def curl(url, extra=()):
     return subprocess.run(
         ["curl", "--silent", "--show-error", "--insecure", "--http2", "--output", "-",
+         "--write-out", "\n%{http_version}", url, *extra],
+        capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
+    )
+
+
+def curl_h2c(url, extra=()):
+    return subprocess.run(
+        ["curl", "--silent", "--show-error", "--http2-prior-knowledge", "--output", "-",
+         "--write-out", "\n%{http_version}", url, *extra],
+        capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
+    )
+
+
+def curl_h1(url, extra=()):
+    return subprocess.run(
+        ["curl", "--silent", "--show-error", "--http1.1", "--output", "-",
          "--write-out", "\n%{http_version}", url, *extra],
         capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
     )
@@ -295,13 +331,13 @@ class H2ServingTest(unittest.TestCase):
 
     def test_http2_parallel_streams_one_connection(self):
         urls = [f"{self.base_url}/"] * 8
-        extra = ["--parallel", "--parallel-max", "10"]
+        extra = ["--parallel", "--parallel-max", "10", "--write-out", "\n[HTTP_VERSION:%{http_version}]\n"]
         for u in urls[1:]:
             extra.extend(["--url", u])
         result = curl(urls[0], extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.count("h2-backend"), 8, result.stdout)
-        versions = [line for line in result.stdout.splitlines() if line in ("2", "2.0")]
+        versions = re.findall(r"\[HTTP_VERSION:(2|2\.0)\]", result.stdout)
         self.assertEqual(len(versions), 8, result.stdout)
 
     def test_http1_fallback_still_served(self):
@@ -340,6 +376,98 @@ class H2ServingTest(unittest.TestCase):
         body, _, version = result.stdout.rpartition("\n")
         self.assertEqual(body, "h2-backend")
         self.assertTrue(float(version) >= 2.0)
+
+
+class H2cPriorKnowledgeTest(unittest.TestCase):
+
+    def setUp(self):
+        probe = subprocess.run(["curl", "--version"], capture_output=True, text=True)
+        if "nghttp2" not in probe.stdout:
+            self.skipTest("curl lacks nghttp2 (no HTTP/2 support)")
+        self.workdir = tempfile.mkdtemp(prefix="apex-h2c-")
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+        self.backend, self.backend_port = start_backend()
+        self.addCleanup(stop_backend, self.backend)
+        self.listen_port = free_port()
+        self.config = os.path.join(self.workdir, "apex.conf")
+        with open(self.config, "w") as handle:
+            handle.write(PLAIN_CONFIG.format(listen_port=self.listen_port, upstream_port=self.backend_port))
+        self.server = ApexServer(self.config, self.workdir)
+        self.addCleanup(self.server.stop)
+        self.server.wait_ready(self.listen_port)
+        self.base_url = f"http://127.0.0.1:{self.listen_port}"
+
+    def test_h2c_prior_knowledge_get_round_trip(self):
+        result = curl_h2c(f"{self.base_url}/")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body, _, version = result.stdout.rpartition("\n")
+        self.assertEqual(body, "h2-backend")
+        self.assertTrue(float(version) >= 2.0, f"not HTTP/2: {version}")
+
+    def test_h2c_prior_knowledge_post_round_trip(self):
+        payload = os.urandom(64 * 1024)
+        result = subprocess.run(
+            ["curl", "--silent", "--show-error", "--http2-prior-knowledge", "--output", "-",
+             "--write-out", "\n%{http_version}", "--request", "POST",
+             f"{self.base_url}/echo", "--data-binary", "@-"],
+            input=payload.hex(),
+            capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body, _, version = result.stdout.rpartition("\n")
+        self.assertEqual(body, payload.hex())
+        self.assertTrue(float(version) >= 2.0, f"not HTTP/2: {version}")
+
+    def test_h2c_parallel_streams(self):
+        urls = [f"{self.base_url}/"] * 8
+        extra = ["--parallel", "--parallel-max", "10", "--write-out", "\n[HTTP_VERSION:%{http_version}]\n"]
+        for u in urls[1:]:
+            extra.extend(["--url", u])
+        result = curl_h2c(urls[0], extra)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("h2-backend"), 8, result.stdout)
+        versions = re.findall(r"\[HTTP_VERSION:(2|2\.0)\]", result.stdout)
+        self.assertEqual(len(versions), 8, result.stdout)
+
+    def test_unified_port_interleaved_h1_and_h2c(self):
+        # 1. Plain HTTP/1.1 request
+        res1 = curl_h1(f"{self.base_url}/")
+        self.assertEqual(res1.returncode, 0, res1.stderr)
+        body1, _, ver1 = res1.stdout.rpartition("\n")
+        self.assertEqual(body1, "h2-backend")
+        self.assertEqual(ver1, "1.1")
+
+        # 2. HTTP/2 Prior Knowledge on the EXACT same port
+        res2 = curl_h2c(f"{self.base_url}/")
+        self.assertEqual(res2.returncode, 0, res2.stderr)
+        body2, _, ver2 = res2.stdout.rpartition("\n")
+        self.assertEqual(body2, "h2-backend")
+        self.assertTrue(float(ver2) >= 2.0)
+
+        # 3. Another HTTP/1.1 request
+        res3 = curl_h1(f"{self.base_url}/")
+        self.assertEqual(res3.returncode, 0, res3.stderr)
+        body3, _, ver3 = res3.stdout.rpartition("\n")
+        self.assertEqual(body3, "h2-backend")
+        self.assertEqual(ver3, "1.1")
+
+        # 4. Another HTTP/2 Prior Knowledge request
+        res4 = curl_h2c(f"{self.base_url}/")
+        self.assertEqual(res4.returncode, 0, res4.stderr)
+        body4, _, ver4 = res4.stdout.rpartition("\n")
+        self.assertEqual(body4, "h2-backend")
+        self.assertTrue(float(ver4) >= 2.0)
+
+    def test_h2c_sigquit_drains_session(self):
+        client = H2RawClient(self.listen_port, tls=False)
+        self.addCleanup(client.close)
+        time.sleep(0.3)
+        self.server.proc.send_signal(signal.SIGQUIT)
+        payload = client.read_frames(timeout=STOP_TIMEOUT)
+        types = h2_frame_types(payload)
+        self.assertIn(7, types, f"no GOAWAY frame on drain: {types}")
+        self.assertTrue(client.wait_for_eof(), "h2c connection was not closed orderly")
+        self.assertEqual(self.server.wait_exit(), 0)
 
 
 if __name__ == "__main__":

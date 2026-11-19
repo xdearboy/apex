@@ -447,7 +447,20 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
         }
     }
 
-    if (connection->fd < 0) {
+    if (connection->fd < 0 || connection->read_length == 0) {
+        return;
+    }
+
+    static const char H2_PREFACE[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    if (connection->read_length >= sizeof(H2_PREFACE) - 1u &&
+        memcmp(connection->read_buffer, H2_PREFACE, sizeof(H2_PREFACE) - 1u) == 0) {
+        if (h2_start_prior_knowledge(worker, connection) != 0) {
+            close_conn(worker, connection);
+        }
+        return;
+    }
+    if (connection->read_length < sizeof(H2_PREFACE) - 1u &&
+        memcmp(connection->read_buffer, H2_PREFACE, connection->read_length) == 0) {
         return;
     }
 

@@ -352,7 +352,8 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame, co
             }
             break;
         case 8u: /* :scheme */
-            if (value_length != 5u || memcmp(value, "https", 5u) != 0) {
+            if ((value_length != 5u || memcmp(value, "https", 5u) != 0) &&
+                (value_length != 4u || memcmp(value, "http", 4u) != 0)) {
                 h2_stream_reset(h2, stream->stream_id, NGHTTP2_PROTOCOL_ERROR);
                 return 0;
             }
@@ -642,8 +643,13 @@ static void h2_dispatch_stream(h2_conn_t *h2, h2_stream_t *stream) {
         memcpy(request + offset, "\r\n", 2u);
         offset += 2u;
     }
-    memcpy(request + offset, "X-Forwarded-Proto: https\r\n", 26u);
-    offset += 26u;
+    if (h2->owner != NULL && h2->owner->transport == APEX_TRANSPORT_TLS) {
+        memcpy(request + offset, "X-Forwarded-Proto: https\r\n", 26u);
+        offset += 26u;
+    } else {
+        memcpy(request + offset, "X-Forwarded-Proto: http\r\n", 25u);
+        offset += 25u;
+    }
     int content_length_written =
         snprintf(request + offset, capacity - offset, "Content-Length: %zu\r\n\r\n", stream->body_length);
     if (content_length_written < 0 || offset + (size_t)content_length_written > capacity) {
@@ -868,4 +874,23 @@ void h2_drain(worker_arg_t *worker, conn_t *connection) {
     int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(h2->session);
     nghttp2_submit_goaway(h2->session, NGHTTP2_FLAG_NONE, last_stream_id, NGHTTP2_NO_ERROR, NULL, 0);
     h2_flush(worker, connection);
+}
+
+int h2_start_prior_knowledge(worker_arg_t *worker, conn_t *connection) {
+    if (h2_connection_create(connection, worker) != 0) {
+        return -1;
+    }
+    h2_conn_t *h2 = connection->h2;
+    ssize_t consumed = nghttp2_session_mem_recv(h2->session, (const uint8_t *)connection->read_buffer,
+                                                connection->read_length);
+    connection->read_length = 0;
+    if (consumed < 0) {
+        h2_log("prior knowledge mem_recv", (int)consumed);
+        return -1;
+    }
+    h2_flush(worker, connection);
+    if (connection->fd >= 0) {
+        h2_read(worker, connection);
+    }
+    return 0;
 }
