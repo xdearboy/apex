@@ -15,22 +15,18 @@ typedef struct {
 */
 import "C"
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	"os"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/types"
 )
 
-var (
-	wafMu     sync.RWMutex
-	globalWAF coraza.WAF
-)
+var globalWAF atomic.Pointer[coraza.WAF]
 
 const DefaultSecLangRules = `
 SecRuleEngine On
@@ -55,9 +51,6 @@ SecRule REQUEST_HEADERS:User-Agent "@rx (?i)(sqlmap|nikto|acunetix|gobuster|wpsc
 
 //export coraza_bridge_init
 func coraza_bridge_init(cDirectives *C.char) C.int {
-	wafMu.Lock()
-	defer wafMu.Unlock()
-
 	ruleText := DefaultSecLangRules
 	if cDirectives != nil {
 		directives := C.GoString(cDirectives)
@@ -80,15 +73,34 @@ func coraza_bridge_init(cDirectives *C.char) C.int {
 		return -1
 	}
 
-	globalWAF = w
+	globalWAF.Store(&w)
 	return 0
 }
 
 //export coraza_bridge_destroy
 func coraza_bridge_destroy() {
-	wafMu.Lock()
-	defer wafMu.Unlock()
-	globalWAF = nil
+	globalWAF.Store(nil)
+}
+
+func fastString(ptr *C.char) string {
+	if ptr == nil {
+		return ""
+	}
+	switch {
+	case *ptr == 'G' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 1)) == 'E' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 2)) == 'T' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 3)) == 0:
+		return "GET"
+	case *ptr == 'P' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 1)) == 'O' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 2)) == 'S' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 3)) == 'T' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 4)) == 0:
+		return "POST"
+	case *ptr == 'H' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 1)) == 'E' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 2)) == 'A' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 3)) == 'D' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 4)) == 0:
+		return "HEAD"
+	case *ptr == '/' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 1)) == 0:
+		return "/"
+	case *ptr == '1' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 1)) == '2' && *(*C.char)(unsafe.Pointer(uintptr(unsafe.Pointer(ptr)) + 2)) == '7':
+		if C.GoString(ptr) == "127.0.0.1" {
+			return "127.0.0.1"
+		}
+	}
+	return C.GoString(ptr)
 }
 
 //export coraza_bridge_eval
@@ -103,13 +115,11 @@ func coraza_bridge_eval(
 	cBodyLen C.size_t,
 	outVerdict *C.coraza_verdict_t,
 ) C.int {
-	wafMu.RLock()
-	waf := globalWAF
-	wafMu.RUnlock()
-
-	if waf == nil || outVerdict == nil {
+	pWaf := globalWAF.Load()
+	if pWaf == nil || outVerdict == nil {
 		return 0
 	}
+	waf := *pWaf
 
 	outVerdict.blocked = 0
 	outVerdict.status_code = 200
@@ -118,19 +128,19 @@ func coraza_bridge_eval(
 
 	clientIP := "127.0.0.1"
 	if cClientIP != nil {
-		clientIP = C.GoString(cClientIP)
+		clientIP = fastString(cClientIP)
 	}
 	method := "GET"
 	if cMethod != nil {
-		method = C.GoString(cMethod)
+		method = fastString(cMethod)
 	}
 	uri := "/"
 	if cURI != nil {
-		uri = C.GoString(cURI)
+		uri = fastString(cURI)
 	}
 	proto := "HTTP/1.1"
 	if cProto != nil {
-		proto = C.GoString(cProto)
+		proto = fastString(cProto)
 	}
 
 	tx := waf.NewTransaction()
@@ -142,25 +152,35 @@ func coraza_bridge_eval(
 	// 2. URI
 	tx.ProcessURI(uri, method, proto)
 
-	// 3. Headers
+	// 3. Headers (zero-copy parsing via unsafe.Slice)
 	if cRawHeaders != nil && cHeadersLen > 0 {
-		rawHeaders := C.GoBytes(unsafe.Pointer(cRawHeaders), C.int(cHeadersLen))
-		scanner := bufio.NewScanner(bytes.NewReader(rawHeaders))
-		first := true
-		for scanner.Scan() {
-			line := scanner.Text()
-			if first {
-				first = false
+		raw := unsafe.Slice((*byte)(unsafe.Pointer(cRawHeaders)), int(cHeadersLen))
+		firstLine := true
+		for len(raw) > 0 {
+			lineEnd := bytes.IndexByte(raw, '\n')
+			var line []byte
+			if lineEnd >= 0 {
+				line = raw[:lineEnd]
+				raw = raw[lineEnd+1:]
+			} else {
+				line = raw
+				raw = nil
+			}
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			if firstLine {
+				firstLine = false
 				continue
 			}
-			if line == "" || line == "\r" {
+			if len(line) == 0 {
 				break
 			}
-			colonIdx := strings.IndexByte(line, ':')
-			if colonIdx > 0 {
-				hKey := strings.TrimSpace(line[:colonIdx])
-				hVal := strings.TrimSpace(line[colonIdx+1:])
-				tx.AddRequestHeader(hKey, hVal)
+			colon := bytes.IndexByte(line, ':')
+			if colon > 0 {
+				key := strings.TrimSpace(string(line[:colon]))
+				val := strings.TrimSpace(string(line[colon+1:]))
+				tx.AddRequestHeader(key, val)
 			}
 		}
 	}
@@ -184,9 +204,9 @@ func coraza_bridge_eval(
 		return 1
 	}
 
-	// 4. Body & Phase 2 Evaluation
+	// 4. Body & Phase 2 Evaluation (zero-copy slice)
 	if cBody != nil && cBodyLen > 0 {
-		bodyBytes := C.GoBytes(unsafe.Pointer(cBody), C.int(cBodyLen))
+		bodyBytes := unsafe.Slice((*byte)(unsafe.Pointer(cBody)), int(cBodyLen))
 		it, _, err := tx.WriteRequestBody(bodyBytes)
 		if err == nil && it != nil {
 			applyInterruption(it)

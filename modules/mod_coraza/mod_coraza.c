@@ -35,9 +35,50 @@ static void mod_coraza_cleanup(apex_runtime_t *runtime) {
     coraza_bridge_destroy();
 }
 
+#define APEX_CORAZA_CACHE_SLOTS 1024
+#define APEX_CORAZA_CACHE_TTL 2 /* seconds */
+
+typedef struct {
+    uint64_t hash;
+    time_t expires_at;
+    int is_clean;
+} coraza_cache_entry_t;
+
+typedef struct {
+    coraza_cache_entry_t entries[APEX_CORAZA_CACHE_SLOTS];
+} coraza_thread_cache_t;
+
+static __thread coraza_thread_cache_t s_coraza_cache;
+
+static inline uint64_t coraza_fnv1a_hash(const char *data, size_t len) {
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint8_t)data[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
 static apex_action_t mod_coraza_access_control(apex_pipeline_ctx_t *ctx) {
     if (ctx == NULL) {
         return APEX_ACTION_CONTINUE;
+    }
+
+    time_t now = time(NULL);
+    bool can_cache = (ctx->body == NULL || ctx->body_len == 0) &&
+                     ((ctx->method_len == 3 && memcmp(ctx->method, "GET", 3) == 0) ||
+                      (ctx->method_len == 4 && memcmp(ctx->method, "HEAD", 4) == 0));
+    uint64_t req_hash = 0;
+    uint32_t slot = 0;
+
+    if (can_cache && ctx->raw_request != NULL && ctx->raw_request_len > 0) {
+        req_hash = coraza_fnv1a_hash(ctx->raw_request, ctx->raw_request_len);
+        slot = (uint32_t)(req_hash % APEX_CORAZA_CACHE_SLOTS);
+        if (s_coraza_cache.entries[slot].is_clean &&
+            s_coraza_cache.entries[slot].hash == req_hash &&
+            now < s_coraza_cache.entries[slot].expires_at) {
+            return APEX_ACTION_CONTINUE;
+        }
     }
 
     char client_ip[64] = "127.0.0.1";
@@ -75,11 +116,21 @@ static apex_action_t mod_coraza_access_control(apex_pipeline_ctx_t *ctx) {
                                  ctx->body, ctx->body_len, &verdict);
 
     if (ret != 0 || verdict.blocked != 0) {
+        if (can_cache && req_hash != 0) {
+            s_coraza_cache.entries[slot].is_clean = 0;
+            s_coraza_cache.entries[slot].hash = 0;
+        }
         ctx->status_code = verdict.status_code > 0 ? verdict.status_code : 403;
         char waf_header_val[128];
         snprintf(waf_header_val, sizeof(waf_header_val), "Blocked by Coraza (Rule %d)", verdict.rule_id);
         apex_pipeline_add_header(ctx, "X-Apex-WAF", waf_header_val);
         return APEX_ACTION_DENY;
+    }
+
+    if (can_cache && req_hash != 0) {
+        s_coraza_cache.entries[slot].hash = req_hash;
+        s_coraza_cache.entries[slot].expires_at = now + APEX_CORAZA_CACHE_TTL;
+        s_coraza_cache.entries[slot].is_clean = 1;
     }
 
     return APEX_ACTION_CONTINUE;
