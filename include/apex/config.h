@@ -100,6 +100,15 @@ typedef struct {
     uint64_t connect_timeout_ms;
     uint64_t read_timeout_ms;
     uint64_t idle_timeout_ms;
+    uint32_t max_fails;
+    uint64_t fail_timeout_ms;
+    uint32_t max_retries;
+    bool health_check_enabled;
+    char health_check_uri[128];
+    uint64_t health_check_interval_ms;
+    uint64_t health_check_timeout_ms;
+    uint32_t health_check_fall;
+    uint32_t health_check_rise;
 } apex_upstream_config_t;
 
 typedef enum {

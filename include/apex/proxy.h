@@ -50,6 +50,9 @@ typedef struct {
     _Atomic uint64_t bytes_sent;
     _Atomic uint64_t bytes_received;
     _Atomic bool healthy;
+    _Atomic uint32_t consecutive_failures;
+    _Atomic uint32_t consecutive_successes;
+    _Atomic uint64_t last_failure_time_ms;
     struct sockaddr_storage address;
     socklen_t address_len;
 } upstream_server_t;
@@ -64,6 +67,15 @@ typedef struct {
     uint64_t connect_timeout_ms;
     uint64_t io_timeout_ms;
     uint64_t idle_timeout_ms;
+    uint32_t max_fails;
+    uint64_t fail_timeout_ms;
+    uint32_t max_retries;
+    bool health_check_enabled;
+    char health_check_uri[128];
+    uint64_t health_check_interval_ms;
+    uint64_t health_check_timeout_ms;
+    uint32_t health_check_fall;
+    uint32_t health_check_rise;
     _Atomic uint32_t round_robin_cursor;
 } upstream_group_t;
 
@@ -105,6 +117,12 @@ void apex_upstream_group_init(upstream_group_t *group);
 int apex_upstream_add_server(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight);
 void apex_upstream_set_policy(upstream_group_t *group, apex_balance_policy_t policy);
 ssize_t apex_upstream_select(upstream_group_t *group);
+ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask);
+void apex_upstream_record_success(upstream_group_t *group, size_t server_index);
+void apex_upstream_record_failure(upstream_group_t *group, size_t server_index);
+
+int apex_health_prober_start(upstream_group_t *groups, size_t group_count);
+void apex_health_prober_stop(void);
 
 void apex_proxy_response_init(apex_proxy_response_t *response);
 void apex_proxy_response_free(apex_proxy_response_t *response);

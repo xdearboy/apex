@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1131,6 +1132,14 @@ void apex_upstream_group_init(upstream_group_t *group) {
     group->connect_timeout_ms = APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS;
     group->io_timeout_ms = APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
     group->idle_timeout_ms = APEX_PROXY_DEFAULT_IDLE_TIMEOUT_MS;
+    group->max_fails = 2u;
+    group->fail_timeout_ms = 10000u;
+    group->max_retries = 2u;
+    group->health_check_interval_ms = 5000u;
+    group->health_check_timeout_ms = 2000u;
+    group->health_check_fall = 2u;
+    group->health_check_rise = 2u;
+    snprintf(group->health_check_uri, sizeof(group->health_check_uri), "/");
     atomic_init(&group->round_robin_cursor, 0u);
 }
 
@@ -1190,6 +1199,9 @@ int apex_upstream_add_server(upstream_group_t *group, const char *host, uint16_t
     atomic_init(&server->bytes_sent, 0);
     atomic_init(&server->bytes_received, 0);
     atomic_init(&server->healthy, true);
+    atomic_init(&server->consecutive_failures, 0);
+    atomic_init(&server->consecutive_successes, 0);
+    atomic_init(&server->last_failure_time_ms, 0);
 
     size_t index = group->server_count;
     group->server_count++;
@@ -1206,20 +1218,89 @@ void apex_upstream_set_policy(upstream_group_t *group, apex_balance_policy_t pol
     }
 }
 
-ssize_t apex_upstream_select(upstream_group_t *group) {
+void apex_upstream_record_success(upstream_group_t *group, size_t server_index) {
+    if (group == NULL || server_index >= group->server_count) {
+        return;
+    }
+    upstream_server_t *server = &group->servers[server_index];
+    atomic_store_explicit(&server->consecutive_failures, 0, memory_order_relaxed);
+    atomic_fetch_add_explicit(&server->consecutive_successes, 1, memory_order_relaxed);
+    atomic_store_explicit(&server->healthy, true, memory_order_relaxed);
+}
+
+void apex_upstream_record_failure(upstream_group_t *group, size_t server_index) {
+    if (group == NULL || server_index >= group->server_count) {
+        return;
+    }
+    upstream_server_t *server = &group->servers[server_index];
+    atomic_store_explicit(&server->consecutive_successes, 0, memory_order_relaxed);
+    uint32_t fails = atomic_fetch_add_explicit(&server->consecutive_failures, 1, memory_order_relaxed) + 1u;
+    uint32_t max_fails = group->max_fails ? group->max_fails : 2u;
+    if (fails >= max_fails) {
+        atomic_store_explicit(&server->healthy, false, memory_order_relaxed);
+    }
+    atomic_store_explicit(&server->last_failure_time_ms, monotonic_ms(), memory_order_relaxed);
+}
+
+static bool server_is_available(const upstream_group_t *group, size_t index, uint64_t now_ms) {
+    if (index >= group->server_count) {
+        return false;
+    }
+    const upstream_server_t *server = &group->servers[index];
+    if (atomic_load_explicit(&server->healthy, memory_order_relaxed)) {
+        return true;
+    }
+    /* Half-Open probationary trial check */
+    uint64_t last_fail = atomic_load_explicit(&server->last_failure_time_ms, memory_order_relaxed);
+    uint64_t timeout = group->fail_timeout_ms ? group->fail_timeout_ms : 10000u;
+    if (now_ms >= last_fail && (now_ms - last_fail) >= timeout) {
+        return true;
+    }
+    return false;
+}
+
+ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask) {
     if (group == NULL || group->server_count == 0) {
         return -1;
     }
-    if (group->server_count == 1) {
-        return 0;
+
+    size_t candidates[APEX_UPSTREAM_MAX_SERVERS];
+    size_t candidate_count = 0;
+    uint64_t now_ms = monotonic_ms();
+
+    for (size_t i = 0; i < group->server_count; i++) {
+        if ((excluded_mask & (1ULL << i)) != 0) {
+            continue;
+        }
+        if (server_is_available(group, i, now_ms)) {
+            candidates[candidate_count++] = i;
+        }
+    }
+
+    /* Fail-open: if all servers are deemed unavailable, but some are not yet excluded */
+    if (candidate_count == 0) {
+        for (size_t i = 0; i < group->server_count; i++) {
+            if ((excluded_mask & (1ULL << i)) == 0) {
+                candidates[candidate_count++] = i;
+            }
+        }
+    }
+
+    if (candidate_count == 0) {
+        return -1;
+    }
+    if (candidate_count == 1) {
+        return (ssize_t)candidates[0];
     }
 
     if (group->policy == APEX_BALANCE_P2C) {
-        size_t first = random_below(group->server_count);
-        size_t second = random_below(group->server_count - 1u);
-        if (second >= first) {
-            second++;
+        size_t first_idx = random_below(candidate_count);
+        size_t second_idx = random_below(candidate_count - 1u);
+        if (second_idx >= first_idx) {
+            second_idx++;
         }
+        size_t first = candidates[first_idx];
+        size_t second = candidates[second_idx];
 
         uint64_t first_score = server_load_score(&group->servers[first]);
         uint64_t second_score = server_load_score(&group->servers[second]);
@@ -1232,26 +1313,33 @@ ssize_t apex_upstream_select(upstream_group_t *group) {
         return (ssize_t)(thread_random() & 1u ? first : second);
     }
 
+    /* Round Robin over candidates */
     uint64_t total_weight = 0;
-    for (size_t index = 0; index < group->server_count; index++) {
-        total_weight += group->servers[index].weight ? group->servers[index].weight : 1u;
+    for (size_t idx = 0; idx < candidate_count; idx++) {
+        size_t i = candidates[idx];
+        total_weight += group->servers[i].weight ? group->servers[i].weight : 1u;
     }
 
     uint32_t cursor = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
     if (total_weight == 0) {
-        return (ssize_t)(cursor % group->server_count);
+        return (ssize_t)candidates[cursor % candidate_count];
     }
 
     uint64_t slot = (uint64_t)cursor % total_weight;
     uint64_t accumulated = 0;
-    for (size_t index = 0; index < group->server_count; index++) {
-        accumulated += group->servers[index].weight ? group->servers[index].weight : 1u;
+    for (size_t idx = 0; idx < candidate_count; idx++) {
+        size_t i = candidates[idx];
+        accumulated += group->servers[i].weight ? group->servers[i].weight : 1u;
         if (slot < accumulated) {
-            return (ssize_t)index;
+            return (ssize_t)i;
         }
     }
 
-    return (ssize_t)(group->server_count - 1u);
+    return (ssize_t)candidates[candidate_count - 1u];
+}
+
+ssize_t apex_upstream_select(upstream_group_t *group) {
+    return apex_upstream_select_excluding(group, 0);
 }
 
 void apex_proxy_response_init(apex_proxy_response_t *response) {
@@ -1297,92 +1385,141 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         return APEX_PROXY_ERR_TOO_LARGE;
     }
 
-    ssize_t selected = apex_upstream_select(group);
-    if (selected < 0) {
-        return APEX_PROXY_ERR_NO_UPSTREAM;
+    uint32_t max_retries = group->max_retries;
+    if (group->server_count <= 1) {
+        max_retries = 0;
+    } else if (max_retries >= group->server_count) {
+        max_retries = (uint32_t)(group->server_count - 1u);
     }
 
-    upstream_server_t *server = &group->servers[selected];
+    uint64_t tried_mask = 0;
+    int last_error = APEX_PROXY_ERR_NO_UPSTREAM;
     uint64_t started_us = monotonic_us();
-    atomic_fetch_add_explicit(&server->active_conns, 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&server->total_requests, 1, memory_order_relaxed);
 
-    buffer_t wire = {0};
-    reader_t reader = {0};
-    int fd = -1;
-    int result = APEX_PROXY_OK;
-
-    result = build_request(&wire, request, server);
-    if (result != APEX_PROXY_OK) {
-        goto finish;
-    }
-
-    fd = pool_acquire(server, group);
-    if (fd < 0) {
-        fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
-                                                             : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
-        if (fd < 0) {
-            atomic_store_explicit(&server->healthy, false, memory_order_relaxed);
-            result = APEX_PROXY_ERR_CONNECT;
-            goto finish;
+    for (uint32_t attempt = 0; attempt <= max_retries; attempt++) {
+        ssize_t selected = apex_upstream_select_excluding(group, tried_mask);
+        if (selected < 0) {
+            break;
         }
-        thread_pool.total_created++;
-        atomic_store_explicit(&server->healthy, true, memory_order_relaxed);
-    }
+        tried_mask |= (1ULL << (size_t)selected);
+        upstream_server_t *server = &group->servers[selected];
 
-    apply_io_timeouts(fd, group);
+        atomic_fetch_add_explicit(&server->active_conns, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&server->total_requests, 1, memory_order_relaxed);
 
-    result = send_all(fd, wire.data, wire.len);
-    if (result != APEX_PROXY_OK) {
-        goto finish;
-    }
-    atomic_fetch_add_explicit(&server->bytes_sent, wire.len, memory_order_relaxed);
+        buffer_t wire = {0};
+        reader_t reader = {0};
+        int fd = -1;
+        int result = build_request(&wire, request, server);
+        if (result != APEX_PROXY_OK) {
+            atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+            return result;
+        }
 
-    uint64_t limit64 = (uint64_t)(group->max_header_bytes ? group->max_header_bytes
-                                                         : APEX_PROXY_DEFAULT_MAX_HEADER_BYTES) +
-                       (uint64_t)(group->max_body_bytes ? group->max_body_bytes
-                                                        : APEX_PROXY_DEFAULT_MAX_BODY_BYTES) +
-                       65536u;
-    uint64_t io_timeout = group->io_timeout_ms ? group->io_timeout_ms : APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
-    if (io_timeout > 3600000u) {
-        io_timeout = 3600000u;
-    }
-    reader.fd = fd;
-    reader.limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
-    reader.deadline_ms = monotonic_ms() + io_timeout;
+        fd = pool_acquire(server, group);
+        bool from_pool = (fd >= 0);
+        if (fd < 0) {
+            fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                 : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+            if (fd < 0) {
+                apex_upstream_record_failure(group, (size_t)selected);
+                atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+                atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                buffer_free(&wire);
+                last_error = APEX_PROXY_ERR_CONNECT;
+                continue;
+            }
+            thread_pool.total_created++;
+        }
 
-    result = read_response(&reader, group, request, response);
-    if (result != APEX_PROXY_OK) {
-        goto finish;
-    }
+        apply_io_timeouts(fd, group);
 
-    bool reusable = response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
-    response->keep_alive = reusable;
-    response->server_index = (size_t)selected;
-    response->elapsed_us = monotonic_us() - started_us;
+        result = send_all(fd, wire.data, wire.len);
+        if (result != APEX_PROXY_OK) {
+            pool_close(fd);
+            fd = -1;
+            if (from_pool) {
+                /* Connection was stale in pool, try fresh connection to the same server */
+                fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                     : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+                if (fd >= 0) {
+                    thread_pool.total_created++;
+                    apply_io_timeouts(fd, group);
+                    result = send_all(fd, wire.data, wire.len);
+                } else {
+                    result = APEX_PROXY_ERR_CONNECT;
+                }
+            }
+            if (result != APEX_PROXY_OK) {
+                if (fd >= 0) {
+                    pool_close(fd);
+                    fd = -1;
+                }
+                buffer_free(&wire);
+                apex_upstream_record_failure(group, (size_t)selected);
+                atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+                atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                last_error = result;
+                continue;
+            }
+        }
+        atomic_fetch_add_explicit(&server->bytes_sent, wire.len, memory_order_relaxed);
 
-    if (reusable) {
-        pool_release(server, group, fd);
-        fd = -1;
-    }
+        uint64_t limit64 = (uint64_t)(group->max_header_bytes ? group->max_header_bytes
+                                                             : APEX_PROXY_DEFAULT_MAX_HEADER_BYTES) +
+                           (uint64_t)(group->max_body_bytes ? group->max_body_bytes
+                                                            : APEX_PROXY_DEFAULT_MAX_BODY_BYTES) +
+                           65536u;
+        uint64_t io_timeout = group->io_timeout_ms ? group->io_timeout_ms : APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
+        if (io_timeout > 3600000u) {
+            io_timeout = 3600000u;
+        }
+        reader.fd = fd;
+        reader.limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
+        reader.deadline_ms = monotonic_ms() + io_timeout;
 
-finish:
-    if (fd >= 0) {
-        pool_close(fd);
-    }
-    buffer_free(&wire);
-    reader_free(&reader);
+        result = read_response(&reader, group, request, response);
+        if (result != APEX_PROXY_OK) {
+            pool_close(fd);
+            fd = -1;
+            buffer_free(&wire);
+            reader_free(&reader);
+            apex_proxy_response_free(response);
+            atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+            atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+            last_error = result;
 
-    if (result == APEX_PROXY_OK) {
+            /* Retry next server if no response bytes were read yet and retries remain */
+            if (reader.position == 0 && attempt < max_retries) {
+                apex_upstream_record_failure(group, (size_t)selected);
+                continue;
+            }
+            return result;
+        }
+
+        apex_upstream_record_success(group, (size_t)selected);
+        bool reusable = response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
+        response->keep_alive = reusable;
+        response->server_index = (size_t)selected;
+        response->elapsed_us = monotonic_us() - started_us;
+
+        if (reusable) {
+            pool_release(server, group, fd);
+            fd = -1;
+        } else if (fd >= 0) {
+            pool_close(fd);
+            fd = -1;
+        }
+        buffer_free(&wire);
+        reader_free(&reader);
+
         atomic_fetch_add_explicit(&server->bytes_received, response->headers_len + response->body_len,
                                   memory_order_relaxed);
-    } else {
-        apex_proxy_response_free(response);
-        atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+        atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+        return APEX_PROXY_OK;
     }
 
-    atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
-    return result;
+    return last_error;
 }
 
 void apex_proxy_pool_reset(void) {
@@ -1428,4 +1565,152 @@ const char *apex_proxy_strerror(int error_code) {
     default:
         return "unknown error";
     }
+}
+
+static pthread_t prober_thread;
+static _Atomic bool prober_running = false;
+static upstream_group_t *prober_groups = NULL;
+static size_t prober_group_count = 0;
+
+static void probe_single_server(upstream_group_t *group, upstream_server_t *server) {
+    uint64_t timeout_ms = group->health_check_timeout_ms ? group->health_check_timeout_ms : 2000u;
+    int fd = connect_server(server, timeout_ms);
+    if (fd < 0) {
+        atomic_store_explicit(&server->consecutive_successes, 0, memory_order_relaxed);
+        uint32_t fails = atomic_fetch_add_explicit(&server->consecutive_failures, 1, memory_order_relaxed) + 1u;
+        uint32_t fall = group->health_check_fall ? group->health_check_fall : 2u;
+        if (fails >= fall) {
+            atomic_store_explicit(&server->healthy, false, memory_order_relaxed);
+        }
+        atomic_store_explicit(&server->last_failure_time_ms, monotonic_ms(), memory_order_relaxed);
+        return;
+    }
+
+    bool success = true;
+    if (group->health_check_uri[0] != '\0') {
+        char probe_request[256];
+        int req_len = snprintf(probe_request, sizeof(probe_request),
+                               "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: apex-health-prober\r\nConnection: close\r\n\r\n",
+                               group->health_check_uri, server->ip);
+        if (req_len > 0 && (size_t)req_len < sizeof(probe_request)) {
+            struct timeval tv;
+            tv.tv_sec = (time_t)(timeout_ms / 1000u);
+            tv.tv_usec = (suseconds_t)((timeout_ms % 1000u) * 1000u);
+            (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+            if (send_all(fd, probe_request, (size_t)req_len) == 0) {
+                char response_buf[128];
+                ssize_t n = recv(fd, response_buf, sizeof(response_buf) - 1, 0);
+                if (n > 12) {
+                    response_buf[n] = '\0';
+                    int status = 0;
+                    if (sscanf(response_buf, "HTTP/%*s %d", &status) == 1) {
+                        if (status >= 200 && status < 400) {
+                            success = true;
+                        } else {
+                            success = false;
+                        }
+                    } else {
+                        success = false;
+                    }
+                } else {
+                    success = false;
+                }
+            } else {
+                success = false;
+            }
+        }
+    }
+    shutdown(fd, SHUT_WR);
+    char drain_buf[512];
+    while (recv(fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0) {}
+    close(fd);
+
+    if (success) {
+        atomic_store_explicit(&server->consecutive_failures, 0, memory_order_relaxed);
+        uint32_t succ = atomic_fetch_add_explicit(&server->consecutive_successes, 1, memory_order_relaxed) + 1u;
+        uint32_t rise = group->health_check_rise ? group->health_check_rise : 2u;
+        if (succ >= rise) {
+            atomic_store_explicit(&server->healthy, true, memory_order_relaxed);
+        }
+    } else {
+        atomic_store_explicit(&server->consecutive_successes, 0, memory_order_relaxed);
+        uint32_t fails = atomic_fetch_add_explicit(&server->consecutive_failures, 1, memory_order_relaxed) + 1u;
+        uint32_t fall = group->health_check_fall ? group->health_check_fall : 2u;
+        if (fails >= fall) {
+            atomic_store_explicit(&server->healthy, false, memory_order_relaxed);
+        }
+        atomic_store_explicit(&server->last_failure_time_ms, monotonic_ms(), memory_order_relaxed);
+    }
+}
+
+static void *prober_worker(void *arg) {
+    (void)arg;
+    while (atomic_load_explicit(&prober_running, memory_order_acquire)) {
+        for (size_t g = 0; g < prober_group_count; g++) {
+            upstream_group_t *group = &prober_groups[g];
+            if (!group->health_check_enabled) {
+                continue;
+            }
+            for (size_t s = 0; s < group->server_count; s++) {
+                if (!atomic_load_explicit(&prober_running, memory_order_acquire)) {
+                    break;
+                }
+                probe_single_server(group, &group->servers[s]);
+            }
+        }
+
+        uint64_t interval = 5000;
+        if (prober_group_count > 0 && prober_groups[0].health_check_interval_ms > 0) {
+            interval = prober_groups[0].health_check_interval_ms;
+        }
+        uint64_t slices = interval / 100u;
+        if (slices == 0) {
+            slices = 1;
+        }
+        for (uint64_t i = 0; i < slices && atomic_load_explicit(&prober_running, memory_order_acquire); i++) {
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = 100000000L};
+            nanosleep(&ts, NULL);
+        }
+    }
+    return NULL;
+}
+
+int apex_health_prober_start(upstream_group_t *groups, size_t group_count) {
+    if (groups == NULL || group_count == 0) {
+        return 0;
+    }
+    bool any_enabled = false;
+    for (size_t i = 0; i < group_count; i++) {
+        if (groups[i].health_check_enabled) {
+            any_enabled = true;
+            break;
+        }
+    }
+    if (!any_enabled) {
+        return 0;
+    }
+    if (atomic_load_explicit(&prober_running, memory_order_acquire)) {
+        return 0;
+    }
+    prober_groups = groups;
+    prober_group_count = group_count;
+    atomic_store_explicit(&prober_running, true, memory_order_release);
+    int rc = pthread_create(&prober_thread, NULL, prober_worker, NULL);
+    if (rc != 0) {
+        atomic_store_explicit(&prober_running, false, memory_order_release);
+        return -1;
+    }
+    return 0;
+}
+
+void apex_health_prober_stop(void) {
+    if (!atomic_load_explicit(&prober_running, memory_order_acquire)) {
+        return;
+    }
+    atomic_store_explicit(&prober_running, false, memory_order_release);
+    pthread_join(prober_thread, NULL);
+    prober_groups = NULL;
+    prober_group_count = 0;
 }

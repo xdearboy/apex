@@ -1993,6 +1993,118 @@ static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t 
     return upstream_add_server(parser, upstream, &server);
 }
 
+static bool parse_upstream_health_check_item(parser_t *parser, apex_upstream_config_t *upstream) {
+    upstream->health_check_enabled = true;
+    if (upstream->health_check_interval_ms == 0) {
+        upstream->health_check_interval_ms = 5000;
+    }
+    if (upstream->health_check_timeout_ms == 0) {
+        upstream->health_check_timeout_ms = 2000;
+    }
+    if (upstream->health_check_fall == 0) {
+        upstream->health_check_fall = 2;
+    }
+    if (upstream->health_check_rise == 0) {
+        upstream->health_check_rise = 2;
+    }
+    if (upstream->health_check_uri[0] == '\0') {
+        snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "/");
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *attribute = parser_peek(parser);
+        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unterminated 'health_check' directive");
+            return false;
+        }
+        if (attribute->kind != TOKEN_WORD && attribute->kind != TOKEN_STRING) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected a health_check option");
+            return false;
+        }
+
+        const char *name = attribute->text;
+        size_t name_length = attribute->length;
+        const char *equals = strchr(name, '=');
+        size_t key_length = name_length;
+        if (equals != NULL) {
+            key_length = (size_t)(equals - name);
+        }
+        parser_advance(parser);
+
+        char option_text[128];
+        const token_t *value_token = NULL;
+        token_t inline_value;
+        if (equals != NULL) {
+            size_t value_length = name_length - key_length - 1u;
+            if (value_length >= sizeof(option_text)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "health_check option value is too long");
+                return false;
+            }
+            memcpy(option_text, equals + 1, value_length);
+            option_text[value_length] = '\0';
+            memset(&inline_value, 0, sizeof(inline_value));
+            inline_value.kind = TOKEN_WORD;
+            inline_value.text = option_text;
+            inline_value.length = value_length;
+            inline_value.line = attribute->line;
+            inline_value.column = attribute->column;
+            inline_value.file_index = attribute->file_index;
+            value_token = &inline_value;
+        } else {
+            const token_t *equals_token = parser_peek(parser);
+            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
+                             "health_check option '%s' requires '=' and a value", name);
+                return false;
+            }
+            parser_advance(parser);
+            value_token = parser_scalar(parser, "an option value");
+            if (value_token == NULL) {
+                return false;
+            }
+        }
+
+        uint64_t parsed = 0;
+        if (key_length == 3u && strncmp(name, "uri", 3u) == 0) {
+            if (value_token->length >= sizeof(upstream->health_check_uri)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "health_check uri is too long");
+                return false;
+            }
+            snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "%s", value_token->text);
+        } else if (key_length == 8u && strncmp(name, "interval", 8u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for interval");
+                return false;
+            }
+            upstream->health_check_interval_ms = parsed;
+        } else if (key_length == 7u && strncmp(name, "timeout", 7u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for timeout");
+                return false;
+            }
+            upstream->health_check_timeout_ms = parsed;
+        } else if (key_length == 4u && strncmp(name, "fall", 4u) == 0) {
+            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "fall must be between 1 and 100");
+                return false;
+            }
+            upstream->health_check_fall = (uint32_t)parsed;
+        } else if (key_length == 4u && strncmp(name, "rise", 4u) == 0) {
+            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "rise must be between 1 and 100");
+                return false;
+            }
+            upstream->health_check_rise = (uint32_t)parsed;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown health_check option");
+            parser_hint(parser, "health_check options are uri=<path>, interval=<dur>, timeout=<dur>, fall=<n>, rise=<n>");
+            return false;
+        }
+    }
+
+    return parser_expect_semicolon(parser);
+}
+
 static bool parse_upstream_block(parser_t *parser) {
     const token_t *name = parser_identifier(parser, "an upstream name");
     if (name == NULL) {
@@ -2035,6 +2147,12 @@ static bool parse_upstream_block(parser_t *parser) {
             }
             continue;
         }
+        if (token_is_word(directive, "health_check")) {
+            if (!parse_upstream_health_check_item(parser, upstream)) {
+                return false;
+            }
+            continue;
+        }
         if (token_is_word(directive, "policy") || token_is_word(directive, "algorithm")) {
             const token_t *value = parser_scalar(parser, "round_robin or p2c");
             if (value == NULL) {
@@ -2059,6 +2177,39 @@ static bool parse_upstream_block(parser_t *parser) {
                 return false;
             }
             upstream->keepalive = (uint32_t)parsed;
+        } else if (token_is_word(directive, "max_fails")) {
+            const token_t *value = parser_scalar(parser, "a failure count");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t parsed = 0;
+            if (!token_to_u64(value, 1u, 1000u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "max_fails must be between 1 and 1000");
+                return false;
+            }
+            upstream->max_fails = (uint32_t)parsed;
+        } else if (token_is_word(directive, "fail_timeout")) {
+            const token_t *value = parser_scalar(parser, "a duration");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t milliseconds = 0;
+            if (!token_to_duration_ms(value, &milliseconds)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration for fail_timeout");
+                return false;
+            }
+            upstream->fail_timeout_ms = milliseconds;
+        } else if (token_is_word(directive, "max_retries")) {
+            const token_t *value = parser_scalar(parser, "a retry count");
+            if (value == NULL) {
+                return false;
+            }
+            uint64_t parsed = 0;
+            if (!token_to_u64(value, 0u, 64u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "max_retries must be between 0 and 64");
+                return false;
+            }
+            upstream->max_retries = (uint32_t)parsed;
         } else if (token_is_word(directive, "connect_timeout") || token_is_word(directive, "read_timeout") ||
                    token_is_word(directive, "idle_timeout")) {
             const token_t *value = parser_scalar(parser, "a duration");
@@ -2081,7 +2232,7 @@ static bool parse_upstream_block(parser_t *parser) {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown upstream directive '%s'",
                          directive->text);
             parser_hint(parser, "upstream accepts server, policy, keepalive, connect_timeout, read_timeout, "
-                                "idle_timeout");
+                                "idle_timeout, max_fails, fail_timeout, max_retries, health_check");
             return false;
         }
 
@@ -2610,6 +2761,23 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         group->connect_timeout_ms = source->connect_timeout_ms;
         group->io_timeout_ms = source->read_timeout_ms;
         group->idle_timeout_ms = source->idle_timeout_ms;
+        if (source->max_fails > 0) {
+            group->max_fails = source->max_fails;
+        }
+        if (source->fail_timeout_ms > 0) {
+            group->fail_timeout_ms = source->fail_timeout_ms;
+        }
+        if (source->max_retries > 0) {
+            group->max_retries = source->max_retries;
+        }
+        group->health_check_enabled = source->health_check_enabled;
+        if (source->health_check_enabled) {
+            snprintf(group->health_check_uri, sizeof(group->health_check_uri), "%s", source->health_check_uri);
+            group->health_check_interval_ms = source->health_check_interval_ms;
+            group->health_check_timeout_ms = source->health_check_timeout_ms;
+            group->health_check_fall = source->health_check_fall;
+            group->health_check_rise = source->health_check_rise;
+        }
         apex_upstream_set_policy(group, source->policy);
 
         for (size_t server_index = 0; server_index < source->server_count; server_index++) {
@@ -2670,6 +2838,7 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         }
     }
 
+    apex_health_prober_start(runtime->groups, runtime->group_count);
     return runtime;
 }
 
@@ -2677,6 +2846,7 @@ void apex_runtime_destroy(apex_runtime_t *runtime) {
     if (runtime == NULL) {
         return;
     }
+    apex_health_prober_stop();
     free(runtime->groups);
     free(runtime->endpoint_groups);
     free(runtime);

@@ -775,6 +775,84 @@ class ErrorPageTest(unittest.TestCase):
         self.assertIn("bad gateway", text)
 
 
+class UpstreamFailoverTest(unittest.TestCase):
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="apex-failover-")
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+        self.backend, self.backend_port = start_backend("healthy-backend-payload")
+        self.addCleanup(stop_backend, self.backend)
+        self.dead_port = free_port()
+        self.listen_port = free_port()
+
+    def test_next_upstream_failover_serves_200(self):
+        config_text = f"""http {{
+    upstream edge {{
+        server 127.0.0.1:{self.dead_port};
+        server 127.0.0.1:{self.backend_port};
+        connect_timeout 500ms;
+        max_fails 2;
+        fail_timeout 5s;
+        max_retries 2;
+    }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, body = client.request("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"healthy-backend-payload")
+
+        # Second request: dead server should remain avoided, traffic flows smoothly
+        status2, body2 = client.request("/")
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, b"healthy-backend-payload")
+
+    def test_health_check_directive_and_active_prober(self):
+        config_text = f"""http {{
+    upstream edge {{
+        server 127.0.0.1:{self.backend_port};
+        health_check uri=/ interval=1s timeout=500ms fall=2 rise=2;
+        max_fails 3;
+        fail_timeout 5s;
+        max_retries 2;
+    }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        check = run_cli(["-t", "-c", config])
+        self.assertEqual(check.returncode, 0, check.stderr)
+        self.assertIn("valid", check.stdout)
+
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, body = client.request("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"healthy-backend-payload")
+
+
 def main():
     unittest.main(argv=[sys.argv[0]], verbosity=2)
 

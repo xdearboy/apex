@@ -511,6 +511,88 @@ static int run_zero_weight_case(void) {
     return failures ? 1 : 0;
 }
 
+static int run_failover_case(void) {
+    _Atomic bool stop = false;
+    backend_t live_backend = {0};
+    int live_port = start_backend(&live_backend, 0, &stop);
+    if (live_port < 0) {
+        fprintf(stderr, "edge failover: failed to start live backend\n");
+        return 1;
+    }
+
+    int dead_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in dead_addr = {0};
+    dead_addr.sin_family = AF_INET;
+    dead_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    dead_addr.sin_port = 0;
+    (void)bind(dead_fd, (struct sockaddr *)&dead_addr, sizeof(dead_addr));
+    socklen_t addr_len = sizeof(dead_addr);
+    (void)getsockname(dead_fd, (struct sockaddr *)&dead_addr, &addr_len);
+    int dead_port = ntohs(dead_addr.sin_port);
+    close(dead_fd);
+
+    upstream_group_t group;
+    apex_upstream_group_init(&group);
+    group.connect_timeout_ms = 200;
+    group.max_retries = 2;
+    group.max_fails = 2;
+    group.health_check_enabled = true;
+    group.health_check_interval_ms = 1000;
+    group.health_check_timeout_ms = 200;
+
+    if (apex_upstream_add_server(&group, "127.0.0.1", (uint16_t)dead_port, 1) < 0 ||
+        apex_upstream_add_server(&group, "127.0.0.1", (uint16_t)live_port, 1) < 0) {
+        fprintf(stderr, "edge failover: failed to add servers\n");
+        atomic_store_explicit(&stop, true, memory_order_relaxed);
+        close(live_backend.listen_fd);
+        for (int i = 0; i < live_backend.thread_count; i++) {
+            (void)pthread_join(live_backend.threads[i], NULL);
+        }
+        return 1;
+    }
+
+    int failures = 0;
+    apex_proxy_request_t request = {0};
+    request.method = "GET";
+    request.target = "/";
+    request.keep_alive = true;
+
+    apex_proxy_response_t response;
+    int result = apex_proxy_forward(&group, &request, &response);
+    if (result != APEX_PROXY_OK || response.status != 200) {
+        fprintf(stderr, "edge failover: forward failed (%d: %s, status=%d)\n", result, apex_proxy_strerror(result),
+                response.status);
+        failures++;
+    } else if (response.server_index != 1) {
+        fprintf(stderr, "edge failover: expected response from server 1, got %zu\n", response.server_index);
+        failures++;
+    }
+    apex_proxy_response_free(&response);
+
+    result = apex_proxy_forward(&group, &request, &response);
+    if (result != APEX_PROXY_OK || response.status != 200) {
+        fprintf(stderr, "edge failover: second forward failed (%d: %s)\n", result, apex_proxy_strerror(result));
+        failures++;
+    }
+    apex_proxy_response_free(&response);
+
+    if (apex_health_prober_start(&group, 1) != 0) {
+        fprintf(stderr, "edge failover: prober start failed\n");
+        failures++;
+    }
+    apex_health_prober_stop();
+
+    atomic_store_explicit(&stop, true, memory_order_relaxed);
+    close(live_backend.listen_fd);
+    for (int i = 0; i < live_backend.thread_count; i++) {
+        (void)pthread_join(live_backend.threads[i], NULL);
+    }
+    apex_proxy_pool_reset();
+
+    printf("edge failover: %s\n", failures ? "failed" : "ok");
+    return failures ? 1 : 0;
+}
+
 int main(void) {
     (void)signal(SIGPIPE, SIG_IGN);
 
@@ -613,6 +695,7 @@ int main(void) {
     int edge_failures = 0;
     edge_failures += run_validation_case();
     edge_failures += run_zero_weight_case();
+    edge_failures += run_failover_case();
     edge_failures += run_edge_case("slow upstream timeout", EDGE_SLOW, 0, 0, 150, APEX_PROXY_ERR_TIMEOUT);
     edge_failures += run_edge_case("trickle deadline", EDGE_TRICKLE, 0, 0, 200, APEX_PROXY_ERR_TIMEOUT);
     edge_failures += run_edge_case("oversized header", EDGE_BIG_HEADER, 512, 0, 0, APEX_PROXY_ERR_TOO_LARGE);
