@@ -570,7 +570,11 @@ static void begin_drain(worker_arg_t *worker) {
         conn_t *connection = &worker->connections[fd];
         if (connection->active) {
             connection->close_after_write = 1;
-            flush_write(worker, connection);
+            if (connection->h2 != NULL) {
+                h2_drain(worker, connection);
+            } else {
+                flush_write(worker, connection);
+            }
         }
     }
 }
@@ -699,7 +703,7 @@ static void *worker_main(void *arg) {
                 continue;
             }
 
-            if ((active_event_flags & EPOLLIN) && !draining) {
+            if ((active_event_flags & EPOLLIN) && (!draining || connection->h2 != NULL)) {
                 if (connection->transport == APEX_TRANSPORT_TLS && connection->tls_phase == APEX_TLS_HANDSHAKE) {
                     if (!tls_handshake_step(worker, connection)) {
                         continue;

@@ -176,7 +176,7 @@ class H2RawClient:
     """
 
     PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-    EMPTY_SETTINGS = struct.pack(">BBI", 0, 4, 0) + b"\x00\x00\x00\x00"
+    EMPTY_SETTINGS = b"\x00\x00\x00\x04\x00\x00\x00\x00\x00"
 
     def __init__(self, port, alpn=("h2",)):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
@@ -184,7 +184,8 @@ class H2RawClient:
         context.verify_mode = ssl.CERT_NONE
         context.set_alpn_protocols(list(alpn))
         self.sock = context.wrap_socket(socket.create_connection(("127.0.0.1", port), timeout=REQUEST_TIMEOUT))
-        self.sock.sendall(self.PREFACE + self.EMPTY_SETTINGS)
+        if self.sock.selected_alpn_protocol() == "h2":
+            self.sock.sendall(self.PREFACE + self.EMPTY_SETTINGS)
 
     def alpn(self):
         return self.sock.selected_alpn_protocol()
@@ -283,7 +284,8 @@ class H2ServingTest(unittest.TestCase):
         result = subprocess.run(
             ["curl", "--silent", "--show-error", "--insecure", "--http2", "--output", "-",
              "--write-out", "\n%{http_version}", "--request", "POST",
-             f"{self.base_url}/echo", "--data-binary", payload.hex()],
+             f"{self.base_url}/echo", "--data-binary", "@-"],
+            input=payload.hex(),
             capture_output=True, text=True, timeout=REQUEST_TIMEOUT,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -292,20 +294,15 @@ class H2ServingTest(unittest.TestCase):
         self.assertTrue(float(version) >= 2.0, f"not HTTP/2: {version}")
 
     def test_http2_parallel_streams_one_connection(self):
-        result = curl(self.base_url, ["--parallel", "--parallel-max", "10",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/",
-                                      "--url", f"{self.base_url}/"])
+        urls = [f"{self.base_url}/"] * 8
+        extra = ["--parallel", "--parallel-max", "10"]
+        for u in urls[1:]:
+            extra.extend(["--url", u])
+        result = curl(urls[0], extra)
         self.assertEqual(result.returncode, 0, result.stderr)
-        bodies = [line for line in result.stdout.splitlines() if line != "2" and line != "2.0"]
-        self.assertEqual(len(bodies), 8, result.stdout)
-        for body in bodies:
-            self.assertEqual(body, "h2-backend")
+        self.assertEqual(result.stdout.count("h2-backend"), 8, result.stdout)
+        versions = [line for line in result.stdout.splitlines() if line in ("2", "2.0")]
+        self.assertEqual(len(versions), 8, result.stdout)
 
     def test_http1_fallback_still_served(self):
         client = H2RawClient(self.listen_port, alpn=("http/1.1",))

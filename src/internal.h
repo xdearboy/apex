@@ -142,5 +142,6 @@ void h2_connection_destroy(conn_t *connection);
 void h2_read(worker_arg_t *worker, conn_t *connection);
 void h2_flush(worker_arg_t *worker, conn_t *connection);
 bool h2_has_pending_output(conn_t *connection);
+void h2_drain(worker_arg_t *worker, conn_t *connection);
 
 #endif /* APEX_INTERNAL_H */

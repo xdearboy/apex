@@ -15,6 +15,7 @@
 #include <nghttp2/nghttp2.h>
 #include <strings.h>
 
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -257,6 +258,10 @@ static int h2_on_begin_headers(nghttp2_session *session, const nghttp2_frame *fr
         return 0;
     }
     h2_conn_t *h2 = user_data;
+    if (h2->owner != NULL && h2->owner->close_after_write) {
+        h2_stream_reset(h2, frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
+        return 0;
+    }
     h2_stream_t *existing = h2_find_stream(h2, frame->hd.stream_id);
     if (existing != NULL) {
         h2_stream_reset(h2, frame->hd.stream_id, NGHTTP2_PROTOCOL_ERROR);
@@ -488,7 +493,9 @@ static void h2_translate_response(h2_conn_t *h2, h2_stream_t *stream) {
         goto malformed;
     }
 
-    if (blob_length > H2_MAX_RESPONSE_BYTES || blob_length < 14u || memcmp(blob, "HTTP/1.1 ", 9u) != 0 ||
+    bool valid_proto =
+        (blob_length >= 14u && (memcmp(blob, "HTTP/1.1 ", 9u) == 0 || memcmp(blob, "HTTP/1.0 ", 9u) == 0));
+    if (blob_length > H2_MAX_RESPONSE_BYTES || !valid_proto ||
         blob[9] < '1' || blob[9] > '5' || blob[10] < '0' || blob[10] > '9' || blob[11] < '0' || blob[11] > '9') {
         goto malformed;
     }
@@ -536,6 +543,9 @@ static void h2_translate_response(h2_conn_t *h2, h2_stream_t *stream) {
             value_length--;
         }
         if (!h2_drop_h1_header(cursor, name_length)) {
+            for (size_t i = 0; i < name_length; i++) {
+                ((char *)cursor)[i] = (char)tolower((unsigned char)cursor[i]);
+            }
             nva[nva_count++] = (nghttp2_nv){.name = (uint8_t *)cursor, .value = (uint8_t *)value,
                                             .namelen = name_length, .valuelen = value_length,
                                             .flags = NGHTTP2_NV_FLAG_NONE};
@@ -582,7 +592,7 @@ static void h2_dispatch_stream(h2_conn_t *h2, h2_stream_t *stream) {
         return;
     }
 
-    size_t capacity = stream->method_length + stream->path_length + stream->authority_length + 64u;
+    size_t capacity = stream->method_length + stream->path_length + stream->authority_length + 256u;
     for (size_t index = 0; index < stream->header_count; index++) {
         h2_header_t *header = &stream->headers[index];
         if (h2_drop_h1_header(header->name, header->name_length) ||
@@ -681,6 +691,10 @@ static int h2_on_stream_close(nghttp2_session *session, int32_t stream_id, uint3
     h2_conn_t *h2 = user_data;
     h2_stream_t *stream = h2_stream_take(h2, stream_id);
     h2_stream_free(stream);
+    if (h2->owner != NULL && h2->owner->close_after_write && h2->streams == NULL &&
+        !nghttp2_session_want_write(h2->session)) {
+        apex_close_connection(h2->worker, h2->owner);
+    }
     return 0;
 }
 
@@ -823,19 +837,35 @@ void h2_flush(worker_arg_t *worker, conn_t *connection) {
     }
     if (nghttp2_session_want_write(h2->session)) {
         apex_arm_connection_output(worker, connection);
-    } else if (connection->epollout_active) {
-        struct epoll_event event_config;
-        event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-        event_config.data.fd = connection->fd;
-        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
-            perror("apex: epoll_ctl disarm h2 output");
+    } else {
+        if (connection->epollout_active) {
+            struct epoll_event event_config;
+            event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+            event_config.data.fd = connection->fd;
+            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+                perror("apex: epoll_ctl disarm h2 output");
+                apex_close_connection(worker, connection);
+                return;
+            }
+            connection->epollout_active = 0;
+        }
+        if (connection->close_after_write && h2->streams == NULL) {
             apex_close_connection(worker, connection);
             return;
         }
-        connection->epollout_active = 0;
     }
 }
 
 bool h2_has_pending_output(conn_t *connection) {
     return connection->h2 != NULL && nghttp2_session_want_write(connection->h2->session);
+}
+
+void h2_drain(worker_arg_t *worker, conn_t *connection) {
+    h2_conn_t *h2 = connection->h2;
+    if (h2 == NULL || connection->fd < 0) {
+        return;
+    }
+    int32_t last_stream_id = nghttp2_session_get_last_proc_stream_id(h2->session);
+    nghttp2_submit_goaway(h2->session, NGHTTP2_FLAG_NONE, last_stream_id, NGHTTP2_NO_ERROR, NULL, 0);
+    h2_flush(worker, connection);
 }
