@@ -11,6 +11,7 @@ is pinned to at most two CPUs when the platform allows it.
 """
 
 import http.server
+import json
 import os
 import shutil
 import signal
@@ -56,12 +57,24 @@ class Client:
     def __init__(self, port, host="127.0.0.1"):
         self.sock = socket.create_connection((host, port), timeout=REQUEST_TIMEOUT)
 
-    def request(self, path="/", host_header="localhost"):
-        request_line = f"GET {path} HTTP/1.1\r\nHost: {host_header}\r\nConnection: keep-alive\r\n\r\n"
-        self.sock.sendall(request_line.encode())
-        return self.read_response()
+    def request(self, path="/", host_header="localhost", headers=None):
+        status, _, body = self.request_full(path=path, host_header=host_header, headers=headers)
+        return status, body
+
+    def request_full(self, path="/", host_header="localhost", headers=None):
+        lines = [f"GET {path} HTTP/1.1", f"Host: {host_header}", "Connection: keep-alive"]
+        if headers:
+            for k, v in headers.items():
+                lines.append(f"{k}: {v}")
+        payload = "\r\n".join(lines) + "\r\n\r\n"
+        self.sock.sendall(payload.encode())
+        return self.read_response_full()
 
     def read_response(self):
+        status, _, body = self.read_response_full()
+        return status, body
+
+    def read_response_full(self):
         data = b""
         while b"\r\n\r\n" not in data:
             chunk = self.sock.recv(4096)
@@ -69,19 +82,21 @@ class Client:
                 raise ConnectionError("connection closed before response headers")
             data += chunk
         head, _, rest = data.partition(b"\r\n\r\n")
-        headers = head.decode("latin-1")
-        status = int(headers.split("\r\n", 1)[0].split()[1])
-        length = 0
-        for line in headers.split("\r\n")[1:]:
+        header_text = head.decode("latin-1")
+        status = int(header_text.split("\r\n", 1)[0].split()[1])
+        headers = {}
+        for line in header_text.split("\r\n")[1:]:
+            if not line:
+                continue
             name, _, value = line.partition(":")
-            if name.strip().lower() == "content-length":
-                length = int(value.strip())
+            headers[name.strip().lower()] = value.strip()
+        length = int(headers.get("content-length", 0))
         while len(rest) < length:
             chunk = self.sock.recv(4096)
             if not chunk:
                 raise ConnectionError("connection closed before response body")
             rest += chunk
-        return status, rest[:length]
+        return status, headers, rest[:length]
 
     def closed_by_peer(self, probe_seconds=STOP_TIMEOUT):
         """Return True when the peer closes while this process stays alive."""
@@ -609,9 +624,161 @@ class SignalTest(unittest.TestCase):
         self.assertEqual(self.server.wait_exit(timeout=STOP_TIMEOUT), 0)
 
 
+class ErrorPageTest(unittest.TestCase):
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="apex-err-")
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+        self.listen_port = free_port()
+        self.dead_port = free_port()
+
+    def test_default_404_razor_wing_html(self):
+        config_text = f"""http {{
+    upstream edge {{ server 127.0.0.1:{self.dead_port}; }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/api/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/unmatched-path")
+        self.assertEqual(status, 404)
+        self.assertIn("text/html", headers.get("content-type", ""))
+        text = body.decode("utf-8")
+        self.assertIn("<title>apex — 404</title>", text)
+        self.assertIn("not found", text)
+        self.assertIn("this page could not be found.", text)
+        self.assertIn("M4 8C14 8 26 14 28 26C20 22 14 18 10 14L4 8Z", text)
+
+    def test_default_502_razor_wing_html_and_no_ip_leak(self):
+        config_text = f"""http {{
+    upstream edge {{ server 127.0.0.1:{self.dead_port}; }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/")
+        self.assertEqual(status, 502)
+        self.assertIn("text/html", headers.get("content-type", ""))
+        text = body.decode("utf-8")
+        self.assertIn("<title>apex — 502</title>", text)
+        self.assertIn("bad gateway", text)
+        self.assertIn("temporarily unreachable. try again in a moment.", text)
+        self.assertIn("M4 8C14 8 26 14 28 26C20 22 14 18 10 14L4 8Z", text)
+        # Verify strict anti-leak: never expose internal upstream IP or port
+        self.assertNotIn(f":{self.dead_port}", text)
+        self.assertNotIn("127.0.0.1", text)
+
+    def test_json_error_negotiation(self):
+        config_text = f"""http {{
+    upstream edge {{ server 127.0.0.1:{self.dead_port}; }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/", headers={"Accept": "application/json"})
+        self.assertEqual(status, 502)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["error"], 502)
+        self.assertEqual(payload["status"], "bad gateway")
+        self.assertEqual(payload["message"], "temporarily unreachable. try again in a moment.")
+
+    def test_custom_error_page_served(self):
+        custom_file = os.path.join(self.workdir, "custom_502.html")
+        with open(custom_file, "w") as f:
+            f.write("<!DOCTYPE html><html><body>custom brand error 502</body></html>")
+
+        config_text = f"""http {{
+    upstream edge {{ server 127.0.0.1:{self.dead_port}; }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        error_page 502 "{custom_file}";
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/")
+        self.assertEqual(status, 502)
+        self.assertIn("text/html", headers.get("content-type", ""))
+        self.assertEqual(body.decode("utf-8"), "<!DOCTYPE html><html><body>custom brand error 502</body></html>")
+
+    def test_custom_error_page_fallback_when_file_missing(self):
+        missing_file = os.path.join(self.workdir, "nonexistent.html")
+        config_text = f"""http {{
+    upstream edge {{ server 127.0.0.1:{self.dead_port}; }}
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        error_page 502 "{missing_file}";
+        location "/" {{
+            proxy_pass edge;
+        }}
+    }}
+}}
+"""
+        config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        server = ApexServer(config, self.workdir)
+        self.addCleanup(server.stop)
+        server.wait_ready(self.listen_port)
+
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/")
+        self.assertEqual(status, 502)
+        self.assertIn("text/html", headers.get("content-type", ""))
+        text = body.decode("utf-8")
+        self.assertIn("<title>apex — 502</title>", text)
+        self.assertIn("bad gateway", text)
+
+
 def main():
     unittest.main(argv=[sys.argv[0]], verbosity=2)
 
 
 if __name__ == "__main__":
     main()
+

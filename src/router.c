@@ -1,7 +1,10 @@
 #include "internal.h"
 
+#include <ctype.h>
 #include <strings.h>
 #include <sys/stat.h>
+
+static const char *router_determine_content_type(const char *path);
 
 
 typedef struct {
@@ -181,31 +184,264 @@ static bool build_request_headers(const char *request, size_t request_length,
     return true;
 }
 
-static void router_send_error(conn_t *connection, int status, const char *reason, const char *message) {
+static const char APEX_ERROR_HTML_TEMPLATE[] =
+    "<!DOCTYPE html>\n"
+    "<html lang=\"en\">\n"
+    "<head>\n"
+    "  <meta charset=\"utf-8\">\n"
+    "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+    "  <title>apex — %d</title>\n"
+    "  <style>\n"
+    "    * { box-sizing: border-box; margin: 0; padding: 0; }\n"
+    "    body {\n"
+    "      background: #000000;\n"
+    "      color: #ededed;\n"
+    "      font-family: -apple-system, BlinkMacSystemFont, \"SF Pro Text\", \"Inter\", \"Segoe UI\", sans-serif;\n"
+    "      -webkit-font-smoothing: antialiased;\n"
+    "      min-height: 100vh;\n"
+    "      display: flex;\n"
+    "      flex-direction: column;\n"
+    "      align-items: center;\n"
+    "      justify-content: center;\n"
+    "      text-align: center;\n"
+    "      text-transform: lowercase;\n"
+    "      user-select: none;\n"
+    "      padding: 24px;\n"
+    "    }\n"
+    "    .container { max-width: 440px; }\n"
+    "    .brand-mark {\n"
+    "      font-family: ui-monospace, \"SF Mono\", Menlo, monospace;\n"
+    "      font-size: 14px;\n"
+    "      color: #555555;\n"
+    "      letter-spacing: 0.08em;\n"
+    "      margin-bottom: 24px;\n"
+    "      display: flex;\n"
+    "      align-items: center;\n"
+    "      justify-content: center;\n"
+    "      gap: 9px;\n"
+    "    }\n"
+    "    .brand-mark svg { width: 17px; height: 17px; fill: currentColor; }\n"
+    "    .code {\n"
+    "      font-size: 80px;\n"
+    "      font-weight: 200;\n"
+    "      letter-spacing: -0.06em;\n"
+    "      line-height: 1;\n"
+    "      color: #ffffff;\n"
+    "      margin-bottom: 16px;\n"
+    "    }\n"
+    "    .title {\n"
+    "      font-size: 19px;\n"
+    "      font-weight: 400;\n"
+    "      color: #cccccc;\n"
+    "      letter-spacing: -0.02em;\n"
+    "      margin-bottom: 10px;\n"
+    "    }\n"
+    "    .desc {\n"
+    "      font-size: 14px;\n"
+    "      font-weight: 400;\n"
+    "      color: #555555;\n"
+    "      line-height: 1.5;\n"
+    "      letter-spacing: -0.01em;\n"
+    "    }\n"
+    "  </style>\n"
+    "</head>\n"
+    "<body>\n"
+    "  <div class=\"container\">\n"
+    "    <div class=\"brand-mark\">\n"
+    "      <svg viewBox=\"0 0 32 32\"><path d=\"M4 8C14 8 26 14 28 26C20 22 14 18 10 14L4 8Z\" fill=\"currentColor\"/><path d=\"M12 20C17 21 21 23 24 26\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" fill=\"none\"/></svg>\n"
+    "      apex\n"
+    "    </div>\n"
+    "    <div class=\"code\">%d</div>\n"
+    "    <div class=\"title\">%s</div>\n"
+    "    <div class=\"desc\">%s</div>\n"
+    "  </div>\n"
+    "</body>\n"
+    "</html>\n";
+
+static void router_error_details(int status, const char *default_reason,
+                                 const char **title_out, const char **desc_out) {
+    switch (status) {
+    case 400:
+        *title_out = "bad request";
+        *desc_out = "the request could not be understood by the server.";
+        break;
+    case 403:
+        *title_out = "forbidden";
+        *desc_out = "you don't have permission to access this resource.";
+        break;
+    case 404:
+        *title_out = "not found";
+        *desc_out = "this page could not be found.";
+        break;
+    case 405:
+        *title_out = "method not allowed";
+        *desc_out = "the request method is not supported for this route.";
+        break;
+    case 414:
+        *title_out = "uri too long";
+        *desc_out = "the request uri exceeds the maximum supported length.";
+        break;
+    case 500:
+        *title_out = "internal error";
+        *desc_out = "something went wrong on our end.";
+        break;
+    case 502:
+        *title_out = "bad gateway";
+        *desc_out = "temporarily unreachable. try again in a moment.";
+        break;
+    case 503:
+        *title_out = "service unavailable";
+        *desc_out = "the server is temporarily overloaded or down for maintenance.";
+        break;
+    case 504:
+        *title_out = "gateway timeout";
+        *desc_out = "the server took too long to respond.";
+        break;
+    default:
+        *title_out = default_reason;
+        *desc_out = "an unexpected error occurred.";
+        break;
+    }
+}
+
+static void router_send_error(conn_t *connection, const apex_server_config_t *server,
+                              const char *request, size_t request_length,
+                              int status, const char *reason, const char *message) {
     if (connection == NULL || connection->fd < 0) {
         return;
     }
 
-    size_t message_length = strlen(message);
+    /* 1. Custom error_page if configured */
+    if (server != NULL && server->error_pages != NULL) {
+        for (size_t i = 0; i < server->error_page_count; i++) {
+            if (server->error_pages[i].status_code == status) {
+                const char *path = server->error_pages[i].path;
+                int file_fd = open(path, O_RDONLY | O_CLOEXEC);
+                if (file_fd >= 0) {
+                    struct stat st;
+                    if (fstat(file_fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
+                        st.st_size <= 2u * 1024u * 1024u) {
+                        size_t file_size = (size_t)st.st_size;
+                        char *file_buf = malloc(file_size);
+                        if (file_buf != NULL) {
+                            ssize_t n = read(file_fd, file_buf, file_size);
+                            close(file_fd);
+                            if (n == (ssize_t)file_size) {
+                                const char *content_type = router_determine_content_type(path);
+                                char header[512];
+                                int written = snprintf(header, sizeof(header),
+                                                       "HTTP/1.1 %d %s\r\n"
+                                                       "Server: apex\r\n"
+                                                       "Content-Type: %s\r\n"
+                                                       "Content-Length: %zu\r\n"
+                                                       "Connection: %s\r\n"
+                                                       "\r\n",
+                                                       status, reason, content_type, file_size,
+                                                       connection->close_after_write ? "close" : "keep-alive");
+                                if (written > 0 && (size_t)written < sizeof(header)) {
+                                    apex_conn_write(connection, header, (size_t)written);
+                                    apex_conn_write(connection, file_buf, file_size);
+                                    free(file_buf);
+                                    return;
+                                }
+                            }
+                            free(file_buf);
+                        } else {
+                            close(file_fd);
+                        }
+                    } else {
+                        close(file_fd);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    const char *title = NULL;
+    const char *desc = NULL;
+    router_error_details(status, reason, &title, &desc);
+
+    /* 2. Check for Accept: application/json */
+    const char *accept_val = NULL;
+    size_t accept_len = 0;
+    bool client_wants_json = false;
+    if (request != NULL && request_length > 0) {
+        if (router_find_header(request, request_length, "Accept", &accept_val, &accept_len)) {
+            if (accept_val != NULL && memmem(accept_val, accept_len, "application/json", 16) != NULL) {
+                client_wants_json = true;
+            }
+        }
+    }
+
+    if (client_wants_json) {
+        char json_body[256];
+        int body_len = snprintf(json_body, sizeof(json_body),
+                                "{\"error\":%d,\"status\":\"%s\",\"message\":\"%s\"}\n",
+                                status, title, desc);
+        if (body_len > 0) {
+            char header[512];
+            int written = snprintf(header, sizeof(header),
+                                   "HTTP/1.1 %d %s\r\n"
+                                   "Server: apex\r\n"
+                                   "Content-Type: application/json\r\n"
+                                   "Content-Length: %d\r\n"
+                                   "Connection: %s\r\n"
+                                   "\r\n",
+                                   status, reason, body_len,
+                                   connection->close_after_write ? "close" : "keep-alive");
+            if (written > 0 && (size_t)written < sizeof(header)) {
+                apex_conn_write(connection, header, (size_t)written);
+                apex_conn_write(connection, json_body, (size_t)body_len);
+                return;
+            }
+        }
+    }
+
+    /* 3. Built-in Razor Wing HTML template */
+    char html_body[2048];
+    int body_written = snprintf(html_body, sizeof(html_body), APEX_ERROR_HTML_TEMPLATE,
+                                status, status, title, desc);
+    if (body_written <= 0 || (size_t)body_written >= sizeof(html_body)) {
+        size_t message_length = strlen(message);
+        char header[256];
+        int written = snprintf(header, sizeof(header),
+                               "HTTP/1.1 %d %s\r\n"
+                               "Server: apex\r\n"
+                               "Content-Type: text/plain\r\n"
+                               "Content-Length: %zu\r\n"
+                               "Connection: %s\r\n"
+                               "\r\n",
+                               status, reason, message_length,
+                               connection->close_after_write ? "close" : "keep-alive");
+        if (written > 0 && (size_t)written < sizeof(header)) {
+            apex_conn_write(connection, header, (size_t)written);
+            apex_conn_write(connection, message, message_length);
+        }
+        return;
+    }
+
     char header[512];
     int written = snprintf(header, sizeof(header),
                            "HTTP/1.1 %d %s\r\n"
                            "Server: apex\r\n"
-                           "Content-Type: text/plain\r\n"
-                           "Content-Length: %zu\r\n"
+                           "Content-Type: text/html; charset=utf-8\r\n"
+                           "Content-Length: %d\r\n"
                            "Connection: %s\r\n"
                            "\r\n",
-                           status, reason, message_length,
+                           status, reason, body_written,
                            connection->close_after_write ? "close" : "keep-alive");
     if (written < 0 || (size_t)written >= sizeof(header)) {
         connection->close_after_write = 1;
         return;
     }
     apex_conn_write(connection, header, (size_t)written);
-    apex_conn_write(connection, message, message_length);
+    apex_conn_write(connection, html_body, (size_t)body_written);
 }
 
-static void router_write_proxy_response(conn_t *connection, const apex_proxy_response_t *response,
+static void router_write_proxy_response(conn_t *connection, const apex_server_config_t *server,
+                                        const char *request, size_t request_length,
+                                        const apex_proxy_response_t *response,
                                         bool head_request) {
     const char *headers = response->headers;
     size_t headers_length = response->headers_len;
@@ -213,7 +449,7 @@ static void router_write_proxy_response(conn_t *connection, const apex_proxy_res
 
     const char *status_end = router_find_crlf(headers, headers_length);
     if (status_end == NULL) {
-        router_send_error(connection, 502, "Bad Gateway", "upstream returned an invalid response\n");
+        router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "upstream returned an invalid response\n");
         return;
     }
 
@@ -287,27 +523,28 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
                                    const char *method, size_t method_length, const char *target,
                                    size_t target_length, const char *body, size_t body_length, apex_res_t *res) {
     conn_t *connection = res->conn;
+    const apex_server_config_t *server = route ? route->server : NULL;
     if (route->group == NULL) {
-        router_send_error(connection, 502, "Bad Gateway", "no upstream group for location\n");
+        router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "no upstream group for location\n");
         return;
     }
 
     char method_text[16];
     if (method_length == 0 || method_length >= sizeof(method_text)) {
-        router_send_error(connection, 400, "Bad Request", "invalid request method\n");
+        router_send_error(connection, server, request, request_length, 400, "Bad Request", "invalid request method\n");
         return;
     }
     memcpy(method_text, method, method_length);
     method_text[method_length] = '\0';
 
     if (target_length == 0 || target_length > APEX_PROXY_MAX_REQUEST_BYTES) {
-        router_send_error(connection, 400, "Bad Request", "invalid request target\n");
+        router_send_error(connection, server, request, request_length, 400, "Bad Request", "invalid request target\n");
         return;
     }
 
     char *target_text = malloc(target_length + 1u);
     if (target_text == NULL) {
-        router_send_error(connection, 500, "Internal Server Error", "out of memory\n");
+        router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
         return;
     }
     memcpy(target_text, target, target_length);
@@ -320,7 +557,7 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
     if (router_find_header(request, request_length, "Host", &host_value, &host_length)) {
         if (host_length >= sizeof(host)) {
             free(target_text);
-            router_send_error(connection, 400, "Bad Request", "host header is too long\n");
+            router_send_error(connection, server, request, request_length, 400, "Bad Request", "host header is too long\n");
             return;
         }
         memcpy(host, host_value, host_length);
@@ -331,7 +568,7 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
     size_t headers_length = 0;
     if (!build_request_headers(request, request_length, route->location, &headers, &headers_length)) {
         free(target_text);
-        router_send_error(connection, 500, "Internal Server Error", "out of memory\n");
+        router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
         return;
     }
 
@@ -357,11 +594,12 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
         const char *reason = status == 504 ? "Gateway Timeout" : "Bad Gateway";
         char message[160];
         snprintf(message, sizeof(message), "upstream error: %s\n", apex_proxy_strerror(result));
-        router_send_error(connection, status, reason, message);
+        router_send_error(connection, server, request, request_length, status, reason, message);
         return;
     }
 
-    router_write_proxy_response(connection, &proxy_response, strcasecmp(method_text, "HEAD") == 0);
+    router_write_proxy_response(connection, server, request, request_length, &proxy_response,
+                                strcasecmp(method_text, "HEAD") == 0);
     apex_proxy_response_free(&proxy_response);
 }
 
@@ -618,11 +856,12 @@ static const char *router_determine_content_type(const char *path) {
     return "application/octet-stream";
 }
 
-static void router_serve_static(const apex_location_config_t *location, const char *path, size_t path_len,
+static void router_serve_static(const apex_server_config_t *server, const char *request, size_t request_length,
+                                const apex_location_config_t *location, const char *path, size_t path_len,
                                 bool head_request, apex_res_t *res) {
     conn_t *connection = res->conn;
     if (location == NULL || location->root == NULL || path == NULL) {
-        router_send_error(connection, 404, "Not Found", "Not Found\n");
+        router_send_error(connection, server, request, request_length, 404, "Not Found", "Not Found\n");
         return;
     }
 
@@ -630,7 +869,7 @@ static void router_serve_static(const apex_location_config_t *location, const ch
     for (size_t i = 0; i + 1 < path_len; i++) {
         if (path[i] == '.' && path[i + 1] == '.') {
             if (i + 2 == path_len || path[i + 2] == '/' || i == 0 || path[i - 1] == '/') {
-                router_send_error(connection, 403, "Forbidden", "Forbidden\n");
+                router_send_error(connection, server, request, request_length, 403, "Forbidden", "Forbidden\n");
                 return;
             }
         }
@@ -663,13 +902,13 @@ static void router_serve_static(const apex_location_config_t *location, const ch
     }
 
     if (written < 0 || (size_t)written >= sizeof(file_path)) {
-        router_send_error(connection, 414, "URI Too Long", "URI Too Long\n");
+        router_send_error(connection, server, request, request_length, 414, "URI Too Long", "URI Too Long\n");
         return;
     }
 
     struct stat file_stat;
     if (stat(file_path, &file_stat) < 0) {
-        router_send_error(connection, 404, "Not Found", "File Not Found\n");
+        router_send_error(connection, server, request, request_length, 404, "Not Found", "File Not Found\n");
         return;
     }
 
@@ -682,18 +921,18 @@ static void router_serve_static(const apex_location_config_t *location, const ch
                 strcat(file_path, "index.html");
             }
             if (stat(file_path, &file_stat) < 0 || S_ISDIR(file_stat.st_mode)) {
-                router_send_error(connection, 404, "Not Found", "Directory index not found\n");
+                router_send_error(connection, server, request, request_length, 404, "Not Found", "Directory index not found\n");
                 return;
             }
         } else {
-            router_send_error(connection, 404, "Not Found", "Not Found\n");
+            router_send_error(connection, server, request, request_length, 404, "Not Found", "Not Found\n");
             return;
         }
     }
 
     int file_fd = open(file_path, O_RDONLY | O_CLOEXEC);
     if (file_fd < 0) {
-        router_send_error(connection, 403, "Forbidden", "Permission Denied\n");
+        router_send_error(connection, server, request, request_length, 403, "Forbidden", "Permission Denied\n");
         return;
     }
 
@@ -703,7 +942,7 @@ static void router_serve_static(const apex_location_config_t *location, const ch
         file_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
         if (file_data == MAP_FAILED) {
             close(file_fd);
-            router_send_error(connection, 500, "Internal Server Error", "mmap failed\n");
+            router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "mmap failed\n");
             return;
         }
     }
@@ -880,10 +1119,17 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             }
             if (route.location->root != NULL) {
                 bool head_request = method_len == 4 && memcmp(req_buf, "HEAD", 4) == 0;
-                router_serve_static(route.location, path, match_path_length, head_request, res);
+                router_serve_static(route.server, req_buf, header_len, route.location, path, match_path_length,
+                                    head_request, res);
                 return;
             }
         }
+    }
+
+    if (runtime != NULL && runtime->config != NULL && runtime->config->server_count > 0) {
+        router_send_error(res->conn, &runtime->config->servers[0], req_buf, header_len, 404, "Not Found",
+                          "Not Found\n");
+        return;
     }
 
     apex_res_send(res, 404, NULL, 0);

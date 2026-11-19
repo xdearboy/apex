@@ -1287,6 +1287,46 @@ static bool server_add_name(parser_t *parser, apex_server_config_t *server, cons
     return true;
 }
 
+static bool server_add_error_page(parser_t *parser, apex_server_config_t *server, int status_code,
+                                  const token_t *path) {
+    if (server->error_page_count >= 32u) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "server declares too many error pages");
+        return false;
+    }
+
+    if (server->error_page_count == server->error_page_capacity) {
+        size_t capacity = server->error_page_capacity ? server->error_page_capacity * 2u : 4u;
+        apex_error_page_config_t *grown = realloc(server->error_pages, capacity * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        server->error_pages = grown;
+        server->error_page_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(path->text, path->length);
+    if (copy == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+
+    for (size_t index = 0; index < server->error_page_count; index++) {
+        if (server->error_pages[index].status_code == status_code) {
+            free(server->error_pages[index].path);
+            server->error_pages[index].path = copy;
+            server->error_pages[index].line = path->line;
+            return true;
+        }
+    }
+
+    apex_error_page_config_t *entry = &server->error_pages[server->error_page_count++];
+    entry->status_code = status_code;
+    entry->path = copy;
+    entry->line = path->line;
+    return true;
+}
+
 static apex_location_config_t *server_add_location(parser_t *parser, apex_server_config_t *server,
                                                     const token_t *begin) {
     if (server->location_count >= APEX_CONFIG_MAX_LOCATIONS) {
@@ -1796,9 +1836,40 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
             continue;
+        } else if (token_is_word(directive, "error_page")) {
+            int codes[16];
+            size_t code_count = 0;
+            while (parser_peek(parser)->kind == TOKEN_WORD &&
+                   isdigit((unsigned char)parser_peek(parser)->text[0])) {
+                const token_t *code_token = parser_scalar(parser, "an HTTP status code");
+                if (code_token == NULL) {
+                    return false;
+                }
+                uint64_t code_val = 0;
+                if (!token_to_u64(code_token, 300, 599, &code_val)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, code_token, "invalid HTTP error status code");
+                    return false;
+                }
+                if (code_count < sizeof(codes) / sizeof(codes[0])) {
+                    codes[code_count++] = (int)code_val;
+                }
+            }
+            if (code_count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "error_page requires at least one status code");
+                return false;
+            }
+            const token_t *path_token = parser_scalar(parser, "a file path for error_page");
+            if (path_token == NULL) {
+                return false;
+            }
+            for (size_t c = 0; c < code_count; c++) {
+                if (!server_add_error_page(parser, server, codes[c], path_token)) {
+                    return false;
+                }
+            }
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location");
+            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page");
             return false;
         }
 
@@ -2430,6 +2501,11 @@ void apex_config_free(apex_config_t *config) {
             free(location->headers);
         }
         free(server->locations);
+
+        for (size_t ep_index = 0; ep_index < server->error_page_count; ep_index++) {
+            free(server->error_pages[ep_index].path);
+        }
+        free(server->error_pages);
     }
     free(config->servers);
 

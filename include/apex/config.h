@@ -120,6 +120,12 @@ typedef struct {
 } apex_tls_config_t;
 
 typedef struct {
+    int status_code;
+    char *path;
+    int line;
+} apex_error_page_config_t;
+
+typedef struct {
     char listen_host[APEX_CONFIG_HOST_MAX];
     uint16_t listen_port;
     bool listen_tls;
@@ -130,6 +136,9 @@ typedef struct {
     apex_location_config_t *locations;
     size_t location_count;
     size_t location_capacity;
+    apex_error_page_config_t *error_pages;
+    size_t error_page_count;
+    size_t error_page_capacity;
     int line;
 } apex_server_config_t;
 
