@@ -3,6 +3,7 @@
 #endif
 
 #include "apex/config.h"
+#include "apex/module.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -1144,6 +1145,8 @@ static const char *const reserved_words[] = {
     "keepalive",  "connect_timeout", "read_timeout", "idle_timeout", "certificate",  "private_key",
     "protocols",  "ciphers",       "client_auth",    "proxy_pass",   "proxy_set_header",
     "proxy_connect_timeout", "proxy_read_timeout", "proxy_http_version", "round_robin", "p2c",
+    "index",      "try_files",     "sendfile",       "etag",         "precompressed", "gzip_static",
+    "brotli_static",
     "on",         "off",           "optional",       "required",
 };
 
@@ -1599,6 +1602,44 @@ static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *lo
     return true;
 }
 
+static bool location_add_index(parser_t *parser, apex_location_config_t *location, const token_t *value) {
+    char *copy = config_strdup_range(value->text, value->length);
+    if (copy == NULL) {
+        return config_oom(parser->error);
+    }
+    if (location->index_count >= location->index_capacity) {
+        size_t capacity = location->index_capacity ? location->index_capacity * 2u : 4u;
+        char **grown = realloc(location->indices, capacity * sizeof(char *));
+        if (grown == NULL) {
+            free(copy);
+            return config_oom(parser->error);
+        }
+        location->indices = grown;
+        location->index_capacity = capacity;
+    }
+    location->indices[location->index_count++] = copy;
+    return true;
+}
+
+static bool location_add_try_file(parser_t *parser, apex_location_config_t *location, const token_t *value) {
+    char *copy = config_strdup_range(value->text, value->length);
+    if (copy == NULL) {
+        return config_oom(parser->error);
+    }
+    if (location->try_files_count >= location->try_files_capacity) {
+        size_t capacity = location->try_files_capacity ? location->try_files_capacity * 2u : 4u;
+        char **grown = realloc(location->try_files, capacity * sizeof(char *));
+        if (grown == NULL) {
+            free(copy);
+            return config_oom(parser->error);
+        }
+        location->try_files = grown;
+        location->try_files_capacity = capacity;
+    }
+    location->try_files[location->try_files_count++] = copy;
+    return true;
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -1638,6 +1679,9 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
         return config_oom(parser->error);
     }
     location->exact = exact;
+    location->sendfile = true;
+    location->etag = true;
+    location->precompressed = true;
 
     if (!parser_expect_lbrace(parser)) {
         return false;
@@ -1673,6 +1717,60 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             location->root = config_strdup_range(value->text, value->length);
             if (location->root == NULL) {
                 return config_oom(parser->error);
+            }
+        } else if (token_is_word(directive, "index")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *value = parser_scalar(parser, "an index filename");
+                if (value == NULL || !location_add_index(parser, location, value)) {
+                    return false;
+                }
+            }
+        } else if (token_is_word(directive, "try_files")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *value = parser_scalar(parser, "a try_files pattern");
+                if (value == NULL || !location_add_try_file(parser, location, value)) {
+                    return false;
+                }
+            }
+        } else if (token_is_word(directive, "sendfile")) {
+            const token_t *value = parser_scalar(parser, "on or off");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "on")) {
+                location->sendfile = true;
+            } else if (token_is_word(value, "off")) {
+                location->sendfile = false;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "sendfile must be 'on' or 'off'");
+                return false;
+            }
+        } else if (token_is_word(directive, "etag")) {
+            const token_t *value = parser_scalar(parser, "on or off");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "on")) {
+                location->etag = true;
+            } else if (token_is_word(value, "off")) {
+                location->etag = false;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "etag must be 'on' or 'off'");
+                return false;
+            }
+        } else if (token_is_word(directive, "precompressed") || token_is_word(directive, "gzip_static") ||
+                   token_is_word(directive, "brotli_static")) {
+            const token_t *value = parser_scalar(parser, "on or off");
+            if (value == NULL) {
+                return false;
+            }
+            if (token_is_word(value, "on")) {
+                location->precompressed = true;
+            } else if (token_is_word(value, "off")) {
+                location->precompressed = false;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "precompressed must be 'on' or 'off'");
+                return false;
             }
         } else if (token_is_word(directive, "proxy_set_header")) {
             const token_t *name = parser_scalar(parser, "a header name");
@@ -1714,7 +1812,7 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
-            parser_hint(parser, "location accepts proxy_pass, root, proxy_set_header, proxy_*_timeout, "
+            parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
                                 "proxy_http_version");
             return false;
         }
@@ -2645,6 +2743,14 @@ void apex_config_free(apex_config_t *config) {
             free(location->upstream_name);
             free(location->endpoint_host);
             free(location->root);
+            for (size_t idx = 0; idx < location->index_count; idx++) {
+                free(location->indices[idx]);
+            }
+            free(location->indices);
+            for (size_t tf = 0; tf < location->try_files_count; tf++) {
+                free(location->try_files[tf]);
+            }
+            free(location->try_files);
             for (size_t header_index = 0; header_index < location->header_count; header_index++) {
                 free(location->headers[header_index].name);
                 free(location->headers[header_index].value);
@@ -2838,6 +2944,11 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         }
     }
 
+    if (apex_module_registry_init(runtime, config, error) != 0) {
+        apex_runtime_destroy(runtime);
+        return NULL;
+    }
+
     apex_health_prober_start(runtime->groups, runtime->group_count);
     return runtime;
 }
@@ -2847,6 +2958,7 @@ void apex_runtime_destroy(apex_runtime_t *runtime) {
         return;
     }
     apex_health_prober_stop();
+    apex_module_registry_destroy(runtime);
     free(runtime->groups);
     free(runtime->endpoint_groups);
     free(runtime);

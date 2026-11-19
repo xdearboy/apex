@@ -304,9 +304,9 @@ static void router_error_details(int status, const char *default_reason,
     }
 }
 
-static void router_send_error(conn_t *connection, const apex_server_config_t *server,
-                              const char *request, size_t request_length,
-                              int status, const char *reason, const char *message) {
+void router_send_error(conn_t *connection, const apex_server_config_t *server,
+                       const char *request, size_t request_length,
+                       int status, const char *reason, const char *message) {
     if (connection == NULL || connection->fd < 0) {
         return;
     }
@@ -442,7 +442,8 @@ static void router_send_error(conn_t *connection, const apex_server_config_t *se
 static void router_write_proxy_response(conn_t *connection, const apex_server_config_t *server,
                                         const char *request, size_t request_length,
                                         const apex_proxy_response_t *response,
-                                        bool head_request) {
+                                        bool head_request,
+                                        const char *extra_headers, size_t extra_headers_len) {
     const char *headers = response->headers;
     size_t headers_length = response->headers_len;
     int status = response->status;
@@ -512,6 +513,9 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
     const char *connection_header = connection->close_after_write ? "Connection: close\r\n"
                                                                   : "Connection: keep-alive\r\n";
     apex_conn_write(connection, connection_header, strlen(connection_header));
+    if (extra_headers != NULL && extra_headers_len > 0) {
+        apex_conn_write(connection, extra_headers, extra_headers_len);
+    }
     apex_conn_write(connection, "\r\n", 2u);
 
     if (!head_request && !no_body && response->body != NULL && response->body_len > 0) {
@@ -521,7 +525,8 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
 
 static void router_forward_request(apex_config_route_t *route, const char *request, size_t request_length,
                                    const char *method, size_t method_length, const char *target,
-                                   size_t target_length, const char *body, size_t body_length, apex_res_t *res) {
+                                   size_t target_length, const char *body, size_t body_length, apex_res_t *res,
+                                   const char *extra_headers, size_t extra_headers_len) {
     conn_t *connection = res->conn;
     const apex_server_config_t *server = route ? route->server : NULL;
     if (route->group == NULL) {
@@ -599,7 +604,7 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
     }
 
     router_write_proxy_response(connection, server, request, request_length, &proxy_response,
-                                strcasecmp(method_text, "HEAD") == 0);
+                                strcasecmp(method_text, "HEAD") == 0, extra_headers, extra_headers_len);
     apex_proxy_response_free(&proxy_response);
 }
 
@@ -819,157 +824,7 @@ void apex_res_header(apex_res_t *res, const char *key, const char *value) {
 }
 
 static const char *router_determine_content_type(const char *path) {
-    const char *dot = strrchr(path, '.');
-    if (dot == NULL) {
-        return "application/octet-stream";
-    }
-    if (strcasecmp(dot, ".html") == 0 || strcasecmp(dot, ".htm") == 0) {
-        return "text/html; charset=utf-8";
-    }
-    if (strcasecmp(dot, ".css") == 0) {
-        return "text/css; charset=utf-8";
-    }
-    if (strcasecmp(dot, ".js") == 0) {
-        return "application/javascript; charset=utf-8";
-    }
-    if (strcasecmp(dot, ".json") == 0) {
-        return "application/json";
-    }
-    if (strcasecmp(dot, ".png") == 0) {
-        return "image/png";
-    }
-    if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0) {
-        return "image/jpeg";
-    }
-    if (strcasecmp(dot, ".gif") == 0) {
-        return "image/gif";
-    }
-    if (strcasecmp(dot, ".svg") == 0) {
-        return "image/svg+xml";
-    }
-    if (strcasecmp(dot, ".ico") == 0) {
-        return "image/x-icon";
-    }
-    if (strcasecmp(dot, ".txt") == 0) {
-        return "text/plain; charset=utf-8";
-    }
-    return "application/octet-stream";
-}
-
-static void router_serve_static(const apex_server_config_t *server, const char *request, size_t request_length,
-                                const apex_location_config_t *location, const char *path, size_t path_len,
-                                bool head_request, apex_res_t *res) {
-    conn_t *connection = res->conn;
-    if (location == NULL || location->root == NULL || path == NULL) {
-        router_send_error(connection, server, request, request_length, 404, "Not Found", "Not Found\n");
-        return;
-    }
-
-    /* Prevent directory traversal */
-    for (size_t i = 0; i + 1 < path_len; i++) {
-        if (path[i] == '.' && path[i + 1] == '.') {
-            if (i + 2 == path_len || path[i + 2] == '/' || i == 0 || path[i - 1] == '/') {
-                router_send_error(connection, server, request, request_length, 403, "Forbidden", "Forbidden\n");
-                return;
-            }
-        }
-    }
-
-    size_t root_len = strlen(location->root);
-    size_t location_path_len = strlen(location->path);
-    const char *relative_path = path;
-    size_t relative_path_len = path_len;
-
-    if (path_len >= location_path_len && strncmp(path, location->path, location_path_len) == 0) {
-        relative_path = path + location_path_len;
-        relative_path_len = path_len - location_path_len;
-    }
-
-    char file_path[APEX_CONFIG_PATH_MAX];
-    bool root_has_slash = root_len > 0 && location->root[root_len - 1] == '/';
-    bool rel_has_slash = relative_path_len > 0 && relative_path[0] == '/';
-
-    int written;
-    if (root_has_slash && rel_has_slash) {
-        written = snprintf(file_path, sizeof(file_path), "%s%.*s", location->root,
-                           (int)(relative_path_len - 1), relative_path + 1);
-    } else if (!root_has_slash && !rel_has_slash && relative_path_len > 0) {
-        written = snprintf(file_path, sizeof(file_path), "%s/%.*s", location->root,
-                           (int)relative_path_len, relative_path);
-    } else {
-        written = snprintf(file_path, sizeof(file_path), "%s%.*s", location->root,
-                           (int)relative_path_len, relative_path);
-    }
-
-    if (written < 0 || (size_t)written >= sizeof(file_path)) {
-        router_send_error(connection, server, request, request_length, 414, "URI Too Long", "URI Too Long\n");
-        return;
-    }
-
-    struct stat file_stat;
-    if (stat(file_path, &file_stat) < 0) {
-        router_send_error(connection, server, request, request_length, 404, "Not Found", "File Not Found\n");
-        return;
-    }
-
-    if (S_ISDIR(file_stat.st_mode)) {
-        size_t current_len = strlen(file_path);
-        if (current_len + 11 < sizeof(file_path)) {
-            if (file_path[current_len - 1] != '/') {
-                strcat(file_path, "/index.html");
-            } else {
-                strcat(file_path, "index.html");
-            }
-            if (stat(file_path, &file_stat) < 0 || S_ISDIR(file_stat.st_mode)) {
-                router_send_error(connection, server, request, request_length, 404, "Not Found", "Directory index not found\n");
-                return;
-            }
-        } else {
-            router_send_error(connection, server, request, request_length, 404, "Not Found", "Not Found\n");
-            return;
-        }
-    }
-
-    int file_fd = open(file_path, O_RDONLY | O_CLOEXEC);
-    if (file_fd < 0) {
-        router_send_error(connection, server, request, request_length, 403, "Forbidden", "Permission Denied\n");
-        return;
-    }
-
-    size_t file_size = (size_t)file_stat.st_size;
-    void *file_data = NULL;
-    if (file_size > 0) {
-        file_data = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, file_fd, 0);
-        if (file_data == MAP_FAILED) {
-            close(file_fd);
-            router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "mmap failed\n");
-            return;
-        }
-    }
-    close(file_fd);
-
-    const char *content_type = router_determine_content_type(file_path);
-    char header_buffer[512];
-    int header_len = snprintf(header_buffer, sizeof(header_buffer),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Server: apex\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Connection: %s\r\n"
-                              "\r\n",
-                              content_type, file_size,
-                              connection->close_after_write ? "close" : "keep-alive");
-
-    if (header_len > 0 && (size_t)header_len < sizeof(header_buffer)) {
-        apex_conn_write(connection, header_buffer, (size_t)header_len);
-        if (!head_request && file_data != NULL && file_size > 0) {
-            apex_conn_write(connection, file_data, file_size);
-        }
-    }
-
-    if (file_data != NULL && file_size > 0) {
-        munmap(file_data, file_size);
-    }
+    return apex_mime_type(path);
 }
 
 void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
@@ -1109,27 +964,95 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             match_path_length = (size_t)(query - path);
         }
 
+        apex_pipeline_ctx_t ctx = {
+            .method = req_buf,
+            .method_len = method_len,
+            .path = path,
+            .path_len = path_len,
+            .raw_request = req_buf,
+            .raw_request_len = header_len,
+            .body = body,
+            .body_len = body_len,
+            .conn = res != NULL ? res->conn : NULL,
+            .res = res,
+            .server = NULL,
+            .location = NULL,
+            .runtime = runtime,
+            .status_code = 200,
+            .start_time_us = 0,
+            .extra_headers = {0},
+            .extra_headers_len = 0,
+            .module_data = {0},
+        };
+
+        /* Phase 1: PRE_ROUTING */
+        apex_action_t action = apex_pipeline_run_phase(&ctx, APEX_PHASE_PRE_ROUTING);
+        if (action == APEX_ACTION_DENY) {
+            router_send_error(res->conn, NULL, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+            return;
+        }
+        if (action == APEX_ACTION_DONE) {
+            return;
+        }
+
         apex_config_route_t route;
         if (apex_runtime_match(runtime, host, host_length, path, match_path_length, &route) &&
             route.location != NULL) {
+            ctx.server = route.server;
+            ctx.location = route.location;
+
+            /* Phase 3: HEADER_FILTER */
+            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_HEADER_FILTER);
+            if (action == APEX_ACTION_DENY) {
+                router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
+                return;
+            }
+            if (action == APEX_ACTION_DONE) {
+                return;
+            }
+
+            /* Phase 4: ACCESS_CONTROL */
+            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_ACCESS_CONTROL);
+            if (action == APEX_ACTION_DENY) {
+                router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Access Denied by Policy\n");
+                return;
+            }
+            if (action == APEX_ACTION_DONE) {
+                return;
+            }
+
+            /* Phase 5: CONTENT_HANDLER */
+            action = apex_pipeline_run_phase(&ctx, APEX_PHASE_CONTENT_HANDLER);
+            if (action == APEX_ACTION_DONE) {
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                return;
+            }
+
+            /* Phase 6: RESPONSE_FILTER */
+            apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
+
             if (route.location->target != APEX_PROXY_TARGET_NONE) {
                 router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
-                                       body_len, res);
+                                       body_len, res, ctx.extra_headers, ctx.extra_headers_len);
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                 return;
             }
             if (route.location->root != NULL) {
                 bool head_request = method_len == 4 && memcmp(req_buf, "HEAD", 4) == 0;
-                router_serve_static(route.server, req_buf, header_len, route.location, path, match_path_length,
-                                    head_request, res);
+                apex_static_serve(route.server, route.location, req_buf, header_len, path, match_path_length,
+                                  head_request, res, ctx.extra_headers, ctx.extra_headers_len);
+                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                 return;
             }
         }
-    }
 
-    if (runtime != NULL && runtime->config != NULL && runtime->config->server_count > 0) {
-        router_send_error(res->conn, &runtime->config->servers[0], req_buf, header_len, 404, "Not Found",
-                          "Not Found\n");
-        return;
+        if (runtime->config != NULL && runtime->config->server_count > 0) {
+            router_send_error(res->conn, &runtime->config->servers[0], req_buf, header_len, 404, "Not Found",
+                              "Not Found\n");
+            apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+            return;
+        }
     }
 
     apex_res_send(res, 404, NULL, 0);

@@ -2,7 +2,7 @@ CC ?= cc
 CSTD ?= -std=c2x
 CFLAGS ?= $(CSTD) -O3 -flto -D_GNU_SOURCE -pthread -Wall -Wextra -Werror -Iinclude -Isrc
 AR ?= ar
-LDFLAGS ?= -pthread -flto
+LDFLAGS ?= -pthread -flto -rdynamic
 VERSION ?= 1.3.2
 PYTHON ?= python3
 
@@ -13,19 +13,19 @@ endif
 
 LIB = libapex.a
 BIN = apex
-SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c
+SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c src/module.c src/static.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal.h
+HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h include/apex/module.h include/apex/static.h src/internal.h
 
 TLS_CFLAGS := $(shell pkg-config --cflags libssl libcrypto 2>/dev/null)
 TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s ' -lssl -lcrypto)
 H2_CFLAGS := $(shell pkg-config --cflags libnghttp2 2>/dev/null)
 H2_LIBS := $(shell pkg-config --libs libnghttp2 2>/dev/null || printf '%s ' -lnghttp2)
 CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS)
-LDLIBS = $(TLS_LIBS) $(H2_LIBS)
+LDLIBS = $(TLS_LIBS) $(H2_LIBS) -ldl
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
-           examples/config_demo
+           examples/config_demo examples/mod_security_headers.so
 
 all: $(LIB) $(BIN) $(EXAMPLES)
 
@@ -61,6 +61,9 @@ examples/proxy_demo: examples/proxy_demo.o src/proxy.o
 examples/config_demo: examples/config_demo.o $(LIB)
 	$(CC) $(CFLAGS) -o $@ examples/config_demo.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
+examples/mod_security_headers.so: examples/mod_security_headers.c include/apex/module.h
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ $<
+
 proxy: examples/proxy_demo
 
 test: all
@@ -76,6 +79,6 @@ check: test
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) src/main.o $(LIB) $(BIN) examples/*.o $(EXAMPLES) $(BUILD_META_H)
+	rm -f $(OBJS) src/main.o $(LIB) $(BIN) examples/*.o examples/*.so $(EXAMPLES) $(BUILD_META_H)
 
 .PHONY: all clean proxy test check

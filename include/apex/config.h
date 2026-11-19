@@ -68,6 +68,15 @@ typedef struct {
     uint16_t endpoint_port;
 
     char *root;
+    char **indices;
+    size_t index_count;
+    size_t index_capacity;
+    char **try_files;
+    size_t try_files_count;
+    size_t try_files_capacity;
+    bool sendfile;
+    bool etag;
+    bool precompressed;
 
     apex_config_header_t *headers;
     size_t header_count;
@@ -178,12 +187,15 @@ typedef struct {
     upstream_group_t group;
 } apex_endpoint_group_t;
 
+struct apex_module_registry;
+
 typedef struct {
     const apex_config_t *config;
     upstream_group_t *groups;
     size_t group_count;
     apex_endpoint_group_t *endpoint_groups;
     size_t endpoint_group_count;
+    struct apex_module_registry *module_registry;
 } apex_runtime_t;
 
 typedef struct {

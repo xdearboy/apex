@@ -89,6 +89,12 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
     connection->aux_length = 0;
     connection->aux_offset = 0;
 
+    if (connection->sendfile_remain > 0 && connection->sendfile_fd >= 0) {
+        close(connection->sendfile_fd);
+        connection->sendfile_fd = -1;
+        connection->sendfile_remain = 0;
+    }
+
     if (connection->active) {
         if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL) != 0 && errno != ENOENT) {
             perror("apex: epoll_ctl remove connection");
@@ -315,6 +321,46 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
     connection->aux_length += length;
 }
 
+void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t length) {
+    if (connection == NULL || file_fd < 0 || length == 0) {
+        if (file_fd >= 0) {
+            close(file_fd);
+        }
+        return;
+    }
+#if defined(__linux__)
+    if (connection->transport == APEX_TRANSPORT_PLAIN) {
+        if (connection->sendfile_remain > 0 && connection->sendfile_fd >= 0) {
+            close(connection->sendfile_fd);
+        }
+        connection->sendfile_fd = file_fd;
+        connection->sendfile_offset = offset;
+        connection->sendfile_remain = length;
+        return;
+    }
+#endif
+    void *map = mmap(NULL, length, PROT_READ, MAP_PRIVATE, file_fd, offset);
+    if (map != MAP_FAILED) {
+        apex_conn_write(connection, map, length);
+        munmap(map, length);
+    } else {
+        char buf[8192];
+        if (lseek(file_fd, offset, SEEK_SET) != (off_t)-1) {
+            size_t rem = length;
+            while (rem > 0) {
+                size_t to_read = rem < sizeof(buf) ? rem : sizeof(buf);
+                ssize_t n = read(file_fd, buf, to_read);
+                if (n <= 0) {
+                    break;
+                }
+                apex_conn_write(connection, buf, (size_t)n);
+                rem -= (size_t)n;
+            }
+        }
+    }
+    close(file_fd);
+}
+
 void apex_close_connection(worker_arg_t *worker, conn_t *connection) {
     close_conn(worker, connection);
 }
@@ -376,12 +422,45 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
         return;
     }
 
+#if defined(__linux__)
+    if (connection->fd >= 0 && connection->transport == APEX_TRANSPORT_PLAIN &&
+        connection->write_length == connection->write_offset &&
+        connection->aux_length == connection->aux_offset &&
+        connection->sendfile_remain > 0) {
+        while (connection->sendfile_remain > 0) {
+            ssize_t sent = sendfile(connection->fd, connection->sendfile_fd,
+                                    &connection->sendfile_offset, connection->sendfile_remain);
+            if (sent > 0) {
+                connection->sendfile_remain -= (size_t)sent;
+                if (connection->sendfile_remain == 0) {
+                    close(connection->sendfile_fd);
+                    connection->sendfile_fd = -1;
+                    break;
+                }
+                continue;
+            }
+            if (sent < 0 && errno == EINTR) {
+                continue;
+            }
+            if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            close(connection->sendfile_fd);
+            connection->sendfile_fd = -1;
+            connection->sendfile_remain = 0;
+            close_conn(worker, connection);
+            return;
+        }
+    }
+#endif
+
     if (connection->fd < 0) {
         return;
     }
 
     bool pending = connection->write_length > connection->write_offset ||
-                   connection->aux_length > connection->aux_offset;
+                   connection->aux_length > connection->aux_offset ||
+                   connection->sendfile_remain > 0;
 
     if (!pending && connection->close_after_write) {
         close_conn(worker, connection);

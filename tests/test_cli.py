@@ -853,10 +853,238 @@ class UpstreamFailoverTest(unittest.TestCase):
         self.assertEqual(body, b"healthy-backend-payload")
 
 
+class ModulePipelineTest(unittest.TestCase):
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="apex-mod-")
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+        self.listen_port = free_port()
+        self.backend, self.backend_port = start_backend("mod-backend")
+        self.addCleanup(stop_backend, self.backend)
+
+        # Locate mod_security_headers.so
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        so_path = os.path.join(repo_root, "examples", "mod_security_headers.so")
+        self.assertTrue(os.path.exists(so_path), f"Module not found at {so_path}")
+
+        config_text = f"""modules {{
+    load "{so_path}";
+}}
+
+http {{
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+        location "/" {{
+            proxy_pass http://127.0.0.1:{self.backend_port};
+        }}
+    }}
+}}
+"""
+        self.config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        self.server = ApexServer(self.config, self.workdir)
+        self.addCleanup(self.server.stop)
+        self.server.wait_ready(self.listen_port)
+
+    def test_module_response_filter_injects_headers(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, headers, body = client.request_full("/")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"mod-backend")
+        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(headers.get("x-frame-options"), "DENY")
+        self.assertEqual(headers.get("x-apex-module"), "mod_security_headers")
+
+    def test_module_access_control_denies_request(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+        status, body = client.request("/mod-forbidden")
+        self.assertEqual(status, 403)
+
+
+class StaticServerEngineTest(unittest.TestCase):
+    def setUp(self):
+        self.workdir = tempfile.mkdtemp(prefix="apex-static-")
+        self.addCleanup(shutil.rmtree, self.workdir, ignore_errors=True)
+        self.listen_port = free_port()
+
+        self.static_root = os.path.join(self.workdir, "www")
+        os.makedirs(self.static_root, exist_ok=True)
+
+        with open(os.path.join(self.static_root, "index.html"), "w") as f:
+            f.write("<html>apex web server</html>")
+        with open(os.path.join(self.static_root, "style.css"), "w") as f:
+            f.write("body { margin: 0; }")
+        with open(os.path.join(self.static_root, "script.js"), "w") as f:
+            f.write("console.log('apex');")
+        with open(os.path.join(self.static_root, "data.json"), "w") as f:
+            f.write('{"server":"apex"}')
+        with open(os.path.join(self.static_root, "module.wasm"), "wb") as f:
+            f.write(b"\x00asm\x01\x00\x00\x00")
+        with open(os.path.join(self.static_root, "logo.svg"), "w") as f:
+            f.write('<svg viewBox="0 0 10 10"></svg>')
+
+        # Precompressed twins
+        with open(os.path.join(self.static_root, "bundle.js"), "w") as f:
+            f.write("uncompressed bundle code")
+        with open(os.path.join(self.static_root, "bundle.js.gz"), "w") as f:
+            f.write("gzip-twin-content")
+        with open(os.path.join(self.static_root, "bundle.js.br"), "w") as f:
+            f.write("brotli-twin-content")
+
+        # Subdirectory for index test
+        sub_dir = os.path.join(self.static_root, "sub")
+        os.makedirs(sub_dir, exist_ok=True)
+        with open(os.path.join(sub_dir, "custom.html"), "w") as f:
+            f.write("custom index page")
+
+        config_text = f"""http {{
+    server {{
+        listen "127.0.0.1:{self.listen_port}";
+        server_name localhost;
+
+        location "/static/" {{
+            root "{self.static_root}";
+            sendfile on;
+            etag on;
+            precompressed on;
+        }}
+
+        location "/sub/" {{
+            root "{sub_dir}";
+            index custom.html;
+        }}
+
+        location "/app/" {{
+            root "{self.static_root}";
+            try_files $uri $uri/ /index.html;
+        }}
+    }}
+}}
+"""
+        self.config = write_config(os.path.join(self.workdir, "apex.conf"), config_text)
+        self.server = ApexServer(self.config, self.workdir)
+        self.addCleanup(self.server.stop)
+        self.server.wait_ready(self.listen_port)
+
+    def test_static_mime_types(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        cases = [
+            ("/static/index.html", "text/html; charset=utf-8"),
+            ("/static/style.css", "text/css; charset=utf-8"),
+            ("/static/script.js", "application/javascript; charset=utf-8"),
+            ("/static/data.json", "application/json"),
+            ("/static/module.wasm", "application/wasm"),
+            ("/static/logo.svg", "image/svg+xml"),
+        ]
+        for path, expected_mime in cases:
+            status, headers, _ = client.request_full(path)
+            self.assertEqual(status, 200, f"Failed for {path}")
+            self.assertEqual(headers.get("content-type"), expected_mime, f"MIME mismatch for {path}")
+
+    def test_etag_and_304_not_modified(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        status, headers, body = client.request_full("/static/index.html")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"<html>apex web server</html>")
+        etag = headers.get("etag")
+        self.assertTrue(etag, "ETag missing from static response")
+
+        # Second request with If-None-Match
+        status2, headers2, body2 = client.request_full("/static/index.html", headers={"If-None-Match": etag})
+        self.assertEqual(status2, 304)
+        self.assertEqual(len(body2), 0)
+
+    def test_last_modified_and_304(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        status, headers, _ = client.request_full("/static/style.css")
+        self.assertEqual(status, 200)
+        last_mod = headers.get("last-modified")
+        self.assertTrue(last_mod, "Last-Modified header missing")
+
+        # Request with If-Modified-Since
+        status2, _, body2 = client.request_full("/static/style.css", headers={"If-Modified-Since": last_mod})
+        self.assertEqual(status2, 304)
+        self.assertEqual(len(body2), 0)
+
+    def test_precompressed_twins_selection(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        # Brotli preferred
+        status, headers, body = client.request_full("/static/bundle.js", headers={"Accept-Encoding": "gzip, br"})
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("content-encoding"), "br")
+        self.assertEqual(body, b"brotli-twin-content")
+        self.assertIn("Accept-Encoding", headers.get("vary", ""))
+
+        # Gzip fallback
+        status_gz, headers_gz, body_gz = client.request_full("/static/bundle.js", headers={"Accept-Encoding": "gzip"})
+        self.assertEqual(status_gz, 200)
+        self.assertEqual(headers_gz.get("content-encoding"), "gzip")
+        self.assertEqual(body_gz, b"gzip-twin-content")
+
+        # No compression accepted -> uncompressed original
+        status_raw, headers_raw, body_raw = client.request_full("/static/bundle.js", headers={"Accept-Encoding": "identity"})
+        self.assertEqual(status_raw, 200)
+        self.assertIsNone(headers_raw.get("content-encoding"))
+        self.assertEqual(body_raw, b"uncompressed bundle code")
+
+    def test_http_range_requests(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        # "console.log('apex');" length is 20 bytes. Request bytes 0-6 ("console")
+        status, headers, body = client.request_full("/static/script.js", headers={"Range": "bytes=0-6"})
+        self.assertEqual(status, 206)
+        self.assertEqual(body, b"console")
+        self.assertEqual(headers.get("content-length"), "7")
+        self.assertIn("bytes 0-6/20", headers.get("content-range", ""))
+
+    def test_custom_index_directive(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        status, body = client.request("/sub/")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"custom index page")
+
+    def test_try_files_fallback(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        # Existing file -> served directly
+        status1, body1 = client.request("/app/style.css")
+        self.assertEqual(status1, 200)
+        self.assertEqual(body1, b"body { margin: 0; }")
+
+        # Missing file -> falls back to /index.html
+        status2, body2 = client.request("/app/some/client/side/route")
+        self.assertEqual(status2, 200)
+        self.assertEqual(body2, b"<html>apex web server</html>")
+
+    def test_directory_traversal_protection(self):
+        client = Client(self.listen_port)
+        self.addCleanup(client.close)
+
+        status1, _ = client.request("/static/../etc/passwd")
+        self.assertIn(status1, (403, 404))
+
+        status2, _ = client.request("/static/%2e%2e/passwd")
+        self.assertIn(status2, (403, 404))
+
+
 def main():
     unittest.main(argv=[sys.argv[0]], verbosity=2)
 
 
 if __name__ == "__main__":
     main()
+
 

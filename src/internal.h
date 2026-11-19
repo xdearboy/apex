@@ -6,6 +6,8 @@
 #endif
 
 #include "apex.h"
+#include "apex/module.h"
+#include "apex/static.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -23,6 +25,10 @@
 #include <sys/sysinfo.h>
 #include <time.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/sendfile.h>
+#endif
 
 #include <openssl/ssl.h>
 
@@ -53,9 +59,16 @@ typedef struct conn {
     char *aux_buffer;
     size_t aux_length;
     size_t aux_offset;
+    int sendfile_fd;
+    off_t sendfile_offset;
+    size_t sendfile_remain;
 } conn_t;
 
 void apex_conn_write(conn_t *connection, const void *data, size_t length);
+void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t length);
+void router_send_error(conn_t *connection, const apex_server_config_t *server,
+                       const char *request, size_t request_length,
+                       int status, const char *reason, const char *message);
 
 struct apex_res {
     conn_t *conn;
@@ -103,6 +116,11 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
                    apex_res_t *res);
 void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const char *req_buf, size_t header_len,
                            const char *body, size_t body_len, apex_res_t *res);
+
+/* Module lifecycle and pipeline execution (src/module.c) */
+int apex_module_registry_init(apex_runtime_t *runtime, const apex_config_t *config, apex_config_error_t *error);
+void apex_module_registry_destroy(apex_runtime_t *runtime);
+apex_action_t apex_pipeline_run_phase(apex_pipeline_ctx_t *ctx, apex_phase_t phase);
 
 /* Worker event-loop plumbing shared by core.c and h2.c. */
 enum { WORKERS_RUNNING, WORKERS_DRAINING, WORKERS_STOPPING };
