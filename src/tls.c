@@ -43,8 +43,10 @@ static void tls_error(apex_config_error_t *error, const apex_config_t *config, c
     }
 }
 
-/* Advertised protocol is fixed for now: milestone 2b prepends "h2". */
-static const unsigned char tls_alpn_protocols[] = {8u, 'h', 't', 't', 'p', '/', '1', '.', '1'};
+/* Advertised in client-preference order: HTTP/2 first, HTTP/1.1 fallback. */
+static const unsigned char tls_alpn_protocols[] = {
+    2u, 'h', '2', 8u, 'h', 't', 't', 'p', '/', '1', '.', '1',
+};
 
 static int tls_alpn_select(SSL *ssl, const unsigned char **out, unsigned char *out_length,
                            const unsigned char *client, unsigned int client_length, void *argument) {
@@ -68,6 +70,11 @@ SSL_CTX *apex_tls_context_create(const apex_config_t *config, const apex_server_
         return NULL;
     }
     SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
+    /* The HTTP/2 send callback may complete an SSL_write across calls with
+     * different buffers (nghttp2 retries pending data from its own internal
+     * buffer), so partial writes and moving write buffers must be allowed.
+     * The h1 path already copes with partial writes via write_offset. */
+    SSL_CTX_set_mode(context, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_alpn_select_cb(context, tls_alpn_select, NULL);
     if (SSL_CTX_set_min_proto_version(context, TLS1_2_VERSION) != 1) {
         tls_error(error, config, server, APEX_CONFIG_ERR_RUNTIME, "cannot set minimum tls version");

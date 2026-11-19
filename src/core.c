@@ -7,31 +7,6 @@
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 
-enum { WORKERS_RUNNING, WORKERS_DRAINING, WORKERS_STOPPING };
-
-typedef struct {
-    _Atomic int shutdown;
-    int status_fd;
-} run_control_t;
-
-typedef struct {
-    pthread_t thread;
-    int cpu;
-    int epoll_fd;
-    int listen_fd;
-    int wake_fd;
-    int highest_fd;
-    size_t connection_count;
-    bool listener_tls;
-    conn_t *connections;
-    apex_app_t *app;
-    run_control_t *control;
-    apex_generation_t *generation;
-    _Atomic(apex_generation_t *) pending_generation;
-    _Atomic int error;
-    _Atomic bool finished;
-} worker_arg_t;
-
 typedef struct {
     char host[APEX_CONFIG_HOST_MAX];
     uint16_t port;
@@ -95,6 +70,10 @@ static int drain_notification(int fd) {
 }
 
 static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
+    if (connection->h2 != NULL) {
+        h2_connection_destroy(connection);
+        connection->h2 = NULL;
+    }
     if (connection->ssl != NULL) {
         /* Best-effort close_notify: sends FIN-path bytes while the socket is
          * still open so peers observe an orderly TLS close, not a RST. */
@@ -128,10 +107,9 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
     }
 }
 
-/* Transport write: bytes written (>0), -1 retry with errno EAGAIN/EINTR,
- * -2 fatal (caller closes). Plain sockets keep send(2) semantics; TLS wraps
- * SSL_write with WANT_* mapped onto the same retry contract. */
-static int transport_write(conn_t *connection, const void *data, size_t length) {
+/* Transport and connection helpers shared with the HTTP/2 session layer. */
+
+int apex_transport_write(conn_t *connection, const void *data, size_t length) {
     if (length > (size_t)INT_MAX) {
         length = (size_t)INT_MAX;
     }
@@ -166,7 +144,7 @@ static int transport_write(conn_t *connection, const void *data, size_t length) 
 
 /* Transport read: bytes received (>0), 0 clean EOF, -1 retry
  * (errno EAGAIN/EINTR; WANT_WRITE also arms tls_want_write), -2 fatal. */
-static ssize_t transport_read(conn_t *connection) {
+ssize_t apex_transport_read(conn_t *connection) {
     size_t space = sizeof(connection->read_buffer) - connection->read_length;
     if (space == 0) {
         return -1;
@@ -248,9 +226,12 @@ static bool tls_handshake_step(worker_arg_t *worker, conn_t *connection) {
         const unsigned char *protocol = NULL;
         unsigned int length = 0;
         SSL_get0_alpn_selected(connection->ssl, &protocol, &length);
-        /* Milestone 2b serves "h2"; until then the ALPN callback never
-         * selects it, so this flag stays clear. */
         connection->alpn_h2 = (protocol != NULL && length == 2u && memcmp(protocol, "h2", 2u) == 0);
+        if (connection->alpn_h2 && h2_connection_create(connection, worker) != 0) {
+            tls_log_error("h2 session setup failed");
+            close_conn(worker, connection);
+            return false;
+        }
         return true;
     }
     int ssl_error = SSL_get_error(connection->ssl, result);
@@ -334,14 +315,33 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
     connection->aux_length += length;
 }
 
+void apex_close_connection(worker_arg_t *worker, conn_t *connection) {
+    close_conn(worker, connection);
+}
+
+void apex_arm_connection_output(worker_arg_t *worker, conn_t *connection) {
+    if (connection->fd < 0 || connection->epollout_active) {
+        return;
+    }
+    struct epoll_event event_config;
+    event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLOUT | EPOLLET;
+    event_config.data.fd = connection->fd;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+        perror("apex: epoll_ctl arm output");
+        close_conn(worker, connection);
+        return;
+    }
+    connection->epollout_active = 1;
+}
+
 static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
     while (connection->fd >= 0) {
         int bytes_sent = 0;
 
         if (connection->write_length > connection->write_offset) {
             size_t bytes_to_send = connection->write_length - connection->write_offset;
-            bytes_sent = transport_write(connection, connection->write_buffer + connection->write_offset,
-                                         bytes_to_send);
+            bytes_sent = apex_transport_write(connection, connection->write_buffer + connection->write_offset,
+                                              bytes_to_send);
             if (bytes_sent > 0) {
                 connection->write_offset += (uint32_t)bytes_sent;
                 if (connection->write_offset == connection->write_length) {
@@ -351,7 +351,8 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
             }
         } else if (connection->aux_length > connection->aux_offset) {
             size_t bytes_to_send = connection->aux_length - connection->aux_offset;
-            bytes_sent = transport_write(connection, connection->aux_buffer + connection->aux_offset, bytes_to_send);
+            bytes_sent = apex_transport_write(connection, connection->aux_buffer + connection->aux_offset,
+                                              bytes_to_send);
             if (bytes_sent > 0) {
                 connection->aux_offset += (size_t)bytes_sent;
                 if (connection->aux_offset == connection->aux_length) {
@@ -417,8 +418,13 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
  * and flushes any generated output. The EPOLLIN and EPOLLOUT handlers both
  * funnel here so a TLS read that wants a write resumes without a peer kick. */
 static void process_read_event(worker_arg_t *worker, conn_t *connection) {
+    if (connection->h2 != NULL) {
+        h2_read(worker, connection);
+        return;
+    }
+
     while (connection->fd >= 0) {
-        ssize_t bytes_received = transport_read(connection);
+        ssize_t bytes_received = apex_transport_read(connection);
         if (bytes_received > 0) {
             connection->read_length += (uint32_t)bytes_received;
             if (memmem(connection->read_buffer, connection->read_length, "\r\n\r\n", 4) != NULL) {
@@ -706,6 +712,10 @@ static void *worker_main(void *arg) {
             }
 
             if ((active_event_flags & EPOLLOUT) && connection->fd >= 0) {
+                if (connection->h2 != NULL) {
+                    h2_flush(worker, connection);
+                    continue;
+                }
                 flush_write(worker, connection);
                 if (connection->fd >= 0 && connection->tls_want_write) {
                     connection->tls_want_write = 0;

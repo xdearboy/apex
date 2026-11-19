@@ -47,6 +47,7 @@ typedef struct conn {
     tls_phase_t tls_phase;
     uint8_t tls_want_write;
     uint8_t alpn_h2;
+    struct h2_conn *h2;
     char read_buffer[BUF_SIZE];
     char write_buffer[BUF_SIZE];
     char *aux_buffer;
@@ -102,5 +103,44 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
                    apex_res_t *res);
 void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const char *req_buf, size_t header_len,
                            const char *body, size_t body_len, apex_res_t *res);
+
+/* Worker event-loop plumbing shared by core.c and h2.c. */
+enum { WORKERS_RUNNING, WORKERS_DRAINING, WORKERS_STOPPING };
+
+typedef struct {
+    _Atomic int shutdown;
+    int status_fd;
+} run_control_t;
+
+typedef struct {
+    pthread_t thread;
+    int cpu;
+    int epoll_fd;
+    int listen_fd;
+    int wake_fd;
+    int highest_fd;
+    size_t connection_count;
+    bool listener_tls;
+    conn_t *connections;
+    apex_app_t *app;
+    run_control_t *control;
+    apex_generation_t *generation;
+    _Atomic(apex_generation_t *) pending_generation;
+    _Atomic int error;
+    _Atomic bool finished;
+} worker_arg_t;
+
+/* Transport and connection helpers exported for the HTTP/2 session layer. */
+int apex_transport_write(conn_t *connection, const void *data, size_t length);
+ssize_t apex_transport_read(conn_t *connection);
+void apex_close_connection(worker_arg_t *worker, conn_t *connection);
+void apex_arm_connection_output(worker_arg_t *worker, conn_t *connection);
+
+/* HTTP/2 session layer (src/h2.c), reached via ALPN on TLS connections. */
+int h2_connection_create(conn_t *connection, worker_arg_t *worker);
+void h2_connection_destroy(conn_t *connection);
+void h2_read(worker_arg_t *worker, conn_t *connection);
+void h2_flush(worker_arg_t *worker, conn_t *connection);
+bool h2_has_pending_output(conn_t *connection);
 
 #endif /* APEX_INTERNAL_H */

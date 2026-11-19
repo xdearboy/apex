@@ -13,14 +13,16 @@ endif
 
 LIB = libapex.a
 BIN = apex
-SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c
+SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c
 OBJS = $(SRCS:.c=.o)
 HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h src/internal.h
 
 TLS_CFLAGS := $(shell pkg-config --cflags libssl libcrypto 2>/dev/null)
 TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s ' -lssl -lcrypto)
-CFLAGS += $(TLS_CFLAGS)
-LDLIBS = $(TLS_LIBS)
+H2_CFLAGS := $(shell pkg-config --cflags libnghttp2 2>/dev/null)
+H2_LIBS := $(shell pkg-config --libs libnghttp2 2>/dev/null || printf '%s ' -lnghttp2)
+CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS)
+LDLIBS = $(TLS_LIBS) $(H2_LIBS)
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo
@@ -66,6 +68,7 @@ test: all
 	./examples/proxy_demo
 	$(PYTHON) tests/test_cli.py ./$(BIN)
 	$(PYTHON) tests/test_tls.py ./$(BIN)
+	$(PYTHON) tests/test_h2.py ./$(BIN)
 
 check: test
 

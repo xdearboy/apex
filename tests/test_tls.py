@@ -5,8 +5,8 @@ Run from the repository root after `make`:
 
     python3 tests/test_tls.py ./apex
 
-Covers TLS listeners, ALPN negotiation (http/1.1 only until HTTP/2 support
-lands), configuration validation of certificate material, reload rejection
+Covers TLS listeners, ALPN negotiation (h2 preferred, http/1.1 fallback),
+configuration validation of certificate material, reload rejection
 and orderly shutdown. Standard library only; requires the `openssl` CLI to
 generate throwaway certificate/key pairs.
 """
@@ -244,11 +244,10 @@ class TlsServingTest(unittest.TestCase):
             status, body = client.request("/")
             self.assertEqual((status, body), (200, b"tls-backend"))
 
-    def test_alpn_prefers_http11_until_h2_lands(self):
+    def test_alpn_prefers_h2_when_offered(self):
         client = TlsClient(self.listen_port, ["h2", "http/1.1"])
         self.addCleanup(client.close)
-        self.assertEqual(client.alpn(), "http/1.1")
-        self.assertEqual(client.request("/")[0], 200)
+        self.assertEqual(client.alpn(), "h2")
 
     def test_alpn_no_overlap_fails_handshake(self):
         with self.assertRaises(ssl.SSLError):
