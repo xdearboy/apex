@@ -26,6 +26,8 @@ extern "C" {
 typedef enum {
     APEX_BALANCE_ROUND_ROBIN = 0,
     APEX_BALANCE_P2C = 1,
+    APEX_BALANCE_LEAST_CONN = 2,
+    APEX_BALANCE_IP_HASH = 3,
 } apex_balance_policy_t;
 
 typedef enum {
@@ -44,6 +46,8 @@ typedef struct {
     char ip[64];
     uint16_t port;
     uint32_t weight;
+    bool is_backup;
+    bool is_down;
     _Atomic int64_t active_conns;
     _Atomic uint64_t total_requests;
     _Atomic uint64_t failed_requests;
@@ -85,6 +89,7 @@ typedef struct {
     const char *method;
     const char *target;
     const char *host;
+    const char *client_ip;
     const char *headers;
     size_t headers_len;
     const void *body;
@@ -118,9 +123,12 @@ typedef struct {
 
 void apex_upstream_group_init(upstream_group_t *group);
 int apex_upstream_add_server(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight);
+int apex_upstream_add_server_ex(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight,
+                                bool is_backup, bool is_down);
 void apex_upstream_set_policy(upstream_group_t *group, apex_balance_policy_t policy);
 ssize_t apex_upstream_select(upstream_group_t *group);
 ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask);
+ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_mask, const char *client_ip);
 void apex_upstream_record_success(upstream_group_t *group, size_t server_index);
 void apex_upstream_record_failure(upstream_group_t *group, size_t server_index);
 

@@ -24,9 +24,25 @@ extern "C" {
 #define APEX_CONFIG_MAX_HEADERS 32u
 #define APEX_CONFIG_MAX_MODULE_NAMES 32u
 #define APEX_CONFIG_MAX_ACL_RULES 32u
+#define APEX_CONFIG_MAX_RATE_ZONES 16u
+#define APEX_CONFIG_MAX_CONN_ZONES 16u
 #define APEX_CONFIG_MAX_INCLUDE_DEPTH 16u
 #define APEX_CONFIG_MAX_FILE_BYTES (8u * 1024u * 1024u)
 #define APEX_CONFIG_MAX_TOKENS (1024u * 1024u)
+
+typedef struct {
+    char name[64];
+    char key_var[64];
+    size_t size_bytes;
+    uint32_t rate_r_s;
+    double rate_per_sec;
+} apex_rate_limit_zone_t;
+
+typedef struct {
+    char name[64];
+    char key_var[64];
+    size_t size_bytes;
+} apex_conn_limit_zone_t;
 
 typedef struct {
     bool allow;   /* true for allow, false for deny */
@@ -105,6 +121,15 @@ typedef struct {
     bool has_read_timeout;
     uint64_t read_timeout_ms;
 
+    char limit_req_zone[64];
+    uint32_t limit_req_burst;
+    bool limit_req_nodelay;
+    int limit_req_status;
+
+    char limit_conn_zone[64];
+    uint32_t limit_conn_max;
+    int limit_conn_status;
+
     int http_version;
 } apex_location_config_t;
 
@@ -113,6 +138,8 @@ typedef struct {
     uint16_t port;
     uint32_t weight;
     uint32_t max_conns;
+    bool is_backup;
+    bool is_down;
     int line;
 } apex_upstream_server_config_t;
 
@@ -179,6 +206,13 @@ typedef struct {
     char return_url[APEX_CONFIG_PATH_MAX * 2];
     apex_acl_rule_t acl_rules[APEX_CONFIG_MAX_ACL_RULES];
     size_t acl_rule_count;
+    char limit_req_zone[64];
+    uint32_t limit_req_burst;
+    bool limit_req_nodelay;
+    int limit_req_status;
+    char limit_conn_zone[64];
+    uint32_t limit_conn_max;
+    int limit_conn_status;
     int line;
 } apex_server_config_t;
 
@@ -188,6 +222,10 @@ typedef struct {
     uint64_t client_header_timeout_ms;
     uint64_t client_body_timeout_ms;
     bool server_tokens;
+    apex_rate_limit_zone_t rate_zones[APEX_CONFIG_MAX_RATE_ZONES];
+    size_t rate_zone_count;
+    apex_conn_limit_zone_t conn_zones[APEX_CONFIG_MAX_CONN_ZONES];
+    size_t conn_zone_count;
 } apex_http_config_t;
 
 typedef struct {
@@ -218,6 +256,7 @@ typedef struct {
     apex_endpoint_group_t *endpoint_groups;
     size_t endpoint_group_count;
     struct apex_module_registry *module_registry;
+    void *rate_limiter;
 } apex_runtime_t;
 
 typedef struct {
@@ -243,6 +282,12 @@ const upstream_group_t *apex_runtime_endpoint_group(const apex_runtime_t *runtim
                                                     const apex_location_config_t *location);
 bool apex_runtime_match(const apex_runtime_t *runtime, const char *host, size_t host_length, const char *path,
                         size_t path_length, apex_config_route_t *route);
+
+bool apex_rate_limit_check(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip,
+                           uint32_t burst, bool nodelay, uint32_t *retry_after_sec);
+bool apex_conn_limit_acquire(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip,
+                             uint32_t max_conns);
+void apex_conn_limit_release(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip);
 
 #ifdef __cplusplus
 }

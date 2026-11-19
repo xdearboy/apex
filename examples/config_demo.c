@@ -685,9 +685,16 @@ static int print_config_summary(const apex_config_t *config) {
     printf("  servers=%zu upstreams=%zu modules=%zu\n", config->server_count, config->upstream_count,
            config->module_count);
     for (size_t index = 0; index < config->upstream_count; index++) {
+        const char *policy_str = "round_robin";
+        if (config->upstreams[index].policy == APEX_BALANCE_P2C) {
+            policy_str = "p2c";
+        } else if (config->upstreams[index].policy == APEX_BALANCE_LEAST_CONN) {
+            policy_str = "least_conn";
+        } else if (config->upstreams[index].policy == APEX_BALANCE_IP_HASH) {
+            policy_str = "ip_hash";
+        }
         printf("  upstream %s: servers=%zu policy=%s\n", config->upstreams[index].name,
-               config->upstreams[index].server_count,
-               config->upstreams[index].policy == APEX_BALANCE_P2C ? "p2c" : "round_robin");
+               config->upstreams[index].server_count, policy_str);
     }
     for (size_t index = 0; index < config->server_count; index++) {
         const apex_server_config_t *server = &config->servers[index];

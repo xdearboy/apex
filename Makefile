@@ -22,7 +22,7 @@ TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s
 H2_CFLAGS := $(shell pkg-config --cflags libnghttp2 2>/dev/null)
 H2_LIBS := $(shell pkg-config --libs libnghttp2 2>/dev/null || printf '%s ' -lnghttp2)
 CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS)
-LDLIBS = $(TLS_LIBS) $(H2_LIBS) -ldl
+LDLIBS = $(TLS_LIBS) $(H2_LIBS) -ldl -lm
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo examples/mod_security_headers.so
@@ -86,6 +86,8 @@ test: all
 	$(PYTHON) tests/test_proxy_headers.py ./$(BIN)
 	$(PYTHON) tests/test_include_glob.py ./$(BIN)
 	$(PYTHON) tests/test_websocket.py ./$(BIN)
+	$(PYTHON) tests/test_upstream_policies.py ./$(BIN)
+	$(PYTHON) tests/test_ratelimit.py ./$(BIN)
 
 check: test
 

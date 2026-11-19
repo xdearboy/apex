@@ -1095,10 +1095,16 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
         return;
     }
 
+    char client_ip[INET6_ADDRSTRLEN];
+    if (!conn_get_peer_ip(connection, client_ip, sizeof(client_ip))) {
+        strcpy(client_ip, "127.0.0.1");
+    }
+
     apex_proxy_request_t proxy_request = {
         .method = method_text,
         .target = target_text,
         .host = host[0] != '\0' ? host : NULL,
+        .client_ip = client_ip,
         .headers = headers,
         .headers_len = headers_length,
         .body = body,
@@ -1667,9 +1673,63 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     return;
                 }
 
+                /* Rate Limiting & Connection Limiting */
+                char client_ip[INET6_ADDRSTRLEN];
+                if (res->conn == NULL || !conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
+                    strcpy(client_ip, "127.0.0.1");
+                }
+
+                const char *req_zone = (route.location != NULL && route.location->limit_req_zone[0] != '\0')
+                    ? route.location->limit_req_zone
+                    : (route.server != NULL ? route.server->limit_req_zone : "");
+                if (req_zone[0] != '\0') {
+                    uint32_t burst = (route.location != NULL && route.location->limit_req_zone[0] != '\0')
+                        ? route.location->limit_req_burst : route.server->limit_req_burst;
+                    bool nodelay = (route.location != NULL && route.location->limit_req_zone[0] != '\0')
+                        ? route.location->limit_req_nodelay : route.server->limit_req_nodelay;
+                    int req_status = (route.location != NULL && route.location->limit_req_status != 0)
+                        ? route.location->limit_req_status
+                        : (route.server != NULL && route.server->limit_req_status != 0 ? route.server->limit_req_status : 503);
+                    uint32_t retry_after = 1;
+                    if (!apex_rate_limit_check(runtime, req_zone, client_ip, burst, nodelay, &retry_after)) {
+                        char retry_extra[512];
+                        snprintf(retry_extra, sizeof(retry_extra), "%sRetry-After: %u\r\n", ctx.extra_headers, (unsigned)retry_after);
+                        router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                             req_status, req_status == 429 ? "Too Many Requests" : "Service Unavailable",
+                                             req_status == 429 ? "Too Many Requests\n" : "Service Unavailable\n",
+                                             retry_extra, strlen(retry_extra));
+                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        return;
+                    }
+                }
+
+                const char *conn_zone = (route.location != NULL && route.location->limit_conn_zone[0] != '\0')
+                    ? route.location->limit_conn_zone
+                    : (route.server != NULL ? route.server->limit_conn_zone : "");
+                bool conn_acquired = false;
+                if (conn_zone[0] != '\0') {
+                    uint32_t max_conns = (route.location != NULL && route.location->limit_conn_zone[0] != '\0')
+                        ? route.location->limit_conn_max : route.server->limit_conn_max;
+                    int conn_status = (route.location != NULL && route.location->limit_conn_status != 0)
+                        ? route.location->limit_conn_status
+                        : (route.server != NULL && route.server->limit_conn_status != 0 ? route.server->limit_conn_status : 503);
+                    if (!apex_conn_limit_acquire(runtime, conn_zone, client_ip, max_conns)) {
+                        router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                             conn_status, conn_status == 429 ? "Too Many Requests" : "Service Unavailable",
+                                             conn_status == 429 ? "Too Many Requests\n" : "Service Unavailable\n",
+                                             ctx.extra_headers, ctx.extra_headers_len);
+                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        return;
+                    }
+                    conn_acquired = true;
+                }
+
                 /* Phase 5: CONTENT_HANDLER */
                 action = apex_pipeline_run_phase(&ctx, APEX_PHASE_CONTENT_HANDLER);
                 if (action == APEX_ACTION_DONE) {
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
                     apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
                     apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                     return;
@@ -1681,6 +1741,9 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                 if (route.location->target != APEX_PROXY_TARGET_NONE) {
                     router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
                                            body_len, res, ctx.extra_headers, ctx.extra_headers_len);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
                     apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                     return;
                 }
@@ -1688,8 +1751,14 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     bool head_request = method_len == 4 && memcmp(req_buf, "HEAD", 4) == 0;
                     apex_static_serve(route.server, route.location, req_buf, header_len, path, match_path_length,
                                       head_request, res, ctx.extra_headers, ctx.extra_headers_len);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
                     apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
                     return;
+                }
+                if (conn_acquired) {
+                    apex_conn_limit_release(runtime, conn_zone, client_ip);
                 }
             }
         }

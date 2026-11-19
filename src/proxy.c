@@ -1209,11 +1209,22 @@ int apex_upstream_add_server(upstream_group_t *group, const char *host, uint16_t
     return (int)index;
 }
 
+int apex_upstream_add_server_ex(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight,
+                                bool is_backup, bool is_down) {
+    int idx = apex_upstream_add_server(group, host, port, weight);
+    if (idx >= 0 && (size_t)idx < group->server_count) {
+        group->servers[idx].is_backup = is_backup;
+        group->servers[idx].is_down = is_down;
+    }
+    return idx;
+}
+
 void apex_upstream_set_policy(upstream_group_t *group, apex_balance_policy_t policy) {
     if (group == NULL) {
         return;
     }
-    if (policy == APEX_BALANCE_ROUND_ROBIN || policy == APEX_BALANCE_P2C) {
+    if (policy == APEX_BALANCE_ROUND_ROBIN || policy == APEX_BALANCE_P2C ||
+        policy == APEX_BALANCE_LEAST_CONN || policy == APEX_BALANCE_IP_HASH) {
         group->policy = policy;
     }
 }
@@ -1259,27 +1270,48 @@ static bool server_is_available(const upstream_group_t *group, size_t index, uin
     return false;
 }
 
-ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask) {
+ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_mask, const char *client_ip) {
     if (group == NULL || group->server_count == 0) {
         return -1;
     }
 
-    size_t candidates[APEX_UPSTREAM_MAX_SERVERS];
-    size_t candidate_count = 0;
+    size_t primary_candidates[APEX_UPSTREAM_MAX_SERVERS];
+    size_t primary_count = 0;
+    size_t backup_candidates[APEX_UPSTREAM_MAX_SERVERS];
+    size_t backup_count = 0;
     uint64_t now_ms = monotonic_ms();
 
     for (size_t i = 0; i < group->server_count; i++) {
+        if (group->servers[i].is_down) {
+            continue; /* Skip administratively disabled servers */
+        }
         if ((excluded_mask & (1ULL << i)) != 0) {
             continue;
         }
         if (server_is_available(group, i, now_ms)) {
-            candidates[candidate_count++] = i;
+            if (group->servers[i].is_backup) {
+                backup_candidates[backup_count++] = i;
+            } else {
+                primary_candidates[primary_count++] = i;
+            }
         }
     }
 
-    /* Fail-open: if all servers are deemed unavailable, but some are not yet excluded */
+    size_t *candidates = primary_candidates;
+    size_t candidate_count = primary_count;
+
+    /* If all primary servers are down/unavailable, fail over to backup servers */
+    if (candidate_count == 0 && backup_count > 0) {
+        candidates = backup_candidates;
+        candidate_count = backup_count;
+    }
+
+    /* Fail-open: if no available servers, fall back to non-down non-excluded */
     if (candidate_count == 0) {
         for (size_t i = 0; i < group->server_count; i++) {
+            if (group->servers[i].is_down) {
+                continue;
+            }
             if ((excluded_mask & (1ULL << i)) == 0) {
                 candidates[candidate_count++] = i;
             }
@@ -1291,6 +1323,35 @@ ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t exclude
     }
     if (candidate_count == 1) {
         return (ssize_t)candidates[0];
+    }
+
+    if (group->policy == APEX_BALANCE_LEAST_CONN) {
+        size_t start_idx = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed) % candidate_count;
+        size_t best = candidates[start_idx];
+        int64_t min_conns = atomic_load_explicit(&group->servers[best].active_conns, memory_order_relaxed);
+        for (size_t step = 1; step < candidate_count; step++) {
+            size_t idx = (start_idx + step) % candidate_count;
+            size_t i = candidates[idx];
+            int64_t c = atomic_load_explicit(&group->servers[i].active_conns, memory_order_relaxed);
+            if (c < min_conns) {
+                min_conns = c;
+                best = i;
+            }
+        }
+        return (ssize_t)best;
+    }
+
+    if (group->policy == APEX_BALANCE_IP_HASH) {
+        uint32_t hash = 2166136261u;
+        if (client_ip != NULL && client_ip[0] != '\0') {
+            for (const char *p = client_ip; *p; p++) {
+                hash ^= (uint8_t)*p;
+                hash *= 16777619u;
+            }
+        } else {
+            hash = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
+        }
+        return (ssize_t)candidates[hash % candidate_count];
     }
 
     if (group->policy == APEX_BALANCE_P2C) {
@@ -1338,8 +1399,12 @@ ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t exclude
     return (ssize_t)candidates[candidate_count - 1u];
 }
 
+ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask) {
+    return apex_upstream_select_request(group, excluded_mask, NULL);
+}
+
 ssize_t apex_upstream_select(upstream_group_t *group) {
-    return apex_upstream_select_excluding(group, 0);
+    return apex_upstream_select_request(group, 0, NULL);
 }
 
 void apex_proxy_response_init(apex_proxy_response_t *response) {
@@ -1404,7 +1469,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
     uint64_t started_us = monotonic_us();
 
     for (uint32_t attempt = 0; attempt <= max_retries; attempt++) {
-        ssize_t selected = apex_upstream_select_excluding(group, tried_mask);
+        ssize_t selected = apex_upstream_select_request(group, tried_mask, request != NULL ? request->client_ip : NULL);
         if (selected < 0) {
             break;
         }

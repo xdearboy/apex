@@ -9,10 +9,38 @@
 #include <ctype.h>
 #include <glob.h>
 #include <limits.h>
+#include <math.h>
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#define APEX_RATELIMIT_SHARDS 1024u
+
+typedef struct rate_entry {
+    char key[128];
+    uint64_t last_time_us;
+    double tokens;
+    int32_t active_conns;
+    struct rate_entry *next;
+} rate_entry_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+    rate_entry_t *head;
+} rate_shard_t;
+
+typedef struct {
+    rate_shard_t shards[APEX_RATELIMIT_SHARDS];
+} rate_limiter_t;
+
+static inline uint64_t config_monotonic_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ULL + (uint64_t)ts.tv_nsec / 1000ULL;
+}
 
 #define APEX_CONFIG_DEFAULT_WORKER_CONNECTIONS 10240u
 #define APEX_CONFIG_DEFAULT_KEEPALIVE_MS 75000u
@@ -1603,16 +1631,6 @@ static bool parse_tls_block(parser_t *parser, apex_server_config_t *server) {
     return true;
 }
 
-static bool token_is_endpoint(const token_t *token) {
-    if (token->text == NULL) {
-        return false;
-    }
-    if (strncmp(token->text, "http://", 7) == 0) {
-        return true;
-    }
-    return strchr(token->text, ':') != NULL || strchr(token->text, '/') != NULL;
-}
-
 static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *location, const token_t *value) {
     if (location->target != APEX_PROXY_TARGET_NONE) {
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "location declares proxy_pass more than once");
@@ -1623,29 +1641,37 @@ static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *lo
         return false;
     }
 
-    if (!token_is_endpoint(value)) {
-        if (value->kind != TOKEN_WORD || !is_identifier_name(value->text, value->length) ||
-            is_reserved_word(value->text)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid proxy_pass target");
-            return false;
-        }
-        location->target = APEX_PROXY_TARGET_UPSTREAM;
-        location->upstream_name = config_strdup_range(value->text, value->length);
-        if (location->upstream_name == NULL) {
-            return config_oom(parser->error);
-        }
-        return true;
-    }
-
-    const char *endpoint = value->text;
+    const char *target = value->text;
     size_t length = value->length;
-    if (length >= 7u && strncmp(endpoint, "http://", 7) == 0) {
-        endpoint += 7;
+    if (length >= 7u && strncmp(target, "http://", 7) == 0) {
+        target += 7;
         length -= 7u;
     }
-    if (memchr(endpoint, '/', length) != NULL || memchr(endpoint, '?', length) != NULL ||
-        memchr(endpoint, '#', length) != NULL) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass endpoint must be host:port");
+
+    /* Check if target without port is an upstream name (e.g. "upstream_name" or "http://upstream_name") */
+    if (memchr(target, ':', length) == NULL) {
+        char name_buf[APEX_CONFIG_NAME_MAX];
+        size_t name_len = length;
+        if (name_len > 0 && target[name_len - 1] == '/') {
+            name_len--;
+        }
+        if (name_len > 0 && name_len < sizeof(name_buf)) {
+            memcpy(name_buf, target, name_len);
+            name_buf[name_len] = '\0';
+            if (is_identifier_name(name_buf, name_len) && !is_reserved_word(name_buf)) {
+                location->target = APEX_PROXY_TARGET_UPSTREAM;
+                location->upstream_name = config_strdup_range(name_buf, name_len);
+                if (location->upstream_name == NULL) {
+                    return config_oom(parser->error);
+                }
+                return true;
+            }
+        }
+    }
+
+    if (memchr(target, '/', length) != NULL || memchr(target, '?', length) != NULL ||
+        memchr(target, '#', length) != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass endpoint must be host:port or upstream");
         return false;
     }
 
@@ -1654,7 +1680,7 @@ static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *lo
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass endpoint is too long");
         return false;
     }
-    memcpy(endpoint_text, endpoint, length);
+    memcpy(endpoint_text, target, length);
     endpoint_text[length] = '\0';
 
     char host[APEX_CONFIG_HOST_MAX];
@@ -2005,11 +2031,54 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                 return false;
             }
             location->acl_rule_count++;
+        } else if (token_is_word(directive, "limit_req")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *arg = parser_scalar(parser, "limit_req parameter");
+                if (arg == NULL) return false;
+                if (strncmp(arg->text, "zone=", 5) == 0) {
+                    snprintf(location->limit_req_zone, sizeof(location->limit_req_zone), "%s", arg->text + 5);
+                } else if (strncmp(arg->text, "burst=", 6) == 0) {
+                    location->limit_req_burst = (uint32_t)strtoul(arg->text + 6, NULL, 10);
+                } else if (strcmp(arg->text, "nodelay") == 0) {
+                    location->limit_req_nodelay = true;
+                } else if (location->limit_req_zone[0] == '\0') {
+                    snprintf(location->limit_req_zone, sizeof(location->limit_req_zone), "%s", arg->text);
+                }
+            }
+        } else if (token_is_word(directive, "limit_req_status")) {
+            const token_t *val = parser_scalar(parser, "status code");
+            if (val == NULL) return false;
+            uint64_t code = 0;
+            if (!token_to_u64(val, 400, 599, &code)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_req_status");
+                return false;
+            }
+            location->limit_req_status = (int)code;
+        } else if (token_is_word(directive, "limit_conn")) {
+            const token_t *first = parser_scalar(parser, "zone name");
+            if (first == NULL) return false;
+            if (strncmp(first->text, "zone=", 5) == 0) {
+                snprintf(location->limit_conn_zone, sizeof(location->limit_conn_zone), "%s", first->text + 5);
+            } else {
+                snprintf(location->limit_conn_zone, sizeof(location->limit_conn_zone), "%s", first->text);
+            }
+            const token_t *second = parser_scalar(parser, "max connections");
+            if (second == NULL) return false;
+            location->limit_conn_max = (uint32_t)strtoul(second->text, NULL, 10);
+        } else if (token_is_word(directive, "limit_conn_status")) {
+            const token_t *val = parser_scalar(parser, "status code");
+            if (val == NULL) return false;
+            uint64_t code = 0;
+            if (!token_to_u64(val, 400, 599, &code)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_conn_status");
+                return false;
+            }
+            location->limit_conn_status = (int)code;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny");
+                                "proxy_http_version, return, allow, deny, limit_req, limit_conn");
             return false;
         }
 
@@ -2215,9 +2284,52 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
             server->acl_rule_count++;
+        } else if (token_is_word(directive, "limit_req")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *arg = parser_scalar(parser, "limit_req parameter");
+                if (arg == NULL) return false;
+                if (strncmp(arg->text, "zone=", 5) == 0) {
+                    snprintf(server->limit_req_zone, sizeof(server->limit_req_zone), "%s", arg->text + 5);
+                } else if (strncmp(arg->text, "burst=", 6) == 0) {
+                    server->limit_req_burst = (uint32_t)strtoul(arg->text + 6, NULL, 10);
+                } else if (strcmp(arg->text, "nodelay") == 0) {
+                    server->limit_req_nodelay = true;
+                } else if (server->limit_req_zone[0] == '\0') {
+                    snprintf(server->limit_req_zone, sizeof(server->limit_req_zone), "%s", arg->text);
+                }
+            }
+        } else if (token_is_word(directive, "limit_req_status")) {
+            const token_t *val = parser_scalar(parser, "status code");
+            if (val == NULL) return false;
+            uint64_t code = 0;
+            if (!token_to_u64(val, 400, 599, &code)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_req_status");
+                return false;
+            }
+            server->limit_req_status = (int)code;
+        } else if (token_is_word(directive, "limit_conn")) {
+            const token_t *first = parser_scalar(parser, "zone name");
+            if (first == NULL) return false;
+            if (strncmp(first->text, "zone=", 5) == 0) {
+                snprintf(server->limit_conn_zone, sizeof(server->limit_conn_zone), "%s", first->text + 5);
+            } else {
+                snprintf(server->limit_conn_zone, sizeof(server->limit_conn_zone), "%s", first->text);
+            }
+            const token_t *second = parser_scalar(parser, "max connections");
+            if (second == NULL) return false;
+            server->limit_conn_max = (uint32_t)strtoul(second->text, NULL, 10);
+        } else if (token_is_word(directive, "limit_conn_status")) {
+            const token_t *val = parser_scalar(parser, "status code");
+            if (val == NULL) return false;
+            uint64_t code = 0;
+            if (!token_to_u64(val, 400, 599, &code)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_conn_status");
+                return false;
+            }
+            server->limit_conn_status = (int)code;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny");
+            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn");
             return false;
         }
 
@@ -2276,6 +2388,19 @@ static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t 
         const char *equals = memchr(name, '=', name_length);
         size_t key_length = name_length;
 
+        if (equals == NULL) {
+            if (token_is_word(attribute, "backup")) {
+                server.is_backup = true;
+                parser_advance(parser);
+                continue;
+            }
+            if (token_is_word(attribute, "down")) {
+                server.is_down = true;
+                parser_advance(parser);
+                continue;
+            }
+        }
+
         if (equals != NULL) {
             key_length = (size_t)(equals - name);
         }
@@ -2328,9 +2453,21 @@ static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t 
                 return false;
             }
             server.max_conns = (uint32_t)parsed;
+        } else if (key_length == 9u && strncmp(name, "max_fails", 9u) == 0) {
+            if (!token_to_u64(value_token, 1u, 1000u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_fails must be between 1 and 1000");
+                return false;
+            }
+            upstream->max_fails = (uint32_t)parsed;
+        } else if (key_length == 12u && strncmp(name, "fail_timeout", 12u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for fail_timeout");
+                return false;
+            }
+            upstream->fail_timeout_ms = parsed;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown backend option");
-            parser_hint(parser, "backend options are weight=<n> and max_conns=<n>");
+            parser_hint(parser, "backend options are weight=<n>, max_conns=<n>, max_fails=<n>, fail_timeout=<dur>, backup, down");
             return false;
         }
     }
@@ -2501,8 +2638,12 @@ static bool parse_upstream_block(parser_t *parser) {
             }
             continue;
         }
-        if (token_is_word(directive, "policy") || token_is_word(directive, "algorithm")) {
-            const token_t *value = parser_scalar(parser, "round_robin or p2c");
+        if (token_is_word(directive, "least_conn") || token_is_word(directive, "least-conn")) {
+            upstream->policy = APEX_BALANCE_LEAST_CONN;
+        } else if (token_is_word(directive, "ip_hash") || token_is_word(directive, "ip-hash")) {
+            upstream->policy = APEX_BALANCE_IP_HASH;
+        } else if (token_is_word(directive, "policy") || token_is_word(directive, "algorithm")) {
+            const token_t *value = parser_scalar(parser, "round_robin, p2c, least_conn, or ip_hash");
             if (value == NULL) {
                 return false;
             }
@@ -2510,8 +2651,12 @@ static bool parse_upstream_block(parser_t *parser) {
                 upstream->policy = APEX_BALANCE_ROUND_ROBIN;
             } else if (token_is_word(value, "p2c")) {
                 upstream->policy = APEX_BALANCE_P2C;
+            } else if (token_is_word(value, "least_conn") || token_is_word(value, "least-conn")) {
+                upstream->policy = APEX_BALANCE_LEAST_CONN;
+            } else if (token_is_word(value, "ip_hash") || token_is_word(value, "ip-hash")) {
+                upstream->policy = APEX_BALANCE_IP_HASH;
             } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "policy must be round_robin or p2c");
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "policy must be round_robin, p2c, least_conn, or ip_hash");
                 return false;
             }
         } else if (token_is_word(directive, "keepalive")) {
@@ -2600,6 +2745,45 @@ static bool parse_upstream_block(parser_t *parser) {
     return true;
 }
 
+static bool parse_size_str(const char *text, size_t *value_bytes) {
+    if (text == NULL || *text == '\0') return false;
+    char *endptr = NULL;
+    unsigned long long val = strtoull(text, &endptr, 10);
+    if (endptr == text) return false;
+    size_t multiplier = 1;
+    if (*endptr == 'k' || *endptr == 'K') {
+        multiplier = 1024ULL;
+        endptr++;
+    } else if (*endptr == 'm' || *endptr == 'M') {
+        multiplier = 1024ULL * 1024ULL;
+        endptr++;
+    } else if (*endptr == 'g' || *endptr == 'G') {
+        multiplier = 1024ULL * 1024ULL * 1024ULL;
+        endptr++;
+    }
+    if (*endptr != '\0') return false;
+    *value_bytes = (size_t)(val * multiplier);
+    return true;
+}
+
+static bool parse_rate_str(const char *text, double *rate_per_sec, uint32_t *rate_r_s) {
+    if (text == NULL || *text == '\0') return false;
+    char *endptr = NULL;
+    double val = strtod(text, &endptr);
+    if (endptr == text || val <= 0.0) return false;
+    if (strcmp(endptr, "r/s") == 0) {
+        *rate_per_sec = val;
+        *rate_r_s = (uint32_t)ceil(val);
+        return true;
+    } else if (strcmp(endptr, "r/m") == 0) {
+        *rate_per_sec = val / 60.0;
+        *rate_r_s = (uint32_t)ceil(*rate_per_sec);
+        if (*rate_r_s == 0) *rate_r_s = 1;
+        return true;
+    }
+    return false;
+}
+
 static bool parse_http_directive(parser_t *parser, const token_t *directive) {
     if (token_is_word(directive, "worker_connections")) {
         const token_t *value = parser_scalar(parser, "a connection count");
@@ -2644,10 +2828,91 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
             parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "server_tokens must be on or off");
             return false;
         }
+    } else if (token_is_word(directive, "limit_req_zone")) {
+        if (parser->config->http.rate_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many rate limit zones (max %u)",
+                         APEX_CONFIG_MAX_RATE_ZONES);
+            return false;
+        }
+        apex_rate_limit_zone_t *zone = &parser->config->http.rate_zones[parser->config->http.rate_zone_count];
+        memset(zone, 0, sizeof(*zone));
+
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *arg = parser_scalar(parser, "limit_req_zone parameter");
+            if (arg == NULL) return false;
+            if (arg->text[0] == '$') {
+                snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
+            } else if (strncmp(arg->text, "zone=", 5) == 0) {
+                const char *spec = arg->text + 5;
+                const char *colon = strchr(spec, ':');
+                if (colon != NULL) {
+                    size_t name_len = (size_t)(colon - spec);
+                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                    memcpy(zone->name, spec, name_len);
+                    zone->name[name_len] = '\0';
+                    if (!parse_size_str(colon + 1, &zone->size_bytes)) {
+                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
+                        return false;
+                    }
+                } else {
+                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
+                }
+            } else if (strncmp(arg->text, "rate=", 5) == 0) {
+                if (!parse_rate_str(arg->text + 5, &zone->rate_per_sec, &zone->rate_r_s)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid rate '%s'", arg->text + 5);
+                    return false;
+                }
+            }
+        }
+        if (zone->name[0] == '\0') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_req_zone requires a zone name");
+            return false;
+        }
+        if (zone->rate_per_sec <= 0.0) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_req_zone requires rate=<num>r/s or rate=<num>r/m");
+            return false;
+        }
+        parser->config->http.rate_zone_count++;
+    } else if (token_is_word(directive, "limit_conn_zone")) {
+        if (parser->config->http.conn_zone_count >= APEX_CONFIG_MAX_CONN_ZONES) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many conn limit zones (max %u)",
+                         APEX_CONFIG_MAX_CONN_ZONES);
+            return false;
+        }
+        apex_conn_limit_zone_t *zone = &parser->config->http.conn_zones[parser->config->http.conn_zone_count];
+        memset(zone, 0, sizeof(*zone));
+
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *arg = parser_scalar(parser, "limit_conn_zone parameter");
+            if (arg == NULL) return false;
+            if (arg->text[0] == '$') {
+                snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
+            } else if (strncmp(arg->text, "zone=", 5) == 0) {
+                const char *spec = arg->text + 5;
+                const char *colon = strchr(spec, ':');
+                if (colon != NULL) {
+                    size_t name_len = (size_t)(colon - spec);
+                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                    memcpy(zone->name, spec, name_len);
+                    zone->name[name_len] = '\0';
+                    if (!parse_size_str(colon + 1, &zone->size_bytes)) {
+                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
+                        return false;
+                    }
+                } else {
+                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
+                }
+            }
+        }
+        if (zone->name[0] == '\0') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_conn_zone requires a zone name");
+            return false;
+        }
+        parser->config->http.conn_zone_count++;
     } else {
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, upstream, server");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, upstream, server");
         return false;
     }
     return true;
@@ -3193,7 +3458,8 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
 
         for (size_t server_index = 0; server_index < source->server_count; server_index++) {
             const apex_upstream_server_config_t *server = &source->servers[server_index];
-            if (apex_upstream_add_server(group, server->host, server->port, server->weight) < 0) {
+            if (apex_upstream_add_server_ex(group, server->host, server->port, server->weight,
+                                            server->is_backup, server->is_down) < 0) {
                 runtime_error_at(error, config->source, server->line, "cannot resolve upstream '%s' server %s:%u",
                                  source->name, server->host, (unsigned)server->port);
                 apex_runtime_destroy(runtime);
@@ -3254,6 +3520,16 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         return NULL;
     }
 
+    if (config->http.rate_zone_count > 0 || config->http.conn_zone_count > 0) {
+        rate_limiter_t *limiter = calloc(1, sizeof(*limiter));
+        if (limiter != NULL) {
+            for (size_t i = 0; i < APEX_RATELIMIT_SHARDS; i++) {
+                pthread_mutex_init(&limiter->shards[i].lock, NULL);
+            }
+            runtime->rate_limiter = limiter;
+        }
+    }
+
     apex_health_prober_start(runtime->groups, runtime->group_count);
     return runtime;
 }
@@ -3264,6 +3540,20 @@ void apex_runtime_destroy(apex_runtime_t *runtime) {
     }
     apex_health_prober_stop();
     apex_module_registry_destroy(runtime);
+    if (runtime->rate_limiter != NULL) {
+        rate_limiter_t *limiter = (rate_limiter_t *)runtime->rate_limiter;
+        for (size_t i = 0; i < APEX_RATELIMIT_SHARDS; i++) {
+            pthread_mutex_destroy(&limiter->shards[i].lock);
+            rate_entry_t *entry = limiter->shards[i].head;
+            while (entry != NULL) {
+                rate_entry_t *next = entry->next;
+                free(entry);
+                entry = next;
+            }
+        }
+        free(limiter);
+        runtime->rate_limiter = NULL;
+    }
     free(runtime->groups);
     free(runtime->endpoint_groups);
     free(runtime);
@@ -3393,4 +3683,181 @@ bool apex_runtime_match(const apex_runtime_t *runtime, const char *host, size_t 
     }
 
     return true;
+}
+
+static inline uint32_t ratelimit_hash(const char *zone, const char *key) {
+    uint32_t h = 2166136261u;
+    if (zone != NULL) {
+        for (const char *p = zone; *p; p++) {
+            h ^= (uint8_t)*p;
+            h *= 16777619u;
+        }
+    }
+    h ^= 0x5c;
+    h *= 16777619u;
+    if (key != NULL) {
+        for (const char *p = key; *p; p++) {
+            h ^= (uint8_t)*p;
+            h *= 16777619u;
+        }
+    }
+    return h;
+}
+
+bool apex_rate_limit_check(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip,
+                           uint32_t burst, bool nodelay, uint32_t *retry_after_sec) {
+    (void)nodelay;
+    if (runtime == NULL || runtime->config == NULL || zone_name == NULL || zone_name[0] == '\0') {
+        return true;
+    }
+    if (runtime->rate_limiter == NULL) {
+        return true;
+    }
+
+    const apex_rate_limit_zone_t *zone = NULL;
+    for (size_t i = 0; i < runtime->config->http.rate_zone_count; i++) {
+        if (strcmp(runtime->config->http.rate_zones[i].name, zone_name) == 0) {
+            zone = &runtime->config->http.rate_zones[i];
+            break;
+        }
+    }
+    if (zone == NULL || zone->rate_per_sec <= 0.0) {
+        return true;
+    }
+
+    char key_buf[128];
+    snprintf(key_buf, sizeof(key_buf), "%s:%s", zone_name,
+             client_ip != NULL && client_ip[0] != '\0' ? client_ip : "127.0.0.1");
+
+    rate_limiter_t *limiter = (rate_limiter_t *)runtime->rate_limiter;
+    uint32_t shard_idx = ratelimit_hash(zone_name, client_ip) % APEX_RATELIMIT_SHARDS;
+    rate_shard_t *shard = &limiter->shards[shard_idx];
+
+    pthread_mutex_lock(&shard->lock);
+    rate_entry_t *entry = shard->head;
+    while (entry != NULL) {
+        if (strcmp(entry->key, key_buf) == 0) {
+            break;
+        }
+        entry = entry->next;
+    }
+
+    uint64_t now_us = config_monotonic_us();
+    if (entry == NULL) {
+        entry = calloc(1, sizeof(*entry));
+        if (entry == NULL) {
+            pthread_mutex_unlock(&shard->lock);
+            return true;
+        }
+        snprintf(entry->key, sizeof(entry->key), "%s", key_buf);
+        entry->last_time_us = now_us;
+        entry->tokens = 1.0 + (double)burst;
+        entry->next = shard->head;
+        shard->head = entry;
+    } else {
+        uint64_t elapsed_us = (now_us > entry->last_time_us) ? (now_us - entry->last_time_us) : 0;
+        entry->last_time_us = now_us;
+        double added = ((double)elapsed_us / 1000000.0) * zone->rate_per_sec;
+        entry->tokens += added;
+        double max_cap = 1.0 + (double)burst;
+        if (entry->tokens > max_cap) {
+            entry->tokens = max_cap;
+        }
+    }
+
+    if (entry->tokens >= 1.0) {
+        entry->tokens -= 1.0;
+        pthread_mutex_unlock(&shard->lock);
+        return true;
+    }
+
+    if (retry_after_sec != NULL) {
+        double needed = 1.0 - entry->tokens;
+        double wait_sec = needed / zone->rate_per_sec;
+        uint32_t retry = (uint32_t)ceil(wait_sec);
+        if (retry == 0) {
+            retry = 1;
+        }
+        *retry_after_sec = retry;
+    }
+    pthread_mutex_unlock(&shard->lock);
+    return false;
+}
+
+bool apex_conn_limit_acquire(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip,
+                             uint32_t max_conns) {
+    if (runtime == NULL || runtime->config == NULL || zone_name == NULL || zone_name[0] == '\0') {
+        return true;
+    }
+    if (runtime->rate_limiter == NULL || max_conns == 0) {
+        return true;
+    }
+
+    char key_buf[128];
+    snprintf(key_buf, sizeof(key_buf), "%s:%s", zone_name,
+             client_ip != NULL && client_ip[0] != '\0' ? client_ip : "127.0.0.1");
+
+    rate_limiter_t *limiter = (rate_limiter_t *)runtime->rate_limiter;
+    uint32_t shard_idx = ratelimit_hash(zone_name, client_ip) % APEX_RATELIMIT_SHARDS;
+    rate_shard_t *shard = &limiter->shards[shard_idx];
+
+    pthread_mutex_lock(&shard->lock);
+    rate_entry_t *entry = shard->head;
+    while (entry != NULL) {
+        if (strcmp(entry->key, key_buf) == 0) {
+            break;
+        }
+        entry = entry->next;
+    }
+
+    if (entry == NULL) {
+        entry = calloc(1, sizeof(*entry));
+        if (entry == NULL) {
+            pthread_mutex_unlock(&shard->lock);
+            return true;
+        }
+        snprintf(entry->key, sizeof(entry->key), "%s", key_buf);
+        entry->last_time_us = config_monotonic_us();
+        entry->active_conns = 1;
+        entry->next = shard->head;
+        shard->head = entry;
+        pthread_mutex_unlock(&shard->lock);
+        return true;
+    }
+
+    if (entry->active_conns >= (int32_t)max_conns) {
+        pthread_mutex_unlock(&shard->lock);
+        return false;
+    }
+
+    entry->active_conns++;
+    pthread_mutex_unlock(&shard->lock);
+    return true;
+}
+
+void apex_conn_limit_release(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip) {
+    if (runtime == NULL || runtime->rate_limiter == NULL || zone_name == NULL || zone_name[0] == '\0') {
+        return;
+    }
+
+    char key_buf[128];
+    snprintf(key_buf, sizeof(key_buf), "%s:%s", zone_name,
+             client_ip != NULL && client_ip[0] != '\0' ? client_ip : "127.0.0.1");
+
+    rate_limiter_t *limiter = (rate_limiter_t *)runtime->rate_limiter;
+    uint32_t shard_idx = ratelimit_hash(zone_name, client_ip) % APEX_RATELIMIT_SHARDS;
+    rate_shard_t *shard = &limiter->shards[shard_idx];
+
+    pthread_mutex_lock(&shard->lock);
+    rate_entry_t *entry = shard->head;
+    while (entry != NULL) {
+        if (strcmp(entry->key, key_buf) == 0) {
+            if (entry->active_conns > 0) {
+                entry->active_conns--;
+            }
+            break;
+        }
+        entry = entry->next;
+    }
+    pthread_mutex_unlock(&shard->lock);
 }
