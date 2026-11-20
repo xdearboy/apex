@@ -1,11 +1,14 @@
 #include "internal.h"
 #include "apex/cache.h"
+#include "apex/realip.h"
+#include "apex/log.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <poll.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 static const char *router_determine_content_type(const char *path);
 
@@ -186,14 +189,36 @@ static bool acl_rule_matches(const apex_acl_rule_t *rule, const struct sockaddr_
     return false;
 }
 
-static bool router_check_acl(const apex_acl_rule_t *rules, size_t rule_count, int fd) {
+static bool router_check_acl(const apex_acl_rule_t *rules, size_t rule_count, const char *client_ip, int fd) {
     if (rules == NULL || rule_count == 0) {
         return true;
     }
     struct sockaddr_storage ss;
-    socklen_t slen = sizeof(ss);
-    if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) {
-        return true;
+    memset(&ss, 0, sizeof(ss));
+    if (client_ip != NULL && client_ip[0] != '\0') {
+        const char *eval_ip = client_ip;
+        if (strncasecmp(eval_ip, "::ffff:", 7) == 0) {
+            eval_ip += 7;
+        }
+        struct in_addr addr4;
+        if (inet_pton(AF_INET, eval_ip, &addr4) == 1) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+            sin->sin_family = AF_INET;
+            sin->sin_addr = addr4;
+        } else {
+            struct in6_addr addr6;
+            if (inet_pton(AF_INET6, eval_ip, &addr6) == 1) {
+                struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+                sin6->sin6_family = AF_INET6;
+                sin6->sin6_addr = addr6;
+            }
+        }
+    }
+    if (ss.ss_family == 0 && fd >= 0) {
+        socklen_t slen = sizeof(ss);
+        if (getpeername(fd, (struct sockaddr *)&ss, &slen) != 0) {
+            return true;
+        }
     }
     for (size_t i = 0; i < rule_count; i++) {
         if (acl_rule_matches(&rules[i], &ss)) {
@@ -367,12 +392,15 @@ static bool build_request_headers(const char *request, size_t request_length,
                                   const apex_location_config_t *location,
                                   conn_t *connection, const char *host,
                                   const char *target, size_t target_len,
+                                  const char *effective_client_ip,
                                   char **headers, size_t *headers_length) {
     *headers = NULL;
     *headers_length = 0;
 
     char client_ip[INET6_ADDRSTRLEN];
-    if (!conn_get_peer_ip(connection, client_ip, sizeof(client_ip))) {
+    if (effective_client_ip != NULL && effective_client_ip[0] != '\0') {
+        snprintf(client_ip, sizeof(client_ip), "%s", effective_client_ip);
+    } else if (!conn_get_peer_ip(connection, client_ip, sizeof(client_ip))) {
         strcpy(client_ip, "127.0.0.1");
     }
     size_t client_ip_len = strlen(client_ip);
@@ -1041,12 +1069,14 @@ void apex_proxy_ws_tunnel(conn_t *client_conn, int upstream_fd, uint64_t timeout
 tunnel_done:
     close(upstream_fd);
     client_conn->close_after_write = 1;
-    client_conn->read_length = 0;
-}static void router_forward_request(const apex_runtime_t *runtime, apex_config_route_t *route,
-                                    const char *request, size_t request_length,
-                                    const char *method, size_t method_length, const char *target,
-                                    size_t target_length, const char *body, size_t body_length, apex_res_t *res,
-                                    const char *extra_headers, size_t extra_headers_len) {
+}
+
+static void router_forward_request(const apex_runtime_t *runtime, apex_config_route_t *route,
+                                   const char *request, size_t request_length,
+                                   const char *method, size_t method_length, const char *target,
+                                   size_t target_length, const char *body, size_t body_length, apex_res_t *res,
+                                   const char *extra_headers, size_t extra_headers_len,
+                                   const char *client_ip) {
     conn_t *connection = res->conn;
     const apex_server_config_t *server = route ? route->server : NULL;
     if (route->group == NULL) {
@@ -1159,6 +1189,11 @@ tunnel_done:
                     .body_len = cached.body_len,
                     .upstream_fd = -1,
                 };
+                if (res != NULL) {
+                    res->last_status = cached.status;
+                    res->last_body_bytes = cached.body_len;
+                    strncpy(res->last_upstream_addr, "cache", sizeof(res->last_upstream_addr) - 1);
+                }
                 router_write_proxy_response(connection, server, request, request_length, &cached_proxy_resp,
                                             is_head, hit_extra, strlen(hit_extra));
                 apex_cached_response_free(&cached);
@@ -1175,22 +1210,26 @@ tunnel_done:
     char *headers = NULL;
     size_t headers_length = 0;
     if (!build_request_headers(request, request_length, route->location, connection, host,
-                               target_text, target_length, &headers, &headers_length)) {
+                               target_text, target_length, client_ip, &headers, &headers_length)) {
         free(target_text);
         router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
         return;
     }
 
-    char client_ip[INET6_ADDRSTRLEN];
-    if (!conn_get_peer_ip(connection, client_ip, sizeof(client_ip))) {
-        strcpy(client_ip, "127.0.0.1");
+    char fallback_ip[INET6_ADDRSTRLEN];
+    const char *eff_ip = client_ip;
+    if (eff_ip == NULL || eff_ip[0] == '\0') {
+        if (!conn_get_peer_ip(connection, fallback_ip, sizeof(fallback_ip))) {
+            strcpy(fallback_ip, "127.0.0.1");
+        }
+        eff_ip = fallback_ip;
     }
 
     apex_proxy_request_t proxy_request = {
         .method = method_text,
         .target = target_text,
         .host = host[0] != '\0' ? host : NULL,
-        .client_ip = client_ip,
+        .client_ip = eff_ip,
         .headers = headers,
         .headers_len = headers_length,
         .body = body,
@@ -1211,6 +1250,18 @@ tunnel_done:
         snprintf(message, sizeof(message), "upstream error: %s\n", apex_proxy_strerror(result));
         router_send_error(connection, server, request, request_length, status, reason, message);
         return;
+    }
+
+    if (res != NULL) {
+        res->last_status = proxy_response.status;
+        res->last_body_bytes = proxy_response.body_len;
+        res->last_upstream_status = proxy_response.status;
+        res->last_upstream_time_us = proxy_response.elapsed_us;
+        if (route->group != NULL && proxy_response.server_index < route->group->server_count) {
+            snprintf(res->last_upstream_addr, sizeof(res->last_upstream_addr), "%s:%u",
+                     route->group->servers[proxy_response.server_index].ip,
+                     (unsigned)route->group->servers[proxy_response.server_index].port);
+        }
     }
 
     char combined_extra[1024];
@@ -1525,6 +1576,63 @@ static const char *router_determine_content_type(const char *path) {
     return apex_mime_type(path);
 }
 
+static void router_trigger_logging(apex_pipeline_ctx_t *ctx, int fallback_status, size_t fallback_bytes,
+                                   const char *client_ip) {
+    if (ctx == NULL) return;
+
+    int status = fallback_status;
+    size_t body_bytes = fallback_bytes;
+    const char *upstream_addr = NULL;
+    int upstream_status = 0;
+    uint64_t upstream_time_us = 0;
+
+    if (ctx->res != NULL) {
+        if (ctx->res->last_status > 0) {
+            status = ctx->res->last_status;
+            body_bytes = ctx->res->last_body_bytes;
+        }
+        if (ctx->res->last_upstream_addr[0] != '\0') {
+            upstream_addr = ctx->res->last_upstream_addr;
+        }
+        upstream_status = ctx->res->last_upstream_status;
+        upstream_time_us = ctx->res->last_upstream_time_us;
+    }
+
+    ctx->status_code = status;
+    apex_pipeline_run_phase(ctx, APEX_PHASE_LOGGING);
+
+    if (ctx->runtime != NULL && ctx->runtime->log_manager != NULL) {
+        uint64_t now_us = 0;
+        struct timeval tv;
+        if (gettimeofday(&tv, NULL) == 0) {
+            now_us = (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+        }
+
+        const char *effective_ip = (client_ip && client_ip[0]) ? client_ip : "127.0.0.1";
+
+        apex_log_ctx_t log_ctx = {
+            .client_ip = effective_ip,
+            .method = ctx->method,
+            .method_len = ctx->method_len,
+            .uri = ctx->path,
+            .uri_len = ctx->path_len,
+            .protocol = (ctx->conn != NULL && ctx->conn->transport == APEX_TRANSPORT_TLS) ? "HTTP/1.1" : "HTTP/1.1",
+            .raw_request = ctx->raw_request,
+            .raw_request_len = ctx->raw_request_len,
+            .status = status,
+            .bytes_sent = body_bytes + 150,
+            .body_bytes_sent = body_bytes,
+            .start_time_us = ctx->start_time_us ? ctx->start_time_us : now_us,
+            .end_time_us = now_us,
+            .upstream_addr = upstream_addr,
+            .upstream_status = upstream_status,
+            .upstream_time_us = upstream_time_us,
+        };
+
+        apex_access_log_write((apex_runtime_t *)ctx->runtime, ctx->location, ctx->server, &log_ctx);
+    }
+}
+
 void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
                    apex_res_t *res) {
     const apex_runtime_t *runtime = app->generation != NULL ? app->generation->runtime : NULL;
@@ -1663,6 +1771,17 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             match_path_length = (size_t)(query - path);
         }
 
+        struct timeval start_tv;
+        gettimeofday(&start_tv, NULL);
+        uint64_t start_time_us = (uint64_t)start_tv.tv_sec * 1000000ULL + (uint64_t)start_tv.tv_usec;
+
+        char peer_ip[INET6_ADDRSTRLEN];
+        if (res->conn == NULL || !conn_get_peer_ip(res->conn, peer_ip, sizeof(peer_ip))) {
+            strcpy(peer_ip, "127.0.0.1");
+        }
+        char client_ip[INET6_ADDRSTRLEN];
+        snprintf(client_ip, sizeof(client_ip), "%s", peer_ip);
+
         apex_pipeline_ctx_t ctx = {
             .method = req_buf,
             .method_len = method_len,
@@ -1678,7 +1797,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             .location = NULL,
             .runtime = runtime,
             .status_code = 200,
-            .start_time_us = 0,
+            .start_time_us = start_time_us,
             .extra_headers = {0},
             .extra_headers_len = 0,
             .module_data = {0},
@@ -1691,7 +1810,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             router_send_error_ex(res->conn, NULL, req_buf, header_len,
                                  deny_status, "Forbidden", "Forbidden\n",
                                  ctx.extra_headers, ctx.extra_headers_len);
-            apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+            router_trigger_logging(&ctx, deny_status, 10, client_ip);
             return;
         }
         if (action == APEX_ACTION_DONE) {
@@ -1703,12 +1822,28 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             ctx.server = route.server;
             ctx.location = route.location;
 
+            /* Resolve real client IP */
+            const apex_real_ip_rule_t *real_ip_rules = NULL;
+            size_t real_ip_count = 0;
+            const char *real_ip_hdr = NULL;
+            bool real_ip_rec = false;
+
+            if (route.location != NULL && route.location->real_ip_rule_count > 0) {
+                real_ip_rules = route.location->real_ip_rules;
+                real_ip_count = route.location->real_ip_rule_count;
+                real_ip_hdr = route.location->has_real_ip_header ? route.location->real_ip_header : "X-Forwarded-For";
+                real_ip_rec = route.location->has_real_ip_recursive ? route.location->real_ip_recursive : false;
+            } else if (route.server != NULL && route.server->real_ip_rule_count > 0) {
+                real_ip_rules = route.server->real_ip_rules;
+                real_ip_count = route.server->real_ip_rule_count;
+                real_ip_hdr = route.server->has_real_ip_header ? route.server->real_ip_header : "X-Forwarded-For";
+                real_ip_rec = route.server->has_real_ip_recursive ? route.server->real_ip_recursive : false;
+            }
+            apex_real_ip_resolve(real_ip_rules, real_ip_count, real_ip_hdr, real_ip_rec,
+                                 peer_ip, req_buf, header_len, client_ip, sizeof(client_ip));
+
             /* Server-level return redirect */
             if (route.server != NULL && route.server->return_code > 0) {
-                char client_ip[INET6_ADDRSTRLEN];
-                if (!conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
-                    strcpy(client_ip, "127.0.0.1");
-                }
                 const char *scheme = (res->conn != NULL && res->conn->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
                 char expanded[APEX_CONFIG_PATH_MAX * 2];
                 router_expand_string(route.server->return_url, expanded, sizeof(expanded),
@@ -1718,15 +1853,15 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                                      NULL, 0, NULL, 0, NULL, 0);
                 router_send_redirect(res->conn, route.server->return_code, expanded,
                                      ctx.extra_headers, ctx.extra_headers_len);
-                apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                router_trigger_logging(&ctx, route.server->return_code, 0, client_ip);
                 return;
             }
 
             /* Server-level ACL rules */
             if (route.server != NULL && route.server->acl_rule_count > 0 && res->conn != NULL) {
-                if (!router_check_acl(route.server->acl_rules, route.server->acl_rule_count, res->conn->fd)) {
+                if (!router_check_acl(route.server->acl_rules, route.server->acl_rule_count, client_ip, res->conn->fd)) {
                     router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 403, 10, client_ip);
                     return;
                 }
             }
@@ -1734,10 +1869,6 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             if (route.location != NULL) {
                 /* Location-level return redirect */
                 if (route.location->return_code > 0) {
-                    char client_ip[INET6_ADDRSTRLEN];
-                    if (!conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
-                        strcpy(client_ip, "127.0.0.1");
-                    }
                     const char *scheme = (res->conn != NULL && res->conn->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
                     char expanded[APEX_CONFIG_PATH_MAX * 2];
                     router_expand_string(route.location->return_url, expanded, sizeof(expanded),
@@ -1747,15 +1878,15 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                                          NULL, 0, NULL, 0, NULL, 0);
                     router_send_redirect(res->conn, route.location->return_code, expanded,
                                          ctx.extra_headers, ctx.extra_headers_len);
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, route.location->return_code, 0, client_ip);
                     return;
                 }
 
                 /* Location-level ACL rules */
                 if (route.location->acl_rule_count > 0 && res->conn != NULL) {
-                    if (!router_check_acl(route.location->acl_rules, route.location->acl_rule_count, res->conn->fd)) {
+                    if (!router_check_acl(route.location->acl_rules, route.location->acl_rule_count, client_ip, res->conn->fd)) {
                         router_send_error(res->conn, route.server, req_buf, header_len, 403, "Forbidden", "Forbidden\n");
-                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        router_trigger_logging(&ctx, 403, 10, client_ip);
                         return;
                     }
                 }
@@ -1767,7 +1898,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     router_send_error_ex(res->conn, route.server, req_buf, header_len,
                                          deny_status, "Forbidden", "Forbidden\n",
                                          ctx.extra_headers, ctx.extra_headers_len);
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, deny_status, 10, client_ip);
                     return;
                 }
                 if (action == APEX_ACTION_DONE) {
@@ -1781,7 +1912,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     router_send_error_ex(res->conn, route.server, req_buf, header_len,
                                          deny_status, "Forbidden", "Access Denied by Policy\n",
                                          ctx.extra_headers, ctx.extra_headers_len);
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, deny_status, 23, client_ip);
                     return;
                 }
                 if (action == APEX_ACTION_DONE) {
@@ -1789,10 +1920,6 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                 }
 
                 /* Rate Limiting & Connection Limiting */
-                char client_ip[INET6_ADDRSTRLEN];
-                if (res->conn == NULL || !conn_get_peer_ip(res->conn, client_ip, sizeof(client_ip))) {
-                    strcpy(client_ip, "127.0.0.1");
-                }
 
                 const char *req_zone = (route.location != NULL && route.location->limit_req_zone[0] != '\0')
                     ? route.location->limit_req_zone
@@ -1813,7 +1940,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                                              req_status, req_status == 429 ? "Too Many Requests" : "Service Unavailable",
                                              req_status == 429 ? "Too Many Requests\n" : "Service Unavailable\n",
                                              retry_extra, strlen(retry_extra));
-                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        router_trigger_logging(&ctx, req_status, 20, client_ip);
                         return;
                     }
                 }
@@ -1833,7 +1960,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                                              conn_status, conn_status == 429 ? "Too Many Requests" : "Service Unavailable",
                                              conn_status == 429 ? "Too Many Requests\n" : "Service Unavailable\n",
                                              ctx.extra_headers, ctx.extra_headers_len);
-                        apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                        router_trigger_logging(&ctx, conn_status, 20, client_ip);
                         return;
                     }
                     conn_acquired = true;
@@ -1846,7 +1973,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
                     apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 200, 0, client_ip);
                     return;
                 }
 
@@ -1899,7 +2026,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 200, (size_t)blen, client_ip);
                     return;
                 }
 
@@ -1985,17 +2112,17 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 200, (size_t)blen, client_ip);
                     return;
                 }
 
                 if (route.location->target != APEX_PROXY_TARGET_NONE) {
                     router_forward_request(runtime, &route, req_buf, header_len, req_buf, method_len, path, path_len, body,
-                                           body_len, res, ctx.extra_headers, ctx.extra_headers_len);
+                                           body_len, res, ctx.extra_headers, ctx.extra_headers_len, client_ip);
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 200, 0, client_ip);
                     return;
                 }
                 if (route.location->root != NULL) {
@@ -2005,7 +2132,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
-                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    router_trigger_logging(&ctx, 200, 0, client_ip);
                     return;
                 }
                 if (conn_acquired) {
@@ -2017,7 +2144,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         if (runtime->config != NULL && runtime->config->server_count > 0) {
             router_send_error(res->conn, &runtime->config->servers[0], req_buf, header_len, 404, "Not Found",
                               "Not Found\n");
-            apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+            router_trigger_logging(&ctx, 404, 10, client_ip);
             return;
         }
     }

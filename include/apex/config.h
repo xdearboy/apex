@@ -67,6 +67,31 @@ typedef struct {
     struct in6_addr mask6;
 } apex_acl_rule_t;
 
+#define APEX_CONFIG_MAX_LOG_FORMATS 16
+#define APEX_CONFIG_MAX_REAL_IP_RULES 32
+
+typedef struct {
+    bool is_all;
+    bool is_ipv6;
+    struct in_addr addr4;
+    struct in_addr mask4;
+    struct in6_addr addr6;
+    struct in6_addr mask6;
+} apex_real_ip_rule_t;
+
+typedef struct {
+    char name[64];
+    char format[512];
+} apex_log_format_config_t;
+
+typedef struct {
+    bool off;
+    char path[APEX_CONFIG_PATH_MAX];
+    char format_name[64];
+    size_t buffer_size;
+    uint64_t flush_ms;
+} apex_access_log_config_t;
+
 typedef enum {
     APEX_CONFIG_OK = 0,
     APEX_CONFIG_ERR_IO = -1,
@@ -151,6 +176,15 @@ typedef struct {
     char proxy_cache_bypass[64];
     apex_cache_valid_rule_t cache_valid_rules[8];
     size_t cache_valid_rule_count;
+    apex_access_log_config_t access_log;
+    bool has_access_log;
+
+    apex_real_ip_rule_t real_ip_rules[APEX_CONFIG_MAX_REAL_IP_RULES];
+    size_t real_ip_rule_count;
+    char real_ip_header[64];
+    bool real_ip_recursive;
+    bool has_real_ip_header;
+    bool has_real_ip_recursive;
 
     int http_version;
 } apex_location_config_t;
@@ -240,6 +274,14 @@ typedef struct {
     char proxy_cache_bypass[64];
     apex_cache_valid_rule_t cache_valid_rules[8];
     size_t cache_valid_rule_count;
+    apex_access_log_config_t access_log;
+    bool has_access_log;
+    apex_real_ip_rule_t real_ip_rules[APEX_CONFIG_MAX_REAL_IP_RULES];
+    size_t real_ip_rule_count;
+    char real_ip_header[64];
+    bool real_ip_recursive;
+    bool has_real_ip_header;
+    bool has_real_ip_recursive;
     int line;
 } apex_server_config_t;
 
@@ -255,6 +297,16 @@ typedef struct {
     size_t conn_zone_count;
     apex_cache_zone_config_t cache_zones[APEX_CONFIG_MAX_RATE_ZONES];
     size_t cache_zone_count;
+    apex_log_format_config_t log_formats[APEX_CONFIG_MAX_LOG_FORMATS];
+    size_t log_format_count;
+    apex_access_log_config_t access_log;
+    bool has_access_log;
+    apex_real_ip_rule_t real_ip_rules[APEX_CONFIG_MAX_REAL_IP_RULES];
+    size_t real_ip_rule_count;
+    char real_ip_header[64];
+    bool real_ip_recursive;
+    bool has_real_ip_header;
+    bool has_real_ip_recursive;
 } apex_http_config_t;
 
 typedef struct {
@@ -287,6 +339,7 @@ typedef struct {
     struct apex_module_registry *module_registry;
     void *rate_limiter;
     void *cache_manager;
+    void *log_manager;
 } apex_runtime_t;
 
 typedef struct {

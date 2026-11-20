@@ -110,6 +110,11 @@ void apex_proxy_ws_tunnel(conn_t *client_conn, int upstream_fd, uint64_t timeout
 
 struct apex_res {
     conn_t *conn;
+    int last_status;
+    size_t last_body_bytes;
+    char last_upstream_addr[64];
+    int last_upstream_status;
+    uint64_t last_upstream_time_us;
 };
 
 typedef struct {

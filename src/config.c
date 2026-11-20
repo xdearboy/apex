@@ -5,6 +5,8 @@
 #include "apex/config.h"
 #include "apex/module.h"
 #include "apex/cache.h"
+#include "apex/realip.h"
+#include "apex/log.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -19,6 +21,8 @@
 #include <time.h>
 
 #define APEX_RATELIMIT_SHARDS 1024u
+
+static bool parse_size_str(const char *text, size_t *value_bytes);
 
 typedef struct rate_entry {
     char key[128];
@@ -1809,6 +1813,107 @@ static bool config_parse_cidr(const char *text, size_t len, apex_acl_rule_t *rul
     return false;
 }
 
+static bool config_parse_set_real_ip_from(parser_t *parser, const token_t *directive,
+                                          apex_real_ip_rule_t *rules, size_t *count, size_t max_count) {
+    const token_t *arg = parser_scalar(parser, "an IP or CIDR");
+    if (arg == NULL) return false;
+    if (*count >= max_count) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many set_real_ip_from rules");
+        return false;
+    }
+    if (!apex_real_ip_parse_rule(arg->text, arg->length, &rules[*count])) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid IP or CIDR '%s'", arg->text);
+        return false;
+    }
+    (*count)++;
+    return true;
+}
+
+static bool config_parse_real_ip_header(parser_t *parser, char *header_out, size_t header_max) {
+    const token_t *arg = parser_scalar(parser, "a header name");
+    if (arg == NULL) return false;
+    snprintf(header_out, header_max, "%s", arg->text);
+    return true;
+}
+
+static bool config_parse_real_ip_recursive(parser_t *parser, bool *recursive_out) {
+    const token_t *arg = parser_scalar(parser, "on or off");
+    if (arg == NULL) return false;
+    if (token_is_word(arg, "on")) {
+        *recursive_out = true;
+    } else if (token_is_word(arg, "off")) {
+        *recursive_out = false;
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "real_ip_recursive must be on or off");
+        return false;
+    }
+    return true;
+}
+
+static bool config_parse_access_log(parser_t *parser, const token_t *directive, apex_access_log_config_t *log_cfg) {
+    (void)directive;
+    memset(log_cfg, 0, sizeof(*log_cfg));
+    const token_t *first = parser_scalar(parser, "log path or off");
+    if (first == NULL) return false;
+
+    if (token_is_word(first, "off")) {
+        log_cfg->off = true;
+        return true;
+    }
+
+    snprintf(log_cfg->path, sizeof(log_cfg->path), "%s", first->text);
+    strncpy(log_cfg->format_name, "combined", sizeof(log_cfg->format_name) - 1);
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "access_log parameter");
+        if (arg == NULL) return false;
+        if (strncmp(arg->text, "buffer=", 7) == 0) {
+            if (!parse_size_str(arg->text + 7, &log_cfg->buffer_size)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid buffer size '%s'", arg->text + 7);
+                return false;
+            }
+        } else if (strncmp(arg->text, "flush=", 6) == 0) {
+            token_t temp_tok = *arg;
+            temp_tok.text = arg->text + 6;
+            temp_tok.length = strlen(temp_tok.text);
+            if (!token_to_duration_ms(&temp_tok, &log_cfg->flush_ms)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid flush duration '%s'", arg->text + 6);
+                return false;
+            }
+        } else {
+            snprintf(log_cfg->format_name, sizeof(log_cfg->format_name), "%s", arg->text);
+        }
+    }
+    return true;
+}
+
+static bool config_parse_log_format(parser_t *parser, const token_t *directive) {
+    if (parser->config->http.log_format_count >= APEX_CONFIG_MAX_LOG_FORMATS) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many log_format declarations (max %u)",
+                     APEX_CONFIG_MAX_LOG_FORMATS);
+        return false;
+    }
+    const token_t *name_tok = parser_scalar(parser, "format name");
+    if (name_tok == NULL) return false;
+
+    apex_log_format_config_t *fmt = &parser->config->http.log_formats[parser->config->http.log_format_count];
+    memset(fmt, 0, sizeof(*fmt));
+    snprintf(fmt->name, sizeof(fmt->name), "%s", name_tok->text);
+
+    char fmt_buf[512] = "";
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *part = parser_scalar(parser, "format string");
+        if (part == NULL) return false;
+        if (fmt_buf[0] != '\0' && fmt_buf[strlen(fmt_buf) - 1] != ' ') {
+            strncat(fmt_buf, " ", sizeof(fmt_buf) - strlen(fmt_buf) - 1);
+        }
+        strncat(fmt_buf, part->text, sizeof(fmt_buf) - strlen(fmt_buf) - 1);
+    }
+    snprintf(fmt->format, sizeof(fmt->format), "%s", fmt_buf);
+    parser->config->http.log_format_count++;
+    return true;
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -2154,11 +2259,31 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                     location->cache_valid_rule_count++;
                 }
             }
+        } else if (token_is_word(directive, "set_real_ip_from")) {
+            if (!config_parse_set_real_ip_from(parser, directive, location->real_ip_rules,
+                                              &location->real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "real_ip_header")) {
+            if (!config_parse_real_ip_header(parser, location->real_ip_header, sizeof(location->real_ip_header))) {
+                return false;
+            }
+            location->has_real_ip_header = true;
+        } else if (token_is_word(directive, "real_ip_recursive")) {
+            if (!config_parse_real_ip_recursive(parser, &location->real_ip_recursive)) {
+                return false;
+            }
+            location->has_real_ip_recursive = true;
+        } else if (token_is_word(directive, "access_log")) {
+            if (!config_parse_access_log(parser, directive, &location->access_log)) {
+                return false;
+            }
+            location->has_access_log = true;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid");
+                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
             return false;
         }
 
@@ -2184,6 +2309,24 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             location->cache_valid_rule_count = server->cache_valid_rule_count;
             memcpy(location->cache_valid_rules, server->cache_valid_rules, sizeof(server->cache_valid_rules));
         }
+    }
+
+    /* Inherit server real_ip and access_log settings if not configured in location */
+    if (!location->has_access_log && server->has_access_log) {
+        location->access_log = server->access_log;
+        location->has_access_log = true;
+    }
+    if (location->real_ip_rule_count == 0 && server->real_ip_rule_count > 0) {
+        location->real_ip_rule_count = server->real_ip_rule_count;
+        memcpy(location->real_ip_rules, server->real_ip_rules, sizeof(server->real_ip_rules));
+    }
+    if (!location->has_real_ip_header && server->has_real_ip_header) {
+        snprintf(location->real_ip_header, sizeof(location->real_ip_header), "%s", server->real_ip_header);
+        location->has_real_ip_header = true;
+    }
+    if (!location->has_real_ip_recursive && server->has_real_ip_recursive) {
+        location->real_ip_recursive = server->real_ip_recursive;
+        location->has_real_ip_recursive = true;
     }
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
@@ -2487,9 +2630,29 @@ static bool parse_server_block(parser_t *parser) {
                     server->cache_valid_rule_count++;
                 }
             }
+        } else if (token_is_word(directive, "set_real_ip_from")) {
+            if (!config_parse_set_real_ip_from(parser, directive, server->real_ip_rules,
+                                              &server->real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "real_ip_header")) {
+            if (!config_parse_real_ip_header(parser, server->real_ip_header, sizeof(server->real_ip_header))) {
+                return false;
+            }
+            server->has_real_ip_header = true;
+        } else if (token_is_word(directive, "real_ip_recursive")) {
+            if (!config_parse_real_ip_recursive(parser, &server->real_ip_recursive)) {
+                return false;
+            }
+            server->has_real_ip_recursive = true;
+        } else if (token_is_word(directive, "access_log")) {
+            if (!config_parse_access_log(parser, directive, &server->access_log)) {
+                return false;
+            }
+            server->has_access_log = true;
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid");
+            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
             return false;
         }
 
@@ -2501,6 +2664,25 @@ static bool parse_server_block(parser_t *parser) {
     if (!parser_expect_rbrace(parser)) {
         return false;
     }
+
+    /* Inherit http-level real_ip and access_log settings */
+    if (!server->has_access_log && parser->config->http.has_access_log) {
+        server->access_log = parser->config->http.access_log;
+        server->has_access_log = true;
+    }
+    if (server->real_ip_rule_count == 0 && parser->config->http.real_ip_rule_count > 0) {
+        server->real_ip_rule_count = parser->config->http.real_ip_rule_count;
+        memcpy(server->real_ip_rules, parser->config->http.real_ip_rules, sizeof(parser->config->http.real_ip_rules));
+    }
+    if (!server->has_real_ip_header && parser->config->http.has_real_ip_header) {
+        snprintf(server->real_ip_header, sizeof(server->real_ip_header), "%s", parser->config->http.real_ip_header);
+        server->has_real_ip_header = true;
+    }
+    if (!server->has_real_ip_recursive && parser->config->http.has_real_ip_recursive) {
+        server->real_ip_recursive = parser->config->http.real_ip_recursive;
+        server->has_real_ip_recursive = true;
+    }
+
     if (!have_listen) {
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
         return false;
@@ -3125,10 +3307,35 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
             return false;
         }
         parser->config->http.cache_zone_count++;
+    } else if (token_is_word(directive, "log_format")) {
+        if (!config_parse_log_format(parser, directive)) {
+            return false;
+        }
+    } else if (token_is_word(directive, "access_log")) {
+        if (!config_parse_access_log(parser, directive, &parser->config->http.access_log)) {
+            return false;
+        }
+        parser->config->http.has_access_log = true;
+    } else if (token_is_word(directive, "set_real_ip_from")) {
+        if (!config_parse_set_real_ip_from(parser, directive, parser->config->http.real_ip_rules,
+                                          &parser->config->http.real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
+            return false;
+        }
+    } else if (token_is_word(directive, "real_ip_header")) {
+        if (!config_parse_real_ip_header(parser, parser->config->http.real_ip_header,
+                                         sizeof(parser->config->http.real_ip_header))) {
+            return false;
+        }
+        parser->config->http.has_real_ip_header = true;
+    } else if (token_is_word(directive, "real_ip_recursive")) {
+        if (!config_parse_real_ip_recursive(parser, &parser->config->http.real_ip_recursive)) {
+            return false;
+        }
+        parser->config->http.has_real_ip_recursive = true;
     } else {
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, upstream, server");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, upstream, server");
         return false;
     }
     return true;
@@ -3751,6 +3958,7 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
     }
 
     apex_health_prober_start(runtime->groups, runtime->group_count);
+    apex_log_manager_init(runtime);
     return runtime;
 }
 
@@ -3760,6 +3968,10 @@ void apex_runtime_destroy(apex_runtime_t *runtime) {
     }
     apex_health_prober_stop();
     apex_module_registry_destroy(runtime);
+    if (runtime->log_manager != NULL) {
+        apex_log_manager_destroy(runtime);
+        runtime->log_manager = NULL;
+    }
     if (runtime->cache_manager != NULL) {
         apex_cache_manager_destroy((apex_cache_manager_t *)runtime->cache_manager);
         runtime->cache_manager = NULL;

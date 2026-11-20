@@ -538,6 +538,10 @@ void apex_static_serve(const apex_server_config_t *server,
                     if (hlen > 0 && (size_t)hlen < sizeof(header_buf)) {
                         apex_conn_write(connection, header_buf, (size_t)hlen);
                         apex_record_status(304);
+                        if (res != NULL) {
+                            res->last_status = 304;
+                            res->last_body_bytes = 0;
+                        }
                     }
                     return;
                 }
@@ -566,6 +570,10 @@ void apex_static_serve(const apex_server_config_t *server,
                     if (hlen > 0 && (size_t)hlen < sizeof(header_buf)) {
                         apex_conn_write(connection, header_buf, (size_t)hlen);
                         apex_record_status(304);
+                        if (res != NULL) {
+                            res->last_status = 304;
+                            res->last_body_bytes = 0;
+                        }
                     }
                     return;
                 }
@@ -628,6 +636,10 @@ void apex_static_serve(const apex_server_config_t *server,
                     if (n416 > 0 && (size_t)n416 < sizeof(h416)) {
                         apex_conn_write(connection, h416, (size_t)n416);
                         apex_record_status(416);
+                        if (res != NULL) {
+                            res->last_status = 416;
+                            res->last_body_bytes = 0;
+                        }
                     }
                     return;
                 }
@@ -683,6 +695,10 @@ void apex_static_serve(const apex_server_config_t *server,
     if (header_len > 0 && (size_t)header_len < sizeof(header_buffer)) {
         apex_conn_write(connection, header_buffer, (size_t)header_len);
         apex_record_status(is_range ? 206 : 200);
+        if (res != NULL) {
+            res->last_status = is_range ? 206 : 200;
+            res->last_body_bytes = head_request ? 0 : send_length;
+        }
         if (!head_request && send_length > 0) {
             if (cached_memory != NULL) {
                 apex_conn_write(connection, cached_memory + range_start, send_length);
