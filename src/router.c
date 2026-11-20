@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -2991,19 +2992,173 @@ static bool json_find_string(const char *json, size_t json_len, const char *key,
     return true;
 }
 
+static void append_json(char *buf, size_t buf_size, size_t *offset, const char *fmt, ...) {
+    if (buf == NULL || buf_size == 0 || *offset >= buf_size - 1) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int written = vsnprintf(buf + *offset, buf_size - *offset, fmt, args);
+    va_end(args);
+    if (written > 0) {
+        size_t n = (size_t)written;
+        if (n >= buf_size - *offset) {
+            *offset = buf_size - 1;
+            buf[buf_size - 1] = '\0';
+        } else {
+            *offset += n;
+        }
+    }
+}
+
 static bool json_find_int(const char *json, size_t json_len, const char *key, int *out) {
     if (json == NULL || key == NULL || out == NULL) return false;
     char search_pattern[128];
     snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
     const char *found = memmem(json, json_len, search_pattern, strlen(search_pattern));
     if (found == NULL) return false;
-    const char *colon = memchr(found + strlen(search_pattern), ':', json_len - (size_t)(found + strlen(search_pattern) - json));
+    const char *after = found + strlen(search_pattern);
+    const char *colon = memchr(after, ':', json_len - (size_t)(after - json));
     if (colon == NULL) return false;
     const char *p = colon + 1;
     while (p < json + json_len && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
     if (p >= json + json_len) return false;
-    *out = atoi(p);
+    char num_buf[32];
+    size_t num_len = 0;
+    if (*p == '-' || *p == '+') {
+        num_buf[num_len++] = *p++;
+    }
+    while (p < json + json_len && *p >= '0' && *p <= '9' && num_len + 1 < sizeof(num_buf)) {
+        num_buf[num_len++] = *p++;
+    }
+    if (num_len == 0 || (num_len == 1 && (num_buf[0] == '-' || num_buf[0] == '+'))) {
+        return false;
+    }
+    num_buf[num_len] = '\0';
+    *out = atoi(num_buf);
     return true;
+}
+
+static int b64_char_value(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static bool base64_decode(const char *in, size_t in_len, char *out, size_t out_cap, size_t *out_len) {
+    if (in == NULL || out == NULL || out_cap == 0) return false;
+    size_t i = 0, o = 0;
+    while (i < in_len) {
+        while (i < in_len && (in[i] == ' ' || in[i] == '\t' || in[i] == '\r' || in[i] == '\n')) i++;
+        if (i >= in_len || in[i] == '=') break;
+
+        int b0 = b64_char_value(in[i++]);
+        if (b0 < 0 || i >= in_len) return false;
+        int b1 = b64_char_value(in[i++]);
+        if (b1 < 0) return false;
+
+        int b2 = -1;
+        if (i < in_len && in[i] != '=') {
+            b2 = b64_char_value(in[i++]);
+            if (b2 < 0) return false;
+        } else if (i < in_len && in[i] == '=') {
+            i++;
+        }
+
+        int b3 = -1;
+        if (i < in_len && in[i] != '=') {
+            b3 = b64_char_value(in[i++]);
+            if (b3 < 0) return false;
+        } else if (i < in_len && in[i] == '=') {
+            i++;
+        }
+
+        if (o >= out_cap) return false;
+        out[o++] = (char)((b0 << 2) | (b1 >> 4));
+        if (b2 >= 0) {
+            if (o >= out_cap) return false;
+            out[o++] = (char)(((b1 & 0xF) << 4) | (b2 >> 2));
+        }
+        if (b3 >= 0) {
+            if (o >= out_cap) return false;
+            out[o++] = (char)(((b2 & 0x3) << 6) | b3);
+        }
+    }
+    if (o >= out_cap) return false;
+    out[o] = '\0';
+    if (out_len != NULL) *out_len = o;
+    return true;
+}
+
+static bool router_check_auth_basic(const char *req_buf, size_t req_buf_len, const apex_auth_basic_config_t *ab) {
+    if (ab == NULL || !ab->enabled) return true;
+    if (ab->user_file[0] == '\0') return true;
+
+    const char *auth_hdr = NULL;
+    size_t auth_hdr_len = 0;
+    if (!router_find_header(req_buf, req_buf_len, "Authorization", &auth_hdr, &auth_hdr_len)) {
+        return false;
+    }
+    while (auth_hdr_len > 0 && (*auth_hdr == ' ' || *auth_hdr == '\t')) {
+        auth_hdr++;
+        auth_hdr_len--;
+    }
+    if (auth_hdr_len < 6 || strncasecmp(auth_hdr, "Basic ", 6) != 0) {
+        return false;
+    }
+    const char *b64_str = auth_hdr + 6;
+    size_t b64_len = auth_hdr_len - 6;
+    while (b64_len > 0 && (*b64_str == ' ' || *b64_str == '\t')) {
+        b64_str++;
+        b64_len--;
+    }
+    while (b64_len > 0 && (b64_str[b64_len - 1] == ' ' || b64_str[b64_len - 1] == '\t' ||
+                          b64_str[b64_len - 1] == '\r' || b64_str[b64_len - 1] == '\n')) {
+        b64_len--;
+    }
+
+    char decoded[256];
+    size_t decoded_len = 0;
+    if (!base64_decode(b64_str, b64_len, decoded, sizeof(decoded), &decoded_len)) {
+        return false;
+    }
+
+    char *colon = strchr(decoded, ':');
+    if (colon == NULL) return false;
+    *colon = '\0';
+    const char *req_user = decoded;
+    const char *req_pass = colon + 1;
+
+    FILE *f = fopen(ab->user_file, "r");
+    if (f == NULL) return false;
+
+    char line[512];
+    bool matched = false;
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *nl = strchr(line, '\n');
+        if (nl != NULL) *nl = '\0';
+        char *cr = strchr(line, '\r');
+        if (cr != NULL) *cr = '\0';
+        if (line[0] == '#' || line[0] == '\0') continue;
+
+        char *fcolon = strchr(line, ':');
+        if (fcolon == NULL) continue;
+        *fcolon = '\0';
+        const char *fuser = line;
+        const char *fpass = fcolon + 1;
+
+        if (strcmp(req_user, fuser) == 0) {
+            if (strcmp(req_pass, fpass) == 0) {
+                matched = true;
+                break;
+            }
+        }
+    }
+    fclose(f);
+    return matched;
 }
 
 static bool json_find_bool(const char *json, size_t json_len, const char *key, bool *out) {
@@ -3030,6 +3185,7 @@ static bool json_find_bool(const char *json, size_t json_len, const char *key, b
 static void router_handle_api_request(conn_t *connection, const apex_runtime_t *runtime,
                                       const apex_server_config_t *server,
                                       const apex_location_config_t *location,
+                                      const char *req_buf, size_t req_buf_len,
                                       const char *method, size_t method_len,
                                       const char *path, size_t path_len,
                                       const char *body, size_t body_len,
@@ -3057,9 +3213,124 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
     if (q != NULL) *q = '\0';
 
     char body_buf[16384];
+    body_buf[0] = '\0';
     int status_code = 200;
     const char *reason = "OK";
     size_t resp_len = 0;
+
+    /* 1. API Authentication & Token Protection */
+    if (location != NULL && location->api.secret_set) {
+        bool authorized = false;
+        const char *expected = location->api.secret;
+        size_t exp_len = strlen(expected);
+
+        /* Check Authorization: Bearer <token> */
+        const char *auth_hdr = NULL;
+        size_t auth_hdr_len = 0;
+        if (router_find_header(req_buf, req_buf_len, "Authorization", &auth_hdr, &auth_hdr_len)) {
+            while (auth_hdr_len > 0 && (*auth_hdr == ' ' || *auth_hdr == '\t')) {
+                auth_hdr++;
+                auth_hdr_len--;
+            }
+            if (auth_hdr_len >= 7 && strncasecmp(auth_hdr, "Bearer ", 7) == 0) {
+                const char *tok = auth_hdr + 7;
+                size_t tok_len = auth_hdr_len - 7;
+                while (tok_len > 0 && (*tok == ' ' || *tok == '\t')) {
+                    tok++;
+                    tok_len--;
+                }
+                while (tok_len > 0 && (tok[tok_len - 1] == ' ' || tok[tok_len - 1] == '\t')) {
+                    tok_len--;
+                }
+                if (tok_len == exp_len && memcmp(tok, expected, exp_len) == 0) {
+                    authorized = true;
+                }
+            }
+        }
+
+        /* Check X-API-Key: <token> */
+        if (!authorized) {
+            const char *key_hdr = NULL;
+            size_t key_hdr_len = 0;
+            if (router_find_header(req_buf, req_buf_len, "X-API-Key", &key_hdr, &key_hdr_len)) {
+                while (key_hdr_len > 0 && (*key_hdr == ' ' || *key_hdr == '\t')) {
+                    key_hdr++;
+                    key_hdr_len--;
+                }
+                while (key_hdr_len > 0 && (key_hdr[key_hdr_len - 1] == ' ' || key_hdr[key_hdr_len - 1] == '\t')) {
+                    key_hdr_len--;
+                }
+                if (key_hdr_len == exp_len && memcmp(key_hdr, expected, exp_len) == 0) {
+                    authorized = true;
+                }
+            }
+        }
+
+        /* Check Query Param: ?api_key=<token> or ?secret=<token> */
+        if (!authorized && path != NULL) {
+            const char *qmark = memchr(path, '?', path_len);
+            if (qmark != NULL) {
+                const char *qp = qmark + 1;
+                size_t qlen = path_len - (size_t)(qp - path);
+                const char *p = qp;
+                while (p < qp + qlen) {
+                    bool match = false;
+                    size_t klen = 0;
+                    if ((size_t)(qp + qlen - p) >= 8 && memcmp(p, "api_key=", 8) == 0) {
+                        match = true;
+                        klen = 8;
+                    } else if ((size_t)(qp + qlen - p) >= 7 && memcmp(p, "secret=", 7) == 0) {
+                        match = true;
+                        klen = 7;
+                    }
+                    if (match) {
+                        const char *vstart = p + klen;
+                        const char *vend = vstart;
+                        while (vend < qp + qlen && *vend != '&' && *vend != '#') {
+                            vend++;
+                        }
+                        size_t vlen = (size_t)(vend - vstart);
+                        if (vlen == exp_len && memcmp(vstart, expected, exp_len) == 0) {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                    while (p < qp + qlen && *p != '&') p++;
+                    if (p < qp + qlen && *p == '&') p++;
+                }
+            }
+        }
+
+        if (!authorized) {
+            const apex_server_tokens_config_t *tokens = router_get_server_tokens(runtime, server);
+            char server_hdr[128];
+            router_format_server_header(tokens, server_hdr, sizeof(server_hdr));
+            const char *unauth_body = "{\"error\":\"unauthorized: invalid or missing API key\"}\n";
+            size_t unauth_len = strlen(unauth_body);
+            char header[512];
+            int written = snprintf(header, sizeof(header),
+                                   "HTTP/1.1 401 Unauthorized\r\n"
+                                   "%s"
+                                   "WWW-Authenticate: Bearer realm=\"apex-api\"\r\n"
+                                   "Content-Type: application/json\r\n"
+                                   "Content-Length: %zu\r\n"
+                                   "Connection: %s\r\n\r\n",
+                                   server_hdr, unauth_len,
+                                   connection->close_after_write ? "close" : "keep-alive");
+            if (written > 0 && (size_t)written < sizeof(header)) {
+                apex_conn_write(connection, header, (size_t)written);
+                if (method_len != 4 || memcmp(method, "HEAD", 4) != 0) {
+                    apex_conn_write(connection, unauth_body, unauth_len);
+                }
+            }
+            if (res != NULL) {
+                res->last_status = 401;
+                res->last_body_bytes = unauth_len;
+            }
+            apex_record_status(401);
+            return;
+        }
+    }
 
     const char *rel = NULL;
     if (location != NULL && location->path[0] != '\0' &&
@@ -3082,8 +3353,8 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
     }
 
     if (is_root_discovery) {
-        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
-                                    "{\"version\":\"1.0\",\"http\":{\"upstreams\":\"/api/http/upstreams\"}}\n");
+        append_json(body_buf, sizeof(body_buf), &resp_len,
+                    "{\"version\":\"1.0\",\"http\":{\"upstreams\":\"/api/http/upstreams\"}}\n");
     } else if (sub != NULL) {
         if (*sub == '/') sub++;
 
@@ -3091,30 +3362,31 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
             if (strcmp(meth, "GET") != 0 && strcmp(meth, "HEAD") != 0) {
                 status_code = 405;
                 reason = "Method Not Allowed";
-                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"Method Not Allowed\"}\n");
             } else {
-                size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "{");
-                for (size_t u = 0; u < runtime->config->upstream_count && offset + 64 < sizeof(body_buf); u++) {
+                append_json(body_buf, sizeof(body_buf), &resp_len, "{");
+                for (size_t u = 0; u < runtime->config->upstream_count; u++) {
                     const char *uname = runtime->config->upstreams[u].name;
-                    const upstream_group_t *grp = &runtime->groups[u];
-                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
-                                              "%s\"%s\":{\"servers\":[", u > 0 ? "," : "", uname);
-                    for (size_t s = 0; s < grp->server_count && offset + 128 < sizeof(body_buf); s++) {
+                    upstream_group_t *grp = (upstream_group_t *)&runtime->groups[u];
+                    pthread_rwlock_rdlock(&grp->lock);
+                    append_json(body_buf, sizeof(body_buf), &resp_len,
+                                "%s\"%s\":{\"servers\":[", u > 0 ? "," : "", uname);
+                    for (size_t s = 0; s < grp->server_count; s++) {
                         const upstream_server_t *srv = &grp->servers[s];
                         int64_t act = atomic_load_explicit(&srv->active_conns, memory_order_relaxed);
                         uint64_t reqs = atomic_load_explicit(&srv->total_requests, memory_order_relaxed);
                         uint64_t fails = atomic_load_explicit(&srv->failed_requests, memory_order_relaxed);
-                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                        append_json(body_buf, sizeof(body_buf), &resp_len,
                             "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s,\"active\":%lld,\"requests\":%llu,\"fails\":%llu}",
                             s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
                             (unsigned int)srv->weight, srv->is_down ? "true" : "false",
                             srv->is_backup ? "true" : "false", (long long)act,
                             (unsigned long long)reqs, (unsigned long long)fails);
                     }
-                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]}");
+                    append_json(body_buf, sizeof(body_buf), &resp_len, "]}");
+                    pthread_rwlock_unlock(&grp->lock);
                 }
-                offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "}\n");
-                resp_len = offset;
+                append_json(body_buf, sizeof(body_buf), &resp_len, "}\n");
             }
         } else {
             char group_name[128];
@@ -3136,28 +3408,29 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
             if (matched_group == NULL) {
                 status_code = 404;
                 reason = "Not Found";
-                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"upstream group not found\"}\n");
+                append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"upstream group not found\"}\n");
             } else if (*p == '\0' || strcmp(p, "/") == 0) {
                 if (strcmp(meth, "GET") != 0 && strcmp(meth, "HEAD") != 0) {
                     status_code = 405;
                     reason = "Method Not Allowed";
-                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                    append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"Method Not Allowed\"}\n");
                 } else {
-                    size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"servers\":[");
-                    for (size_t s = 0; s < matched_group->server_count && offset + 128 < sizeof(body_buf); s++) {
+                    pthread_rwlock_rdlock(&matched_group->lock);
+                    append_json(body_buf, sizeof(body_buf), &resp_len, "{\"servers\":[");
+                    for (size_t s = 0; s < matched_group->server_count; s++) {
                         const upstream_server_t *srv = &matched_group->servers[s];
                         int64_t act = atomic_load_explicit(&srv->active_conns, memory_order_relaxed);
                         uint64_t reqs = atomic_load_explicit(&srv->total_requests, memory_order_relaxed);
                         uint64_t fails = atomic_load_explicit(&srv->failed_requests, memory_order_relaxed);
-                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                        append_json(body_buf, sizeof(body_buf), &resp_len,
                             "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s,\"active\":%lld,\"requests\":%llu,\"fails\":%llu}",
                             s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
                             (unsigned int)srv->weight, srv->is_down ? "true" : "false",
                             srv->is_backup ? "true" : "false", (long long)act,
                             (unsigned long long)reqs, (unsigned long long)fails);
                     }
-                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]}\n");
-                    resp_len = offset;
+                    append_json(body_buf, sizeof(body_buf), &resp_len, "]}\n");
+                    pthread_rwlock_unlock(&matched_group->lock);
                 }
             } else if (strncmp(p, "/servers", 8) == 0) {
                 const char *sp = p + 8;
@@ -3167,7 +3440,7 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                         if (!location->api.write_enabled) {
                             status_code = 403;
                             reason = "Forbidden";
-                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                            append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"API write disabled\"}\n");
                         } else {
                             char srv_str[128];
                             srv_str[0] = '\0';
@@ -3183,20 +3456,35 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                             if (srv_str[0] == '\0') {
                                 status_code = 400;
                                 reason = "Bad Request";
-                                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"missing server field\"}\n");
+                                append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"missing server field\"}\n");
                             } else {
                                 char shost[128];
                                 uint16_t sport = 80;
-                                const char *scolon = strchr(srv_str, ':');
-                                if (scolon != NULL) {
-                                    size_t hlen = (size_t)(scolon - srv_str);
-                                    if (hlen >= sizeof(shost)) hlen = sizeof(shost) - 1;
-                                    memcpy(shost, srv_str, hlen);
-                                    shost[hlen] = '\0';
-                                    sport = (uint16_t)atoi(scolon + 1);
-                                    if (sport == 0) sport = 80;
+                                if (srv_str[0] == '[') {
+                                    const char *close_b = strchr(srv_str, ']');
+                                    if (close_b != NULL) {
+                                        size_t hlen = (size_t)(close_b - (srv_str + 1));
+                                        if (hlen >= sizeof(shost)) hlen = sizeof(shost) - 1;
+                                        memcpy(shost, srv_str + 1, hlen);
+                                        shost[hlen] = '\0';
+                                        if (*(close_b + 1) == ':') {
+                                            sport = (uint16_t)atoi(close_b + 2);
+                                        }
+                                    } else {
+                                        snprintf(shost, sizeof(shost), "%s", srv_str);
+                                    }
                                 } else {
-                                    snprintf(shost, sizeof(shost), "%s", srv_str);
+                                    const char *scolon = strchr(srv_str, ':');
+                                    if (scolon != NULL) {
+                                        size_t hlen = (size_t)(scolon - srv_str);
+                                        if (hlen >= sizeof(shost)) hlen = sizeof(shost) - 1;
+                                        memcpy(shost, srv_str, hlen);
+                                        shost[hlen] = '\0';
+                                        sport = (uint16_t)atoi(scolon + 1);
+                                        if (sport == 0) sport = 80;
+                                    } else {
+                                        snprintf(shost, sizeof(shost), "%s", srv_str);
+                                    }
                                 }
 
                                 int added = apex_upstream_add_server_ex(matched_group, shost, sport,
@@ -3205,11 +3493,11 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                                 if (added < 0) {
                                     status_code = 400;
                                     reason = "Bad Request";
-                                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"failed to add server to upstream group\"}\n");
+                                    append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"failed to add server to upstream group\"}\n");
                                 } else {
                                     status_code = 201;
                                     reason = "Created";
-                                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                                    append_json(body_buf, sizeof(body_buf), &resp_len,
                                         "{\"server\":\"%s\",\"weight\":%d,\"down\":%s,\"backup\":%s}\n",
                                         srv_str, weight_val > 0 ? weight_val : 1,
                                         down_val ? "true" : "false", backup_val ? "true" : "false");
@@ -3217,31 +3505,38 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                             }
                         }
                     } else if (strcmp(meth, "GET") == 0 || strcmp(meth, "HEAD") == 0) {
-                        size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "[");
-                        for (size_t s = 0; s < matched_group->server_count && offset + 128 < sizeof(body_buf); s++) {
+                        pthread_rwlock_rdlock(&matched_group->lock);
+                        append_json(body_buf, sizeof(body_buf), &resp_len, "[");
+                        for (size_t s = 0; s < matched_group->server_count; s++) {
                             const upstream_server_t *srv = &matched_group->servers[s];
-                            offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                            append_json(body_buf, sizeof(body_buf), &resp_len,
                                 "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s}",
                                 s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
                                 (unsigned int)srv->weight, srv->is_down ? "true" : "false",
                                 srv->is_backup ? "true" : "false");
                         }
-                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]\n");
-                        resp_len = offset;
+                        append_json(body_buf, sizeof(body_buf), &resp_len, "]\n");
+                        pthread_rwlock_unlock(&matched_group->lock);
                     } else {
                         status_code = 405;
                         reason = "Method Not Allowed";
-                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                        append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"Method Not Allowed\"}\n");
                     }
                 } else {
                     const char *target_addr = sp;
                     upstream_server_t *target_srv = NULL;
                     size_t target_idx = 0;
 
+                    pthread_rwlock_wrlock(&matched_group->lock);
                     for (size_t s = 0; s < matched_group->server_count; s++) {
                         char curr_addr[128];
-                        snprintf(curr_addr, sizeof(curr_addr), "%s:%u",
-                                 matched_group->servers[s].ip, matched_group->servers[s].port);
+                        if (strchr(matched_group->servers[s].ip, ':') != NULL) {
+                            snprintf(curr_addr, sizeof(curr_addr), "[%s]:%u",
+                                     matched_group->servers[s].ip, matched_group->servers[s].port);
+                        } else {
+                            snprintf(curr_addr, sizeof(curr_addr), "%s:%u",
+                                     matched_group->servers[s].ip, matched_group->servers[s].port);
+                        }
                         if (strcmp(curr_addr, target_addr) == 0) {
                             target_srv = &matched_group->servers[s];
                             target_idx = s;
@@ -3250,14 +3545,16 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                     }
 
                     if (target_srv == NULL) {
+                        pthread_rwlock_unlock(&matched_group->lock);
                         status_code = 404;
                         reason = "Not Found";
-                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"server not found in upstream group\"}\n");
+                        append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"server not found in upstream group\"}\n");
                     } else if (strcmp(meth, "PATCH") == 0) {
                         if (!location->api.write_enabled) {
+                            pthread_rwlock_unlock(&matched_group->lock);
                             status_code = 403;
                             reason = "Forbidden";
-                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                            append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"API write disabled\"}\n");
                         } else {
                             bool down_val = false;
                             if (json_find_bool(body, body_len, "down", &down_val)) {
@@ -3269,17 +3566,19 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                             }
                             status_code = 200;
                             reason = "OK";
-                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                            append_json(body_buf, sizeof(body_buf), &resp_len,
                                 "{\"server\":\"%s\",\"weight\":%u,\"down\":%s,\"backup\":%s}\n",
                                 target_addr, (unsigned int)target_srv->weight,
                                 target_srv->is_down ? "true" : "false",
                                 target_srv->is_backup ? "true" : "false");
+                            pthread_rwlock_unlock(&matched_group->lock);
                         }
                     } else if (strcmp(meth, "DELETE") == 0) {
                         if (!location->api.write_enabled) {
+                            pthread_rwlock_unlock(&matched_group->lock);
                             status_code = 403;
                             reason = "Forbidden";
-                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                            append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"API write disabled\"}\n");
                         } else {
                             if (target_idx + 1 < matched_group->server_count) {
                                 memmove(&matched_group->servers[target_idx],
@@ -3287,27 +3586,29 @@ static void router_handle_api_request(conn_t *connection, const apex_runtime_t *
                                         (matched_group->server_count - target_idx - 1) * sizeof(upstream_server_t));
                             }
                             matched_group->server_count--;
+                            pthread_rwlock_unlock(&matched_group->lock);
                             status_code = 200;
                             reason = "OK";
-                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                            append_json(body_buf, sizeof(body_buf), &resp_len,
                                 "{\"status\":\"removed\",\"server\":\"%s\"}\n", target_addr);
                         }
                     } else {
+                        pthread_rwlock_unlock(&matched_group->lock);
                         status_code = 405;
                         reason = "Method Not Allowed";
-                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                        append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"Method Not Allowed\"}\n");
                     }
                 }
             } else {
                 status_code = 404;
                 reason = "Not Found";
-                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"endpoint not found\"}\n");
+                append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"endpoint not found\"}\n");
             }
         }
     } else {
         status_code = 404;
         reason = "Not Found";
-        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"unknown api path\"}\n");
+        append_json(body_buf, sizeof(body_buf), &resp_len, "{\"error\":\"unknown api path\"}\n");
     }
 
     const apex_server_tokens_config_t *tokens = router_get_server_tokens(runtime, server);
@@ -3624,6 +3925,28 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                     }
                 }
 
+                /* Basic Authentication check */
+                const apex_auth_basic_config_t *ab = (route.location != NULL && route.location->auth_basic.is_set)
+                    ? &route.location->auth_basic
+                    : (route.server != NULL && route.server->auth_basic.is_set)
+                        ? &route.server->auth_basic
+                        : (runtime != NULL && runtime->config != NULL && runtime->config->http.auth_basic.is_set)
+                            ? &runtime->config->http.auth_basic
+                            : NULL;
+
+                if (ab != NULL && ab->enabled) {
+                    if (!router_check_auth_basic(req_buf, header_len, ab)) {
+                        char auth_hdr_buf[256];
+                        snprintf(auth_hdr_buf, sizeof(auth_hdr_buf), "WWW-Authenticate: Basic realm=\"%s\"\r\n",
+                                 ab->realm[0] ? ab->realm : "Restricted");
+                        router_send_error_ex(res->conn, route.server, req_buf, header_len,
+                                             401, "Unauthorized", "Unauthorized\n",
+                                             auth_hdr_buf, strlen(auth_hdr_buf));
+                        router_trigger_logging(&ctx, 401, 13, client_ip);
+                        return;
+                    }
+                }
+
                 /* Phase 3: HEADER_FILTER */
                 action = apex_pipeline_run_phase(&ctx, APEX_PHASE_HEADER_FILTER);
                 if (action == APEX_ACTION_DENY) {
@@ -3889,7 +4212,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
 
                 if (route.location->api.enabled) {
                     router_handle_api_request(res->conn, runtime, route.server, route.location,
-                                              req_buf, method_len, path, path_len, body, body_len,
+                                              req_buf, header_len, req_buf, method_len, path, path_len, body, body_len,
                                               res, ctx.extra_headers, ctx.extra_headers_len, client_ip);
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);

@@ -250,23 +250,23 @@ http {{
         t = threading.Thread(target=slow_worker)
         t.start()
 
-        # Wait until slow server confirms request has arrived and is sleeping inside do_GET
-        self.assertTrue(slow_in_flight.wait(timeout=5.0))
+        try:
+            self.assertTrue(slow_in_flight.wait(timeout=5.0))
 
-        # While slow server is busy, all subsequent requests must prefer fast server (0 active conns < 1)
-        fast_client = RawHttpClient(self.port)
-        fast_hits = 0
-        for _ in range(5):
-            status, body = fast_client.request("GET", "/least_conn")
-            self.assertEqual(status, 200)
-            if body == "backend-fast":
-                fast_hits += 1
-
-        release_slow.set()
-        t.join()
-        self.slow_server.on_request = None
-        self.slow_server.delay_event = None
-        self.assertEqual(fast_hits, 5)
+            # While slow server is busy, all subsequent requests must prefer fast server (0 active conns < 1)
+            fast_client = RawHttpClient(self.port)
+            fast_hits = 0
+            for _ in range(5):
+                status, body = fast_client.request("GET", "/least_conn")
+                self.assertEqual(status, 200)
+                if body == "backend-fast":
+                    fast_hits += 1
+            self.assertEqual(fast_hits, 5)
+        finally:
+            release_slow.set()
+            t.join(timeout=3.0)
+            self.slow_server.on_request = None
+            self.slow_server.delay_event = None
 
     def test_04_ip_hash_consistency(self):
         # Repeated requests from same client IP must consistently reach the same backend

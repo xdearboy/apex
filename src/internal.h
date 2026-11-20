@@ -64,6 +64,7 @@ typedef struct conn {
     off_t sendfile_offset;
     size_t sendfile_remain;
     uint8_t corked;
+    uint8_t is_virtual;
 } conn_t;
 
 typedef struct {

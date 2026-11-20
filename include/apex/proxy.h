@@ -1,6 +1,7 @@
 #ifndef APEX_PROXY_H
 #define APEX_PROXY_H
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -112,6 +113,7 @@ typedef struct {
     bool use_ssl_sni;
     char ssl_server_name[128];
     _Atomic uint32_t round_robin_cursor;
+    pthread_rwlock_t lock;
 } upstream_group_t;
 
 /* headers is an optional CRLF-delimited block without the request line.

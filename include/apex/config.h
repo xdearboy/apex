@@ -202,7 +202,16 @@ typedef struct {
 typedef struct {
     bool enabled;
     bool write_enabled;
+    char secret[128];
+    bool secret_set;
 } apex_api_config_t;
+
+typedef struct {
+    bool enabled;
+    char realm[128];
+    char user_file[APEX_CONFIG_PATH_MAX];
+    bool is_set;
+} apex_auth_basic_config_t;
 
 typedef struct {
     int status_code;
@@ -322,6 +331,7 @@ typedef struct {
     apex_resolver_config_t resolver;
     apex_otel_config_t otel;
     apex_api_config_t api;
+    apex_auth_basic_config_t auth_basic;
 } apex_location_config_t;
 
 typedef struct {
@@ -434,6 +444,7 @@ typedef struct {
     apex_resolver_config_t resolver;
     apex_otel_config_t otel;
     apex_api_config_t api;
+    apex_auth_basic_config_t auth_basic;
     int line;
 } apex_server_config_t;
 
@@ -482,6 +493,7 @@ typedef struct {
     apex_sub_filter_config_t sub_filter;
     apex_resolver_config_t resolver;
     apex_otel_config_t otel;
+    apex_auth_basic_config_t auth_basic;
 } apex_http_config_t;
 
 typedef struct {

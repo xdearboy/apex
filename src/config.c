@@ -2666,17 +2666,93 @@ static bool parse_api_directive(parser_t *parser, const token_t *directive,
     if (token_is_word(directive, "api")) {
         api->enabled = true;
         while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-            const token_t *arg = parser_scalar(parser, "write=on or write=off");
+            const token_t *arg = parser_scalar(parser, "api parameter");
             if (arg == NULL) return false;
             if (token_is_word(arg, "write=on")) {
                 api->write_enabled = true;
             } else if (token_is_word(arg, "write=off")) {
                 api->write_enabled = false;
+            } else if (token_is_word(arg, "write")) {
+                const token_t *eq = parser_peek(parser);
+                if (eq->kind == TOKEN_WORD && strcmp(eq->text, "=") == 0) {
+                    parser_advance(parser);
+                }
+                const token_t *val = parser_scalar(parser, "write value (on/off)");
+                if (val == NULL) return false;
+                if (token_is_word(val, "on")) {
+                    api->write_enabled = true;
+                } else if (token_is_word(val, "off")) {
+                    api->write_enabled = false;
+                } else {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "expected 'on' or 'off' for write");
+                    return false;
+                }
+            } else if (strncmp(arg->text, "secret=", 7) == 0) {
+                if (arg->text[7] != '\0') {
+                    snprintf(api->secret, sizeof(api->secret), "%s", arg->text + 7);
+                } else {
+                    const token_t *val = parser_scalar(parser, "secret value");
+                    if (val == NULL) return false;
+                    snprintf(api->secret, sizeof(api->secret), "%s", val->text);
+                }
+                api->secret_set = true;
+            } else if (strncmp(arg->text, "key=", 4) == 0) {
+                if (arg->text[4] != '\0') {
+                    snprintf(api->secret, sizeof(api->secret), "%s", arg->text + 4);
+                } else {
+                    const token_t *val = parser_scalar(parser, "key value");
+                    if (val == NULL) return false;
+                    snprintf(api->secret, sizeof(api->secret), "%s", val->text);
+                }
+                api->secret_set = true;
+            } else if (token_is_word(arg, "secret") || token_is_word(arg, "key")) {
+                const token_t *eq = parser_peek(parser);
+                if (eq->kind == TOKEN_WORD && strcmp(eq->text, "=") == 0) {
+                    parser_advance(parser);
+                }
+                const token_t *val = parser_scalar(parser, "secret value");
+                if (val == NULL) return false;
+                snprintf(api->secret, sizeof(api->secret), "%s", val->text);
+                api->secret_set = true;
             } else {
                 parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "unknown api parameter '%s'", arg->text);
                 return false;
             }
         }
+        return true;
+    }
+    if (token_is_word(directive, "api_key") || token_is_word(directive, "api_secret")) {
+        const token_t *arg = parser_scalar(parser, "api key/secret value");
+        if (arg == NULL) return false;
+        snprintf(api->secret, sizeof(api->secret), "%s", arg->text);
+        api->secret_set = true;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static bool parse_auth_basic_directive(parser_t *parser, const token_t *directive,
+                                       apex_auth_basic_config_t *auth, bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "auth_basic")) {
+        const token_t *arg = parser_scalar(parser, "auth_basic realm or 'off'");
+        if (arg == NULL) return false;
+        auth->is_set = true;
+        if (token_is_word(arg, "off")) {
+            auth->enabled = false;
+            auth->realm[0] = '\0';
+        } else {
+            auth->enabled = true;
+            snprintf(auth->realm, sizeof(auth->realm), "%s", arg->text);
+        }
+        return true;
+    }
+    if (token_is_word(directive, "auth_basic_user_file")) {
+        const token_t *arg = parser_scalar(parser, "auth_basic_user_file path");
+        if (arg == NULL) return false;
+        auth->is_set = true;
+        snprintf(auth->user_file, sizeof(auth->user_file), "%s", arg->text);
         return true;
     }
     *handled = false;
@@ -2695,6 +2771,11 @@ static void otel_inherit(apex_otel_config_t *child, const apex_otel_config_t *pa
 
 static void api_inherit(apex_api_config_t *child, const apex_api_config_t *parent) {
     if (child->enabled || !parent->enabled || parent == NULL) return;
+    *child = *parent;
+}
+
+static void auth_basic_inherit(apex_auth_basic_config_t *child, const apex_auth_basic_config_t *parent) {
+    if (child->is_set || !parent->is_set || parent == NULL) return;
     *child = *parent;
 }
 
@@ -3213,17 +3294,25 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                                 if (handled_api) {
                                     /* handled */
                                 } else {
-                                    bool handled_compress = false;
-                                    if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
-                                        if (!handled_compress) {
-                                            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
-                                                         directive->text);
-                                            parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                                                "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, gzip, brotli, zstd");
+                                    bool handled_auth = false;
+                                    if (!parse_auth_basic_directive(parser, directive, &location->auth_basic, &handled_auth)) {
+                                        return false;
+                                    }
+                                    if (handled_auth) {
+                                        /* handled */
+                                    } else {
+                                        bool handled_compress = false;
+                                        if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
+                                            if (!handled_compress) {
+                                                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
+                                                             directive->text);
+                                                parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
+                                                                    "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, gzip, brotli, zstd");
+                                                return false;
+                                            }
+                                        } else {
                                             return false;
                                         }
-                                    } else {
-                                        return false;
                                     }
                                 }
                             }
@@ -3307,6 +3396,7 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     resolver_inherit(&location->resolver, &server->resolver);
     otel_inherit(&location->otel, &server->otel);
     api_inherit(&location->api, &server->api);
+    auth_basic_inherit(&location->auth_basic, &server->auth_basic);
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
         !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0' && !location->api.enabled) {
@@ -3696,15 +3786,23 @@ static bool parse_server_block(parser_t *parser) {
                             if (handled_api) {
                                 /* handled */
                             } else {
-                                bool handled_compress = false;
-                                if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
-                                    if (!handled_compress) {
-                                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-                                        parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, gzip, brotli, zstd");
+                                bool handled_auth = false;
+                                if (!parse_auth_basic_directive(parser, directive, &server->auth_basic, &handled_auth)) {
+                                    return false;
+                                }
+                                if (handled_auth) {
+                                    /* handled */
+                                } else {
+                                    bool handled_compress = false;
+                                    if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
+                                        if (!handled_compress) {
+                                            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+                                            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, gzip, brotli, zstd");
+                                            return false;
+                                        }
+                                    } else {
                                         return false;
                                     }
-                                } else {
-                                    return false;
                                 }
                             }
                         }
@@ -3757,6 +3855,7 @@ static bool parse_server_block(parser_t *parser) {
     sub_filter_inherit(&server->sub_filter, &parser->config->http.sub_filter);
     resolver_inherit(&server->resolver, &parser->config->http.resolver);
     otel_inherit(&server->otel, &parser->config->http.otel);
+    auth_basic_inherit(&server->auth_basic, &parser->config->http.auth_basic);
 
     if (!have_listen) {
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
@@ -4447,6 +4546,13 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
             return false;
         }
         if (handled_otel) {
+            return true;
+        }
+        bool handled_auth = false;
+        if (!parse_auth_basic_directive(parser, directive, &parser->config->http.auth_basic, &handled_auth)) {
+            return false;
+        }
+        if (handled_auth) {
             return true;
         }
         bool handled_compress = false;

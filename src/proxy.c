@@ -723,7 +723,7 @@ static int build_request(buffer_t *wire, const apex_proxy_request_t *request, co
     }
 
     if (!header_block_contains(request->headers, request->headers_len, "Host")) {
-        char host_header[96];
+        char host_header[256];
         int written;
         if (request->host != NULL && request->host[0] != '\0') {
             written = snprintf(host_header, sizeof(host_header), "Host: %s\r\n", request->host);
@@ -1204,6 +1204,7 @@ void apex_upstream_group_init(upstream_group_t *group) {
     group->health_check_rise = 2u;
     snprintf(group->health_check_uri, sizeof(group->health_check_uri), "/");
     atomic_init(&group->round_robin_cursor, 0u);
+    pthread_rwlock_init(&group->lock, NULL);
 }
 
 #define APEX_DNS_CACHE_MAX_ENTRIES 256
@@ -1537,6 +1538,11 @@ int apex_upstream_add_server_resolver(upstream_group_t *group, const char *host,
         }
     }
 
+    pthread_rwlock_wrlock(&group->lock);
+    if (group->server_count >= APEX_UPSTREAM_MAX_SERVERS) {
+        pthread_rwlock_unlock(&group->lock);
+        return -1;
+    }
     upstream_server_t *server = &group->servers[group->server_count];
     memset(server, 0, sizeof(*server));
     memcpy(&server->address, &addr, addr_len);
@@ -1562,6 +1568,7 @@ int apex_upstream_add_server_resolver(upstream_group_t *group, const char *host,
 
     size_t index = group->server_count;
     group->server_count++;
+    pthread_rwlock_unlock(&group->lock);
     return (int)index;
 }
 
@@ -1630,6 +1637,12 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         return -1;
     }
 
+    pthread_rwlock_rdlock(&group->lock);
+    if (group->server_count == 0) {
+        pthread_rwlock_unlock(&group->lock);
+        return -1;
+    }
+
     size_t primary_candidates[APEX_UPSTREAM_MAX_SERVERS];
     size_t primary_count = 0;
     size_t backup_candidates[APEX_UPSTREAM_MAX_SERVERS];
@@ -1674,10 +1687,13 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
     }
 
     if (candidate_count == 0) {
+        pthread_rwlock_unlock(&group->lock);
         return -1;
     }
     if (candidate_count == 1) {
-        return (ssize_t)candidates[0];
+        ssize_t res = (ssize_t)candidates[0];
+        pthread_rwlock_unlock(&group->lock);
+        return res;
     }
 
     if (group->policy == APEX_BALANCE_LEAST_CONN) {
@@ -1693,6 +1709,7 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
                 best = i;
             }
         }
+        pthread_rwlock_unlock(&group->lock);
         return (ssize_t)best;
     }
 
@@ -1706,7 +1723,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         } else {
             hash = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
         }
-        return (ssize_t)candidates[hash % candidate_count];
+        ssize_t res = (ssize_t)candidates[hash % candidate_count];
+        pthread_rwlock_unlock(&group->lock);
+        return res;
     }
 
     if (group->policy == APEX_BALANCE_P2C) {
@@ -1720,13 +1739,16 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
 
         uint64_t first_score = server_load_score(&group->servers[first]);
         uint64_t second_score = server_load_score(&group->servers[second]);
+        ssize_t res;
         if (first_score < second_score) {
-            return (ssize_t)first;
+            res = (ssize_t)first;
+        } else if (second_score < first_score) {
+            res = (ssize_t)second;
+        } else {
+            res = (ssize_t)(thread_random() & 1u ? first : second);
         }
-        if (second_score < first_score) {
-            return (ssize_t)second;
-        }
-        return (ssize_t)(thread_random() & 1u ? first : second);
+        pthread_rwlock_unlock(&group->lock);
+        return res;
     }
 
     /* Round Robin over candidates */
@@ -1738,7 +1760,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
 
     uint32_t cursor = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
     if (total_weight == 0) {
-        return (ssize_t)candidates[cursor % candidate_count];
+        ssize_t res = (ssize_t)candidates[cursor % candidate_count];
+        pthread_rwlock_unlock(&group->lock);
+        return res;
     }
 
     uint64_t slot = (uint64_t)cursor % total_weight;
@@ -1747,11 +1771,14 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         size_t i = candidates[idx];
         accumulated += group->servers[i].weight ? group->servers[i].weight : 1u;
         if (slot < accumulated) {
+            pthread_rwlock_unlock(&group->lock);
             return (ssize_t)i;
         }
     }
 
-    return (ssize_t)candidates[candidate_count - 1u];
+    ssize_t res = (ssize_t)candidates[candidate_count - 1u];
+    pthread_rwlock_unlock(&group->lock);
+    return res;
 }
 
 ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask) {
@@ -2295,12 +2322,14 @@ static void *prober_worker(void *arg) {
             if (!group->health_check_enabled) {
                 continue;
             }
+            pthread_rwlock_rdlock(&group->lock);
             for (size_t s = 0; s < group->server_count; s++) {
                 if (!atomic_load_explicit(&prober_running, memory_order_acquire)) {
                     break;
                 }
                 probe_single_server(group, &group->servers[s]);
             }
+            pthread_rwlock_unlock(&group->lock);
         }
 
         uint64_t interval = 5000;

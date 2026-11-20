@@ -9,8 +9,13 @@ Covers:
 - DELETE /api/http/upstreams/{group}/servers/{addr} to remove backends
 - Verification that traffic routing reflects runtime additions and down states
 - Write-disabled location (api write=off) rejecting modifications with 403
+- API Key / Secret Token verification (Authorization: Bearer, X-API-Key, ?api_key=, ?secret=)
+- HTTP Basic Auth verification (Authorization: Basic <base64>, 401 with WWW-Authenticate)
+- Location ACL access control (403 Forbidden on denied IP)
+- Thread safety and concurrency during active traffic and API mutations
 """
 
+import base64
 import http.server
 import json
 import os
@@ -68,6 +73,11 @@ class TestUpstreamAPI(unittest.TestCase):
         cls.thread2 = threading.Thread(target=cls.httpd2.serve_forever, daemon=True)
         cls.thread2.start()
 
+        cls.htpasswd_file = tempfile.NamedTemporaryFile("w", suffix=".htpasswd", delete=False)
+        cls.htpasswd_file.write("admin:secretpass123\noperator:testpass456\n")
+        cls.htpasswd_file.flush()
+        cls.htpasswd_file.close()
+
         cls.conf_file = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False)
         cls.conf_file.write(f"""
 http {{
@@ -86,6 +96,21 @@ http {{
 
         location /api/ro/ {{
             api write=off;
+        }}
+
+        location /api/secure/ {{
+            api write=on secret="secret-apex-token-123";
+        }}
+
+        location /api/basic/ {{
+            api write=on;
+            auth_basic "Apex API Realm";
+            auth_basic_user_file "{cls.htpasswd_file.name}";
+        }}
+
+        location /api/blocked/ {{
+            api write=on;
+            deny 127.0.0.1;
         }}
 
         location /app/ {{
@@ -122,8 +147,13 @@ http {{
         cls.httpd1.shutdown()
         cls.httpd2.shutdown()
         os.unlink(cls.conf_file.name)
+        os.unlink(cls.htpasswd_file.name)
 
-    def _request(self, method, path, body=None):
+    def _request(self, method, path, body=None, headers=None):
+        status, parsed, _ = self._request_full(method, path, body=body, headers=headers)
+        return status, parsed
+
+    def _request_full(self, method, path, body=None, headers=None):
         with socket.create_connection(("127.0.0.1", self.apex_port), timeout=3.0) as sock:
             content = ""
             if body is not None:
@@ -137,6 +167,9 @@ http {{
             if body is not None:
                 req += "Content-Type: application/json\r\n"
                 req += f"Content-Length: {len(body_bytes)}\r\n"
+            if headers:
+                for k, v in headers.items():
+                    req += f"{k}: {v}\r\n"
             req += "\r\n"
 
             sock.sendall(req.encode("utf-8") + body_bytes)
@@ -150,13 +183,18 @@ http {{
             header_part, _, body_part = resp.partition(b"\r\n\r\n")
             lines = header_part.decode("utf-8", errors="replace").split("\r\n")
             status_code = int(lines[0].split()[1])
+            resp_headers = {}
+            for line in lines[1:]:
+                if ": " in line:
+                    k, v = line.split(": ", 1)
+                    resp_headers[k.lower()] = v
             parsed_json = None
             if body_part:
                 try:
                     parsed_json = json.loads(body_part.decode("utf-8"))
                 except json.JSONDecodeError:
                     parsed_json = body_part.decode("utf-8", errors="replace")
-            return status_code, parsed_json
+            return status_code, parsed_json, resp_headers
 
     def test_01_api_discovery(self):
         """GET /api/ discovery endpoint."""
@@ -228,14 +266,109 @@ http {{
     def test_06_write_disabled_forbidden(self):
         """Modifications are rejected with 403 on read-only API location."""
         new_server = {"server": f"127.0.0.1:{self.port_be2}", "weight": 1}
-        # In a read-only location (/api/ro/), POST returns 403
         status, resp = self._request("POST", "/api/ro/http/upstreams/app_pool/servers", body=new_server)
         self.assertEqual(status, 403)
         self.assertIn("disabled", resp.get("error", ""))
 
-        # Also test PATCH with nonexistent server on write-enabled location
         status_nf, _ = self._request("PATCH", "/api/http/upstreams/app_pool/servers/127.0.0.1:9999", body={"down": True})
         self.assertEqual(status_nf, 404)
+
+    def test_07_api_secret_unauthorized(self):
+        """Requests without secret token return 401 Unauthorized with Bearer challenge."""
+        status, resp, headers = self._request_full("GET", "/api/secure/http/upstreams")
+        self.assertEqual(status, 401)
+        self.assertIn("bearer realm=\"apex-api\"", headers.get("www-authenticate", "").lower())
+        self.assertIn("unauthorized", resp.get("error", "").lower())
+
+    def test_08_api_secret_bearer_token(self):
+        """Requests with Authorization: Bearer <secret> succeed."""
+        status, data = self._request("GET", "/api/secure/http/upstreams",
+                                     headers={"Authorization": "Bearer secret-apex-token-123"})
+        self.assertEqual(status, 200)
+        self.assertIn("app_pool", data)
+
+    def test_09_api_secret_x_api_key_header(self):
+        """Requests with X-API-Key: <secret> succeed."""
+        status, data = self._request("GET", "/api/secure/http/upstreams",
+                                     headers={"X-API-Key": "secret-apex-token-123"})
+        self.assertEqual(status, 200)
+        self.assertIn("app_pool", data)
+
+    def test_10_api_secret_query_params(self):
+        """Requests with query params ?api_key=<secret> or ?secret=<secret> succeed."""
+        status, data = self._request("GET", "/api/secure/http/upstreams?api_key=secret-apex-token-123")
+        self.assertEqual(status, 200)
+        self.assertIn("app_pool", data)
+
+        status2, data2 = self._request("GET", "/api/secure/http/upstreams?secret=secret-apex-token-123")
+        self.assertEqual(status2, 200)
+        self.assertIn("app_pool", data2)
+
+    def test_11_api_secret_invalid_rejected(self):
+        """Requests with invalid secret are rejected with 401."""
+        status, resp = self._request("GET", "/api/secure/http/upstreams",
+                                     headers={"Authorization": "Bearer wrong-key"})
+        self.assertEqual(status, 401)
+        self.assertIn("unauthorized", resp.get("error", "").lower())
+
+    def test_12_api_basic_auth_unauthorized(self):
+        """Requests to basic auth location without credentials return 401 with Basic challenge."""
+        status, _, headers = self._request_full("GET", "/api/basic/http/upstreams")
+        self.assertEqual(status, 401)
+        self.assertIn("basic realm=\"apex api realm\"", headers.get("www-authenticate", "").lower())
+
+    def test_13_api_basic_auth_success(self):
+        """Requests with valid htpasswd basic auth credentials succeed."""
+        creds = base64.b64encode(b"admin:secretpass123").decode("ascii")
+        status, data = self._request("GET", "/api/basic/http/upstreams",
+                                     headers={"Authorization": f"Basic {creds}"})
+        self.assertEqual(status, 200)
+        self.assertIn("app_pool", data)
+
+    def test_14_api_basic_auth_wrong_password(self):
+        """Requests with invalid password return 401."""
+        creds = base64.b64encode(b"admin:wrongpassword").decode("ascii")
+        status, _ = self._request("GET", "/api/basic/http/upstreams",
+                                  headers={"Authorization": f"Basic {creds}"})
+        self.assertEqual(status, 401)
+
+    def test_15_api_acl_blocked_ip(self):
+        """Location ACL deny rules block unauthorized IP addresses with 403."""
+        status, _ = self._request("GET", "/api/blocked/http/upstreams")
+        self.assertEqual(status, 403)
+
+    def test_16_concurrent_traffic_and_api_mutation(self):
+        """Mutating upstreams concurrently with high traffic load does not cause data races or crashes."""
+        stop_event = threading.Event()
+        errors = []
+
+        def worker():
+            while not stop_event.is_set():
+                try:
+                    s_code, _ = self._request("GET", "/app/test")
+                    if s_code != 200:
+                        errors.append(f"Expected 200, got {s_code}")
+                except Exception as e:
+                    errors.append(str(e))
+                time.sleep(0.005)
+
+        workers = [threading.Thread(target=worker) for _ in range(4)]
+        for w in workers:
+            w.start()
+
+        target = f"127.0.0.1:{self.port_be1}"
+        for i in range(10):
+            weight = (i % 5) + 1
+            s, _ = self._request("PATCH", f"/api/http/upstreams/app_pool/servers/{target}",
+                                 body={"weight": weight, "down": False})
+            self.assertEqual(s, 200)
+            time.sleep(0.01)
+
+        stop_event.set()
+        for w in workers:
+            w.join(timeout=2.0)
+
+        self.assertEqual(len(errors), 0, f"Concurrent workers experienced errors: {errors[:5]}")
 
 
 if __name__ == "__main__":

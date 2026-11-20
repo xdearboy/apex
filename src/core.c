@@ -315,7 +315,7 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
         return;
     }
 
-    if (connection->conn_state != 1) {
+    if (!connection->is_virtual && connection->conn_state != 1) {
         if (connection->conn_state == 0) {
             atomic_fetch_sub_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
         } else if (connection->conn_state == 2) {
@@ -355,7 +355,7 @@ void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t le
         }
         return;
     }
-    if (connection->conn_state != 1) {
+    if (!connection->is_virtual && connection->conn_state != 1) {
         if (connection->conn_state == 0) {
             atomic_fetch_sub_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
         } else if (connection->conn_state == 2) {
@@ -365,7 +365,7 @@ void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t le
         atomic_fetch_add_explicit(&g_apex_stats.writing_connections, 1, memory_order_relaxed);
     }
 #if defined(__linux__)
-    if (connection->transport == APEX_TRANSPORT_PLAIN) {
+    if (!connection->is_virtual && connection->transport == APEX_TRANSPORT_PLAIN) {
         if (connection->sendfile_remain > 0 && connection->sendfile_fd >= 0) {
             close(connection->sendfile_fd);
         }

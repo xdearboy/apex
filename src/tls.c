@@ -112,6 +112,16 @@ SSL_CTX *apex_tls_context_create(const apex_config_t *config, const apex_server_
         }
     }
 
+    if (server->tls.client_auth == APEX_TLS_CLIENT_AUTH_REQUIRED) {
+        SSL_CTX_set_verify(context, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
+        (void)SSL_CTX_set_default_verify_paths(context);
+    } else if (server->tls.client_auth == APEX_TLS_CLIENT_AUTH_OPTIONAL) {
+        SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
+        (void)SSL_CTX_set_default_verify_paths(context);
+    } else {
+        SSL_CTX_set_verify(context, SSL_VERIFY_NONE, NULL);
+    }
+
     ERR_clear_error();
     if (SSL_CTX_use_certificate_chain_file(context, server->tls.certificate) != 1) {
         tls_error(error, config, server, APEX_CONFIG_ERR_IO, "cannot load certificate '%s'",

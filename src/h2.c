@@ -665,6 +665,10 @@ static void h2_dispatch_stream(h2_conn_t *h2, h2_stream_t *stream) {
         h2_stream_reset(h2, stream->stream_id, NGHTTP2_INTERNAL_ERROR);
         return;
     }
+    stream->virtual_conn->is_virtual = 1;
+    if (h2 != NULL && h2->owner != NULL) {
+        stream->virtual_conn->fd = h2->owner->fd;
+    }
 
     apex_res_t response = {.conn = stream->virtual_conn};
     const apex_runtime_t *runtime = h2->worker->generation != NULL ? h2->worker->generation->runtime : NULL;
