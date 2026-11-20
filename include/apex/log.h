@@ -28,6 +28,7 @@ typedef enum {
     APEX_LOG_VAR_UPSTREAM_STATUS,
     APEX_LOG_VAR_UPSTREAM_RESPONSE_TIME,
     APEX_LOG_VAR_REQUEST_TIME,
+    APEX_LOG_VAR_REQUEST_ID,
     APEX_LOG_VAR_HTTP_CUSTOM,
     APEX_LOG_ITEM_LITERAL
 } apex_log_item_type_t;
@@ -62,6 +63,7 @@ typedef struct {
     const char *upstream_addr;
     int upstream_status;
     uint64_t upstream_time_us;
+    const char *request_id;
 } apex_log_ctx_t;
 
 int apex_log_manager_init(apex_runtime_t *runtime);

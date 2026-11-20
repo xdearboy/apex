@@ -154,6 +154,8 @@ int apex_log_format_compile(const char *name, const char *fmt_str, apex_log_form
                 add_item(out_fmt, APEX_LOG_VAR_UPSTREAM_RESPONSE_TIME, NULL, NULL);
             } else if (strcmp(var_name, "request_time") == 0) {
                 add_item(out_fmt, APEX_LOG_VAR_REQUEST_TIME, NULL, NULL);
+            } else if (strcmp(var_name, "request_id") == 0) {
+                add_item(out_fmt, APEX_LOG_VAR_REQUEST_ID, NULL, NULL);
             } else if (strncmp(var_name, "http_", 5) == 0) {
                 /* Custom header e.g. http_x_custom -> X-Custom */
                 char header_trans[64];
@@ -447,6 +449,9 @@ void apex_access_log_write(apex_runtime_t *runtime, const apex_location_config_t
                 val_str = temp;
                 break;
             }
+            case APEX_LOG_VAR_REQUEST_ID:
+                val_str = (ctx->request_id && ctx->request_id[0]) ? ctx->request_id : "-";
+                break;
             case APEX_LOG_VAR_HTTP_CUSTOM:
                 if (extract_header(ctx->raw_request, ctx->raw_request_len, item->custom_header, temp, sizeof(temp))) {
                     val_str = temp;

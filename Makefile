@@ -13,16 +13,18 @@ endif
 
 LIB = libapex.a
 BIN = apex
-SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c src/module.c src/static.c src/cache.c src/realip.c src/log.c src/fastcgi.c
+SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c src/module.c src/static.c src/cache.c src/realip.c src/log.c src/fastcgi.c src/compress.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h include/apex/module.h include/apex/static.h include/apex/cache.h include/apex/realip.h include/apex/log.h include/apex/fastcgi.h src/internal.h
+HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h include/apex/module.h include/apex/static.h include/apex/cache.h include/apex/realip.h include/apex/log.h include/apex/fastcgi.h include/apex/compress.h src/internal.h
 
 TLS_CFLAGS := $(shell pkg-config --cflags libssl libcrypto 2>/dev/null)
 TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s ' -lssl -lcrypto)
 H2_CFLAGS := $(shell pkg-config --cflags libnghttp2 2>/dev/null)
 H2_LIBS := $(shell pkg-config --libs libnghttp2 2>/dev/null || printf '%s ' -lnghttp2)
-CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS)
-LDLIBS = $(TLS_LIBS) $(H2_LIBS) -ldl -lm
+COMPRESS_CFLAGS := $(shell pkg-config --cflags libbrotlienc libzstd zlib 2>/dev/null)
+COMPRESS_LIBS := $(shell pkg-config --libs libbrotlienc libzstd zlib 2>/dev/null || printf '%s ' -lbrotlienc -lzstd -lz)
+CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS) $(COMPRESS_CFLAGS)
+LDLIBS = $(TLS_LIBS) $(H2_LIBS) $(COMPRESS_LIBS) -ldl -lm
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo examples/mod_security_headers.so
@@ -98,6 +100,7 @@ test: all
 	$(PYTHON) tests/test_server_tokens.py ./$(BIN)
 	$(PYTHON) tests/test_map.py ./$(BIN)
 	$(PYTHON) tests/test_https_proxy.py ./$(BIN)
+	$(PYTHON) tests/test_compression.py ./$(BIN)
 
 check: test
 

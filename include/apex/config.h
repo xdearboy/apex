@@ -2,6 +2,7 @@
 #define APEX_CONFIG_H
 
 #include "apex/proxy.h"
+#include "apex/compress.h"
 
 #include <netinet/in.h>
 #include <stdbool.h>
@@ -237,6 +238,8 @@ typedef struct {
     bool proxy_pass_ssl;
     bool proxy_pass_dynamic;
     char proxy_pass_raw[APEX_CONFIG_PATH_MAX];
+    apex_compress_config_t compress;
+    bool has_compress;
 } apex_location_config_t;
 
 typedef struct {
@@ -337,6 +340,8 @@ typedef struct {
     size_t add_header_count;
     size_t add_header_capacity;
     apex_server_tokens_config_t server_tokens;
+    apex_compress_config_t compress;
+    bool has_compress;
     int line;
 } apex_server_config_t;
 
@@ -368,6 +373,8 @@ typedef struct {
     apex_map_t *maps;
     size_t map_count;
     size_t map_capacity;
+    apex_compress_config_t compress;
+    bool has_compress;
 } apex_http_config_t;
 
 typedef struct {
@@ -433,6 +440,9 @@ bool apex_conn_limit_acquire(const apex_runtime_t *runtime, const char *zone_nam
                              uint32_t max_conns);
 void apex_conn_limit_release(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip);
 const char *apex_map_lookup(const apex_config_t *config, const char *target_var, const char *source_val);
+const apex_compress_config_t *apex_config_get_compress(const apex_server_config_t *server,
+                                                       const apex_location_config_t *location,
+                                                       const apex_config_t *config);
 
 #ifdef __cplusplus
 }

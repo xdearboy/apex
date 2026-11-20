@@ -268,6 +268,45 @@ static bool router_status_matches_add_header(int status, bool always) {
             status == 307 || status == 308);
 }
 
+static _Thread_local char s_current_request_id[36] = {0};
+
+static void router_generate_request_id(char *dst, size_t dst_cap) {
+    if (dst == NULL || dst_cap < 33) return;
+    uint8_t rand_bytes[16];
+    static _Thread_local uint64_t seed = 0;
+    static _Thread_local bool seeded = false;
+    bool got_entropy = false;
+
+    int urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (urandom_fd >= 0) {
+        ssize_t n = read(urandom_fd, rand_bytes, sizeof(rand_bytes));
+        close(urandom_fd);
+        if (n == (ssize_t)sizeof(rand_bytes)) {
+            got_entropy = true;
+        }
+    }
+
+    if (!got_entropy) {
+        if (!seeded) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            seed = ((uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec) ^ (uintptr_t)&seed;
+            seeded = true;
+        }
+        for (size_t i = 0; i < 16; i++) {
+            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+            rand_bytes[i] = (uint8_t)(seed >> 32);
+        }
+    }
+
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < 16; i++) {
+        dst[i * 2] = hex_chars[(rand_bytes[i] >> 4) & 0x0F];
+        dst[i * 2 + 1] = hex_chars[rand_bytes[i] & 0x0F];
+    }
+    dst[32] = '\0';
+}
+
 static const char *router_resolve_source_var(const char *source_var,
                                              const char *host,
                                              const char *uri,
@@ -275,6 +314,12 @@ static const char *router_resolve_source_var(const char *source_var,
                                              const char *scheme) {
     if (source_var == NULL || source_var[0] == '\0') {
         return host ? host : "";
+    }
+    if (strcmp(source_var, "request_id") == 0) {
+        if (s_current_request_id[0] == '\0') {
+            router_generate_request_id(s_current_request_id, sizeof(s_current_request_id));
+        }
+        return s_current_request_id;
     }
     if (strcmp(source_var, "host") == 0 || strcmp(source_var, "http_host") == 0) {
         return host ? host : "";
@@ -331,7 +376,13 @@ static void router_expand_string_ex(const apex_runtime_t *runtime,
             char status_buf[16];
             char urt_buf[32];
 
-            if (var_len == 4 && strncmp(var, "host", 4) == 0) {
+            if (var_len == 10 && strncmp(var, "request_id", 10) == 0) {
+                if (s_current_request_id[0] == '\0') {
+                    router_generate_request_id(s_current_request_id, sizeof(s_current_request_id));
+                }
+                subst = s_current_request_id;
+                subst_len = strlen(s_current_request_id);
+            } else if (var_len == 4 && strncmp(var, "host", 4) == 0) {
                 subst = host;
                 subst_len = host_len;
             } else if (var_len == 9 && strncmp(var, "http_host", 9) == 0) {
@@ -1041,11 +1092,79 @@ void router_send_error(conn_t *connection, const apex_server_config_t *server,
     router_send_error_ex(connection, server, request, request_length, status, reason, message, NULL, 0);
 }
 
-static void router_write_proxy_response(conn_t *connection, const apex_server_config_t *server,
+static bool router_compress_response(const apex_compress_config_t *compress,
+                                     const char *request, size_t request_len,
+                                     const char *response_headers, size_t response_headers_len,
+                                     int status,
+                                     const void *in_body, size_t in_len,
+                                     void **out_body, size_t *out_len,
+                                     apex_compress_algo_t *out_algo) {
+    if (compress == NULL || out_body == NULL || out_len == NULL || out_algo == NULL) {
+        return false;
+    }
+    *out_body = NULL;
+    *out_len = 0;
+    *out_algo = APEX_COMPRESS_NONE;
+
+    if (status == 204 || status == 304 || (status >= 100 && status < 200)) {
+        return false;
+    }
+    if (in_body == NULL || in_len == 0) {
+        return false;
+    }
+
+    const char *ae_val = NULL;
+    size_t ae_len = 0;
+    if (!router_find_header(request, request_len, "Accept-Encoding", &ae_val, &ae_len) || ae_len == 0) {
+        return false;
+    }
+
+    const char *ce_val = NULL;
+    size_t ce_len = 0;
+    if (response_headers != NULL && response_headers_len > 0) {
+        if (router_find_header(response_headers, response_headers_len, "Content-Encoding", &ce_val, &ce_len)) {
+            return false; /* Upstream already encoded body */
+        }
+    }
+
+    char ct_buf[128] = "text/plain";
+    const char *ct_val = NULL;
+    size_t ct_len = 0;
+    if (response_headers != NULL && response_headers_len > 0) {
+        if (router_find_header(response_headers, response_headers_len, "Content-Type", &ct_val, &ct_len)) {
+            if (ct_len < sizeof(ct_buf)) {
+                memcpy(ct_buf, ct_val, ct_len);
+                ct_buf[ct_len] = '\0';
+            }
+        }
+    }
+
+    apex_compress_algo_t algo = apex_compress_negotiate(compress, ae_val, ae_len, ct_buf, in_len);
+    if (algo == APEX_COMPRESS_NONE) {
+        return false;
+    }
+
+    int comp_level = 0;
+    if (algo == APEX_COMPRESS_ZSTD) comp_level = compress->zstd_comp_level;
+    else if (algo == APEX_COMPRESS_BROTLI) comp_level = compress->brotli_comp_level;
+    else if (algo == APEX_COMPRESS_GZIP) comp_level = compress->gzip_comp_level;
+
+    if (!apex_compress_buffer(algo, comp_level, in_body, in_len, out_body, out_len)) {
+        return false;
+    }
+
+    *out_algo = algo;
+    return true;
+}
+
+static void router_write_proxy_response(conn_t *connection, const apex_runtime_t *runtime,
+                                        const apex_server_config_t *server,
+                                        const apex_location_config_t *location,
                                         const char *request, size_t request_length,
                                         const apex_proxy_response_t *response,
                                         bool head_request,
-                                        const char *extra_headers, size_t extra_headers_len) {
+                                        const char *extra_headers, size_t extra_headers_len,
+                                        apex_res_t *res) {
     const char *headers = response->headers;
     size_t headers_length = response->headers_len;
     int status = response->status;
@@ -1057,11 +1176,31 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
         return;
     }
 
+    bool no_body = status == 204 || status == 304 || (status >= 100 && status < 200);
+
+    const apex_compress_config_t *compress = apex_config_get_compress(server, location, runtime ? runtime->config : NULL);
+    void *compressed_body = NULL;
+    size_t compressed_body_len = 0;
+    apex_compress_algo_t comp_algo = APEX_COMPRESS_NONE;
+    bool is_compressed = false;
+
+    if (compress != NULL && !head_request && !no_body) {
+        if (router_compress_response(compress, request, request_length,
+                                     headers, headers_length,
+                                     status, response->body, response->body_len,
+                                     &compressed_body, &compressed_body_len, &comp_algo)) {
+            is_compressed = true;
+        }
+    }
+
+    const void *body_to_send = is_compressed ? compressed_body : response->body;
+    size_t body_len_to_send = is_compressed ? compressed_body_len : response->body_len;
+
     apex_conn_write(connection, headers, (size_t)(status_end - headers));
     apex_conn_write(connection, "\r\n", 2u);
 
-    bool no_body = status == 204 || status == 304 || (status >= 100 && status < 200);
     bool no_content_length = true;
+    bool seen_vary = false;
 
     size_t position = (size_t)(status_end - headers) + 2u;
     while (position < headers_length) {
@@ -1095,9 +1234,13 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
                 skip = true;
             } else if (router_header_name_equal(line, name_length, "Content-Length")) {
                 no_content_length = false;
-                if (!head_request || no_body) {
+                if (!head_request || no_body || is_compressed) {
                     skip = true;
                 }
+            } else if (is_compressed && router_header_name_equal(line, name_length, "Content-Encoding")) {
+                skip = true;
+            } else if (router_header_name_equal(line, name_length, "Vary")) {
+                seen_vary = true;
             }
         }
 
@@ -1111,12 +1254,24 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
     char length_header[64];
     if (!head_request && !no_body) {
         int written = snprintf(length_header, sizeof(length_header), "Content-Length: %zu\r\n",
-                               response->body_len);
+                               body_len_to_send);
         if (written > 0 && (size_t)written < sizeof(length_header)) {
             apex_conn_write(connection, length_header, (size_t)written);
         }
     } else if (head_request && no_content_length && !no_body) {
         apex_conn_write(connection, "Content-Length: 0\r\n", 19u);
+    }
+
+    if (is_compressed) {
+        const char *algo_name = apex_compress_algo_name(comp_algo);
+        char ce_hdr[64];
+        int ce_written = snprintf(ce_hdr, sizeof(ce_hdr), "Content-Encoding: %s\r\n", algo_name);
+        if (ce_written > 0) {
+            apex_conn_write(connection, ce_hdr, (size_t)ce_written);
+        }
+        if (!seen_vary) {
+            apex_conn_write(connection, "Vary: Accept-Encoding\r\n", 23);
+        }
     }
 
     const apex_server_tokens_config_t *tokens = router_get_server_tokens(NULL, server);
@@ -1136,8 +1291,15 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
     }
     apex_conn_write(connection, "\r\n", 2u);
 
-    if (!head_request && !no_body && response->body != NULL && response->body_len > 0) {
-        apex_conn_write(connection, response->body, response->body_len);
+    if (!head_request && !no_body && body_to_send != NULL && body_len_to_send > 0) {
+        apex_conn_write(connection, body_to_send, body_len_to_send);
+    }
+
+    if (compressed_body != NULL) {
+        free(compressed_body);
+    }
+    if (res != NULL && is_compressed) {
+        res->last_body_bytes = body_len_to_send;
     }
 }
 
@@ -1502,8 +1664,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                     res->last_body_bytes = cached.body_len;
                     strncpy(res->last_upstream_addr, "cache", sizeof(res->last_upstream_addr) - 1);
                 }
-                router_write_proxy_response(connection, server, request, request_length, &cached_proxy_resp,
-                                            is_head, hit_extra, strlen(hit_extra));
+                router_write_proxy_response(connection, runtime, server, route ? route->location : NULL,
+                                            request, request_length, &cached_proxy_resp,
+                                            is_head, hit_extra, strlen(hit_extra), res);
                 apex_cached_response_free(&cached);
                 free(target_text);
                 return;
@@ -1629,8 +1792,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         }
     }
 
-    router_write_proxy_response(connection, server, request, request_length, &proxy_response,
-                                strcasecmp(method_text, "HEAD") == 0, combined_extra, strlen(combined_extra));
+    router_write_proxy_response(connection, runtime, server, route ? route->location : NULL,
+                                request, request_length, &proxy_response,
+                                strcasecmp(method_text, "HEAD") == 0, combined_extra, strlen(combined_extra), res);
 
     if (proxy_response.status == 101 && proxy_response.upstream_fd >= 0) {
         /* Flush written 101 response headers to client socket */
@@ -1795,6 +1959,25 @@ static void router_forward_fastcgi(const apex_runtime_t *runtime, apex_config_ro
         snprintf(res->last_upstream_addr, sizeof(res->last_upstream_addr), "%s", location->fastcgi_pass);
     }
 
+    const apex_compress_config_t *compress = apex_config_get_compress(server, location, runtime ? runtime->config : NULL);
+    void *compressed_body = NULL;
+    size_t compressed_body_len = 0;
+    apex_compress_algo_t comp_algo = APEX_COMPRESS_NONE;
+    bool is_compressed = false;
+    bool is_head = strcasecmp(method_buf, "HEAD") == 0;
+
+    if (compress != NULL && !is_head && fcgi_resp.body != NULL && fcgi_resp.body_len > 0) {
+        if (router_compress_response(compress, request, request_length,
+                                     fcgi_resp.headers, fcgi_resp.headers_len,
+                                     fcgi_resp.status, fcgi_resp.body, fcgi_resp.body_len,
+                                     &compressed_body, &compressed_body_len, &comp_algo)) {
+            is_compressed = true;
+        }
+    }
+
+    const void *body_to_send = is_compressed ? compressed_body : fcgi_resp.body;
+    size_t body_len_to_send = is_compressed ? compressed_body_len : fcgi_resp.body_len;
+
     char status_line[128];
     int slen = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
                         fcgi_resp.status, fcgi_resp.status_text[0] ? fcgi_resp.status_text : "OK");
@@ -1811,8 +1994,16 @@ static void router_forward_fastcgi(const apex_runtime_t *runtime, apex_config_ro
     if (chlen > 0) apex_conn_write(connection, conn_hdr, (size_t)chlen);
 
     char clen_hdr[64];
-    int clen = snprintf(clen_hdr, sizeof(clen_hdr), "Content-Length: %zu\r\n", fcgi_resp.body_len);
+    int clen = snprintf(clen_hdr, sizeof(clen_hdr), "Content-Length: %zu\r\n", body_len_to_send);
     if (clen > 0) apex_conn_write(connection, clen_hdr, (size_t)clen);
+
+    if (is_compressed) {
+        const char *algo_name = apex_compress_algo_name(comp_algo);
+        char ce_hdr[64];
+        int ce_written = snprintf(ce_hdr, sizeof(ce_hdr), "Content-Encoding: %s\r\n", algo_name);
+        if (ce_written > 0) apex_conn_write(connection, ce_hdr, (size_t)ce_written);
+        apex_conn_write(connection, "Vary: Accept-Encoding\r\n", 23);
+    }
 
     if (extra_headers != NULL && extra_headers_len > 0) {
         apex_conn_write(connection, extra_headers, extra_headers_len);
@@ -1837,8 +2028,15 @@ static void router_forward_fastcgi(const apex_runtime_t *runtime, apex_config_ro
 
     apex_conn_write(connection, "\r\n", 2);
 
-    if (strcasecmp(method_buf, "HEAD") != 0 && fcgi_resp.body != NULL && fcgi_resp.body_len > 0) {
-        apex_conn_write(connection, fcgi_resp.body, fcgi_resp.body_len);
+    if (!is_head && body_to_send != NULL && body_len_to_send > 0) {
+        apex_conn_write(connection, body_to_send, body_len_to_send);
+    }
+
+    if (compressed_body != NULL) {
+        free(compressed_body);
+    }
+    if (res != NULL && is_compressed) {
+        res->last_body_bytes = body_len_to_send;
     }
 
     apex_record_status(fcgi_resp.status);
@@ -2115,6 +2313,7 @@ static void router_trigger_logging(apex_pipeline_ctx_t *ctx, int fallback_status
             .upstream_addr = upstream_addr,
             .upstream_status = upstream_status,
             .upstream_time_us = upstream_time_us,
+            .request_id = ctx->request_id,
         };
 
         apex_access_log_write((apex_runtime_t *)ctx->runtime, ctx->location, ctx->server, &log_ctx);
@@ -2270,6 +2469,8 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         char client_ip[INET6_ADDRSTRLEN];
         snprintf(client_ip, sizeof(client_ip), "%s", peer_ip);
 
+        router_generate_request_id(s_current_request_id, sizeof(s_current_request_id));
+
         apex_pipeline_ctx_t ctx = {
             .method = req_buf,
             .method_len = method_len,
@@ -2288,8 +2489,10 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             .start_time_us = start_time_us,
             .extra_headers = {0},
             .extra_headers_len = 0,
+            .request_id = {0},
             .module_data = {0},
         };
+        memcpy(ctx.request_id, s_current_request_id, sizeof(ctx.request_id));
 
         /* Phase 1: PRE_ROUTING */
         apex_action_t action = apex_pipeline_run_phase(&ctx, APEX_PHASE_PRE_ROUTING);

@@ -60,6 +60,8 @@ struct apex_pipeline_ctx {
     char extra_headers[APEX_MODULE_EXTRA_HEADERS_MAX];
     size_t extra_headers_len;
 
+    char request_id[36];
+
     void *module_data[APEX_MODULE_MAX_DATA_SLOTS];
 };
 

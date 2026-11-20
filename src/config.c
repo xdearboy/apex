@@ -2025,6 +2025,222 @@ static bool config_parse_log_format(parser_t *parser, const token_t *directive) 
     return true;
 }
 
+static bool parse_compress_types(parser_t *parser, char ***types_out, size_t *count_out) {
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *tok = parser_scalar(parser, "MIME type");
+        if (tok == NULL) return false;
+        char *str = config_strdup_range(tok->text, tok->length);
+        if (str == NULL) return config_oom(parser->error);
+        char **new_types = realloc(*types_out, (*count_out + 1) * sizeof(char *));
+        if (new_types == NULL) {
+            free(str);
+            return config_oom(parser->error);
+        }
+        new_types[*count_out] = str;
+        *types_out = new_types;
+        (*count_out)++;
+    }
+    return true;
+}
+
+static bool parse_compress_directive(parser_t *parser, const token_t *directive,
+                                     apex_compress_config_t *compress, bool *has_compress,
+                                     bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "gzip")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            compress->gzip_enabled = true;
+            compress->has_gzip = true;
+            *has_compress = true;
+        } else if (token_is_word(val, "off")) {
+            compress->gzip_enabled = false;
+            compress->has_gzip = true;
+            *has_compress = true;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "gzip must be on or off");
+            return false;
+        }
+    } else if (token_is_word(directive, "gzip_min_length")) {
+        const token_t *val = parser_scalar(parser, "a minimum body length in bytes");
+        if (val == NULL) return false;
+        size_t size_bytes = 0;
+        if (!parse_size_str(val->text, &size_bytes)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid gzip_min_length");
+            return false;
+        }
+        compress->gzip_min_length = (uint32_t)size_bytes;
+        *has_compress = true;
+    } else if (token_is_word(directive, "gzip_comp_level")) {
+        const token_t *val = parser_scalar(parser, "a compression level (1-9)");
+        if (val == NULL) return false;
+        uint64_t level = 0;
+        if (!token_to_u64(val, 1, 9, &level)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "gzip_comp_level must be between 1 and 9");
+            return false;
+        }
+        compress->gzip_comp_level = (int)level;
+        *has_compress = true;
+    } else if (token_is_word(directive, "gzip_types")) {
+        if (!parse_compress_types(parser, &compress->gzip_types, &compress->gzip_type_count)) {
+            return false;
+        }
+        *has_compress = true;
+    } else if (token_is_word(directive, "brotli")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            compress->brotli_enabled = true;
+            compress->has_brotli = true;
+            *has_compress = true;
+        } else if (token_is_word(val, "off")) {
+            compress->brotli_enabled = false;
+            compress->has_brotli = true;
+            *has_compress = true;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "brotli must be on or off");
+            return false;
+        }
+    } else if (token_is_word(directive, "brotli_comp_level")) {
+        const token_t *val = parser_scalar(parser, "a compression level (1-11)");
+        if (val == NULL) return false;
+        uint64_t level = 0;
+        if (!token_to_u64(val, 1, 11, &level)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "brotli_comp_level must be between 1 and 11");
+            return false;
+        }
+        compress->brotli_comp_level = (int)level;
+        *has_compress = true;
+    } else if (token_is_word(directive, "brotli_types")) {
+        if (!parse_compress_types(parser, &compress->brotli_types, &compress->brotli_type_count)) {
+            return false;
+        }
+        *has_compress = true;
+    } else if (token_is_word(directive, "zstd")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            compress->zstd_enabled = true;
+            compress->has_zstd = true;
+            *has_compress = true;
+        } else if (token_is_word(val, "off")) {
+            compress->zstd_enabled = false;
+            compress->has_zstd = true;
+            *has_compress = true;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "zstd must be on or off");
+            return false;
+        }
+    } else if (token_is_word(directive, "zstd_comp_level")) {
+        const token_t *val = parser_scalar(parser, "a compression level (1-19)");
+        if (val == NULL) return false;
+        uint64_t level = 0;
+        if (!token_to_u64(val, 1, 19, &level)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "zstd_comp_level must be between 1 and 19");
+            return false;
+        }
+        compress->zstd_comp_level = (int)level;
+        *has_compress = true;
+    } else if (token_is_word(directive, "zstd_types")) {
+        if (!parse_compress_types(parser, &compress->zstd_types, &compress->zstd_type_count)) {
+            return false;
+        }
+        *has_compress = true;
+    } else {
+        *handled = false;
+    }
+    return true;
+}
+
+static bool compress_config_inherit(apex_compress_config_t *dst, bool *dst_has,
+                                    const apex_compress_config_t *src, bool src_has) {
+    if (!src_has) return true;
+    if (!*dst_has) {
+        *dst_has = true;
+    }
+    if (!dst->has_gzip && src->has_gzip) {
+        dst->gzip_enabled = src->gzip_enabled;
+        dst->has_gzip = true;
+    }
+    if (!dst->has_brotli && src->has_brotli) {
+        dst->brotli_enabled = src->brotli_enabled;
+        dst->has_brotli = true;
+    }
+    if (!dst->has_zstd && src->has_zstd) {
+        dst->zstd_enabled = src->zstd_enabled;
+        dst->has_zstd = true;
+    }
+    if (dst->gzip_min_length == 0 && src->gzip_min_length > 0) {
+        dst->gzip_min_length = src->gzip_min_length;
+    }
+    if (dst->gzip_comp_level == 0 && src->gzip_comp_level > 0) {
+        dst->gzip_comp_level = src->gzip_comp_level;
+    }
+    if (dst->brotli_comp_level == 0 && src->brotli_comp_level > 0) {
+        dst->brotli_comp_level = src->brotli_comp_level;
+    }
+    if (dst->zstd_comp_level == 0 && src->zstd_comp_level > 0) {
+        dst->zstd_comp_level = src->zstd_comp_level;
+    }
+    if (dst->gzip_type_count == 0 && src->gzip_type_count > 0) {
+        dst->gzip_types = calloc(src->gzip_type_count, sizeof(char *));
+        if (dst->gzip_types == NULL) return false;
+        for (size_t i = 0; i < src->gzip_type_count; i++) {
+            dst->gzip_types[i] = strdup(src->gzip_types[i]);
+            if (dst->gzip_types[i] == NULL) return false;
+        }
+        dst->gzip_type_count = src->gzip_type_count;
+    }
+    if (dst->brotli_type_count == 0 && src->brotli_type_count > 0) {
+        dst->brotli_types = calloc(src->brotli_type_count, sizeof(char *));
+        if (dst->brotli_types == NULL) return false;
+        for (size_t i = 0; i < src->brotli_type_count; i++) {
+            dst->brotli_types[i] = strdup(src->brotli_types[i]);
+            if (dst->brotli_types[i] == NULL) return false;
+        }
+        dst->brotli_type_count = src->brotli_type_count;
+    }
+    if (dst->zstd_type_count == 0 && src->zstd_type_count > 0) {
+        dst->zstd_types = calloc(src->zstd_type_count, sizeof(char *));
+        if (dst->zstd_types == NULL) return false;
+        for (size_t i = 0; i < src->zstd_type_count; i++) {
+            dst->zstd_types[i] = strdup(src->zstd_types[i]);
+            if (dst->zstd_types[i] == NULL) return false;
+        }
+        dst->zstd_type_count = src->zstd_type_count;
+    }
+    return true;
+}
+
+static void config_free_compress(apex_compress_config_t *compress) {
+    if (compress == NULL) return;
+    if (compress->gzip_types != NULL) {
+        for (size_t i = 0; i < compress->gzip_type_count; i++) {
+            free(compress->gzip_types[i]);
+        }
+        free(compress->gzip_types);
+        compress->gzip_types = NULL;
+        compress->gzip_type_count = 0;
+    }
+    if (compress->brotli_types != NULL) {
+        for (size_t i = 0; i < compress->brotli_type_count; i++) {
+            free(compress->brotli_types[i]);
+        }
+        free(compress->brotli_types);
+        compress->brotli_types = NULL;
+        compress->brotli_type_count = 0;
+    }
+    if (compress->zstd_types != NULL) {
+        for (size_t i = 0; i < compress->zstd_type_count; i++) {
+            free(compress->zstd_types[i]);
+        }
+        free(compress->zstd_types);
+        compress->zstd_types = NULL;
+        compress->zstd_type_count = 0;
+    }
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -2458,11 +2674,18 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             memcpy(location->proxy_ssl_name, value->text, value->length);
             location->proxy_ssl_name[value->length] = '\0';
         } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
-                         directive->text);
-            parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name");
-            return false;
+            bool handled_compress = false;
+            if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
+                if (!handled_compress) {
+                    parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
+                                 directive->text);
+                    parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
+                                        "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, gzip, brotli, zstd");
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
 
         if (!parser_expect_semicolon(parser)) {
@@ -2511,6 +2734,9 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     if (!location->has_real_ip_recursive && server->has_real_ip_recursive) {
         location->real_ip_recursive = server->real_ip_recursive;
         location->has_real_ip_recursive = true;
+    }
+    if (!compress_config_inherit(&location->compress, &location->has_compress, &server->compress, server->has_compress)) {
+        return config_oom(parser->error);
     }
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
@@ -2850,9 +3076,16 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
         } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens");
-            return false;
+            bool handled_compress = false;
+            if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
+                if (!handled_compress) {
+                    parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+                    parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, gzip, brotli, zstd");
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
 
         if (!parser_expect_semicolon(parser)) {
@@ -2883,6 +3116,9 @@ static bool parse_server_block(parser_t *parser) {
     }
     if (!server->server_tokens.set && parser->config->http.server_tokens.set) {
         server->server_tokens = parser->config->http.server_tokens;
+    }
+    if (!compress_config_inherit(&server->compress, &server->has_compress, &parser->config->http.compress, parser->config->http.has_compress)) {
+        return config_oom(parser->error);
     }
 
     if (!have_listen) {
@@ -3532,9 +3768,18 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
         }
         parser->config->http.has_real_ip_recursive = true;
     } else {
+        bool handled_compress = false;
+        if (parse_compress_directive(parser, directive, &parser->config->http.compress,
+                                     &parser->config->http.has_compress, &handled_compress)) {
+            if (handled_compress) {
+                return true;
+            }
+        } else {
+            return false;
+        }
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, upstream, server");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, upstream, server, gzip, brotli, zstd");
         return false;
     }
     return true;
@@ -3765,6 +4010,21 @@ const char *apex_map_lookup(const apex_config_t *config, const char *target_var,
         return map->default_value;
     }
     return "";
+}
+
+const apex_compress_config_t *apex_config_get_compress(const apex_server_config_t *server,
+                                                       const apex_location_config_t *location,
+                                                       const apex_config_t *config) {
+    if (location != NULL && location->has_compress) {
+        return &location->compress;
+    }
+    if (server != NULL && server->has_compress) {
+        return &server->compress;
+    }
+    if (config != NULL && config->http.has_compress) {
+        return &config->http.compress;
+    }
+    return NULL;
 }
 
 static bool parse_http_block(parser_t *parser) {
@@ -4190,6 +4450,7 @@ void apex_config_free(apex_config_t *config) {
                 free(location->add_headers[ah].value);
             }
             free(location->add_headers);
+            config_free_compress(&location->compress);
         }
         free(server->locations);
 
@@ -4203,6 +4464,7 @@ void apex_config_free(apex_config_t *config) {
         }
         free(server->add_headers);
         free(server->root);
+        config_free_compress(&server->compress);
     }
     free(config->servers);
 
@@ -4211,6 +4473,7 @@ void apex_config_free(apex_config_t *config) {
         free(config->http.add_headers[ah].value);
     }
     free(config->http.add_headers);
+    config_free_compress(&config->http.compress);
 
     for (size_t m = 0; m < config->http.map_count; m++) {
         apex_map_t *map = &config->http.maps[m];
