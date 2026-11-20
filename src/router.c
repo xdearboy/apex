@@ -2,6 +2,7 @@
 #include "apex/cache.h"
 #include "apex/realip.h"
 #include "apex/log.h"
+#include "apex/fastcgi.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -1356,6 +1357,139 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
     apex_proxy_response_free(&proxy_response);
 }
 
+static void router_forward_fastcgi(const apex_runtime_t *runtime, apex_config_route_t *route,
+                                   const char *request, size_t request_length,
+                                   const char *method, size_t method_length,
+                                   const char *path, size_t path_length,
+                                   const char *body, size_t body_length,
+                                   apex_res_t *res,
+                                   const char *extra_headers, size_t extra_headers_len,
+                                   const char *client_ip) {
+    (void)runtime;
+    conn_t *connection = res->conn;
+    const apex_server_config_t *server = route ? route->server : NULL;
+    const apex_location_config_t *location = route ? route->location : NULL;
+
+    if (location == NULL || location->fastcgi_pass[0] == '\0') {
+        router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "fastcgi_pass not configured\n");
+        return;
+    }
+
+    char host[256];
+    host[0] = '\0';
+    const char *host_value = NULL;
+    size_t host_length = 0;
+    if (router_find_header(request, request_length, "Host", &host_value, &host_length)) {
+        if (host_length < sizeof(host)) {
+            memcpy(host, host_value, host_length);
+            host[host_length] = '\0';
+        }
+    }
+
+    char path_buf[APEX_CONFIG_PATH_MAX];
+    char query_buf[APEX_CONFIG_PATH_MAX];
+    path_buf[0] = '\0';
+    query_buf[0] = '\0';
+
+    const char *qmark = memchr(path, '?', path_length);
+    if (qmark != NULL) {
+        size_t plen = (size_t)(qmark - path);
+        if (plen >= sizeof(path_buf)) plen = sizeof(path_buf) - 1;
+        memcpy(path_buf, path, plen);
+        path_buf[plen] = '\0';
+
+        size_t qlen = path_length - plen - 1;
+        if (qlen >= sizeof(query_buf)) qlen = sizeof(query_buf) - 1;
+        memcpy(query_buf, qmark + 1, qlen);
+        query_buf[qlen] = '\0';
+    } else {
+        size_t plen = path_length < sizeof(path_buf) ? path_length : sizeof(path_buf) - 1;
+        memcpy(path_buf, path, plen);
+        path_buf[plen] = '\0';
+    }
+
+    char script_filename[APEX_CONFIG_PATH_MAX * 2];
+    const char *doc_root = (location && location->root) ? location->root : "";
+    if (path_buf[0] == '/' && path_buf[1] == '\0' && location->fastcgi_index[0] != '\0') {
+        snprintf(script_filename, sizeof(script_filename), "%s/%s", doc_root, location->fastcgi_index);
+    } else {
+        snprintf(script_filename, sizeof(script_filename), "%s%s", doc_root, path_buf);
+    }
+
+    char method_buf[16];
+    size_t mlen = method_length < sizeof(method_buf) ? method_length : sizeof(method_buf) - 1;
+    memcpy(method_buf, method, mlen);
+    method_buf[mlen] = '\0';
+
+    apex_fastcgi_request_t fcgi_req = {
+        .target = location->fastcgi_pass,
+        .method = method_buf,
+        .uri = path_buf,
+        .script_filename = script_filename,
+        .script_name = path_buf,
+        .query_string = query_buf,
+        .document_root = doc_root,
+        .client_ip = client_ip,
+        .client_port = 0,
+        .server_addr = server ? server->listen_host : "127.0.0.1",
+        .server_port = server ? server->listen_port : 80,
+        .server_name = host[0] ? host : "localhost",
+        .raw_request = request,
+        .raw_request_len = request_length,
+        .body = body,
+        .body_len = body_length,
+        .connect_timeout_ms = location->has_connect_timeout ? location->connect_timeout_ms : 5000,
+        .read_timeout_ms = location->has_read_timeout ? location->read_timeout_ms : 30000,
+    };
+
+    apex_fastcgi_response_t fcgi_resp;
+    int rc = apex_fastcgi_forward(&fcgi_req, &fcgi_resp);
+    if (rc != 0) {
+        router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "FastCGI backend connection failed\n");
+        return;
+    }
+
+    if (res != NULL) {
+        res->last_status = fcgi_resp.status;
+        res->last_body_bytes = fcgi_resp.body_len;
+        res->last_upstream_status = fcgi_resp.status;
+        res->last_upstream_time_us = fcgi_resp.elapsed_us;
+        snprintf(res->last_upstream_addr, sizeof(res->last_upstream_addr), "%s", location->fastcgi_pass);
+    }
+
+    char status_line[128];
+    int slen = snprintf(status_line, sizeof(status_line), "HTTP/1.1 %d %s\r\n",
+                        fcgi_resp.status, fcgi_resp.status_text[0] ? fcgi_resp.status_text : "OK");
+    if (slen > 0) apex_conn_write(connection, status_line, (size_t)slen);
+
+    apex_conn_write(connection, "Server: apex\r\n", 14);
+
+    char conn_hdr[64];
+    int chlen = snprintf(conn_hdr, sizeof(conn_hdr), "Connection: %s\r\n",
+                         connection->close_after_write ? "close" : "keep-alive");
+    if (chlen > 0) apex_conn_write(connection, conn_hdr, (size_t)chlen);
+
+    char clen_hdr[64];
+    int clen = snprintf(clen_hdr, sizeof(clen_hdr), "Content-Length: %zu\r\n", fcgi_resp.body_len);
+    if (clen > 0) apex_conn_write(connection, clen_hdr, (size_t)clen);
+
+    if (extra_headers != NULL && extra_headers_len > 0) {
+        apex_conn_write(connection, extra_headers, extra_headers_len);
+    }
+
+    if (fcgi_resp.headers != NULL && fcgi_resp.headers_len > 0) {
+        apex_conn_write(connection, fcgi_resp.headers, fcgi_resp.headers_len);
+    }
+
+    apex_conn_write(connection, "\r\n", 2);
+
+    if (strcasecmp(method_buf, "HEAD") != 0 && fcgi_resp.body != NULL && fcgi_resp.body_len > 0) {
+        apex_conn_write(connection, fcgi_resp.body, fcgi_resp.body_len);
+    }
+
+    apex_record_status(fcgi_resp.status);
+    apex_fastcgi_response_free(&fcgi_resp);
+}
 
 apex_app_t *apex_create(void) {
     apex_app_t *app = (apex_app_t *)calloc(1, sizeof(apex_app_t));
@@ -2118,6 +2252,15 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
 
                 if (route.location->target != APEX_PROXY_TARGET_NONE) {
                     router_forward_request(runtime, &route, req_buf, header_len, req_buf, method_len, path, path_len, body,
+                                           body_len, res, ctx.extra_headers, ctx.extra_headers_len, client_ip);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
+                    router_trigger_logging(&ctx, 200, 0, client_ip);
+                    return;
+                }
+                if (route.location->fastcgi_pass[0] != '\0') {
+                    router_forward_fastcgi(runtime, &route, req_buf, header_len, req_buf, method_len, path, path_len, body,
                                            body_len, res, ctx.extra_headers, ctx.extra_headers_len, client_ip);
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);

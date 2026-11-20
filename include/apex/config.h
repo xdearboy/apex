@@ -186,6 +186,12 @@ typedef struct {
     bool has_real_ip_header;
     bool has_real_ip_recursive;
 
+    char fastcgi_pass[APEX_CONFIG_PATH_MAX];
+    char fastcgi_index[64];
+    apex_config_header_t *fastcgi_params;
+    size_t fastcgi_param_count;
+    size_t fastcgi_param_capacity;
+
     int http_version;
 } apex_location_config_t;
 
@@ -252,6 +258,7 @@ typedef struct {
     size_t server_name_count;
     size_t server_name_capacity;
     apex_tls_config_t tls;
+    char *root;
     apex_location_config_t *locations;
     size_t location_count;
     size_t location_capacity;

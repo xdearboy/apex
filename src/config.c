@@ -2279,11 +2279,52 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                 return false;
             }
             location->has_access_log = true;
+        } else if (token_is_word(directive, "fastcgi_pass")) {
+            const token_t *value = parser_scalar(parser, "a fastcgi backend endpoint (host:port or unix:/path)");
+            if (value == NULL) {
+                return false;
+            }
+            if (value->length >= sizeof(location->fastcgi_pass)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "fastcgi_pass endpoint is too long");
+                return false;
+            }
+            snprintf(location->fastcgi_pass, sizeof(location->fastcgi_pass), "%s", value->text);
+        } else if (token_is_word(directive, "fastcgi_index")) {
+            const token_t *value = parser_scalar(parser, "a fastcgi index filename");
+            if (value == NULL) {
+                return false;
+            }
+            if (value->length >= sizeof(location->fastcgi_index)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "fastcgi_index filename is too long");
+                return false;
+            }
+            snprintf(location->fastcgi_index, sizeof(location->fastcgi_index), "%s", value->text);
+        } else if (token_is_word(directive, "fastcgi_param")) {
+            const token_t *key = parser_scalar(parser, "a fastcgi parameter name");
+            if (key == NULL) {
+                return false;
+            }
+            const token_t *val = parser_scalar(parser, "a fastcgi parameter value");
+            if (val == NULL) {
+                return false;
+            }
+            if (location->fastcgi_param_count >= location->fastcgi_param_capacity) {
+                size_t ncap = location->fastcgi_param_capacity ? location->fastcgi_param_capacity * 2 : 8;
+                apex_config_header_t *nparams = realloc(location->fastcgi_params, ncap * sizeof(apex_config_header_t));
+                if (!nparams) return config_oom(parser->error);
+                location->fastcgi_params = nparams;
+                location->fastcgi_param_capacity = ncap;
+            }
+            apex_config_header_t *p = &location->fastcgi_params[location->fastcgi_param_count++];
+            p->name = config_strdup_range(key->text, key->length);
+            p->value = config_strdup_range(val->text, val->length);
+            p->line = key->line;
+            if (!p->name || !p->value) return config_oom(parser->error);
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
+                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param");
             return false;
         }
 
@@ -2294,6 +2335,12 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
 
     if (!parser_expect_rbrace(parser)) {
         return false;
+    }
+
+    /* Inherit server root if not configured in location */
+    if (location->root == NULL && server->root != NULL) {
+        location->root = config_strdup_range(server->root, strlen(server->root));
+        if (location->root == NULL) return config_oom(parser->error);
     }
 
     /* Inherit server cache settings if not explicitly configured in location */
@@ -2330,8 +2377,8 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     }
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
-        !location->stub_status && !location->metrics) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, root, return, stub_status, or metrics");
+        !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, fastcgi_pass, root, return, stub_status, or metrics");
         return false;
     }
     return true;
@@ -2650,9 +2697,14 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
             server->has_access_log = true;
+        } else if (token_is_word(directive, "root")) {
+            const token_t *value = parser_scalar(parser, "a filesystem path");
+            if (value == NULL) return false;
+            server->root = config_strdup_range(value->text, value->length);
+            if (server->root == NULL) return config_oom(parser->error);
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
+            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
             return false;
         }
 
@@ -3749,6 +3801,11 @@ void apex_config_free(apex_config_t *config) {
                 free(location->headers[header_index].value);
             }
             free(location->headers);
+            for (size_t p_index = 0; p_index < location->fastcgi_param_count; p_index++) {
+                free(location->fastcgi_params[p_index].name);
+                free(location->fastcgi_params[p_index].value);
+            }
+            free(location->fastcgi_params);
         }
         free(server->locations);
 
@@ -3756,6 +3813,7 @@ void apex_config_free(apex_config_t *config) {
             free(server->error_pages[ep_index].path);
         }
         free(server->error_pages);
+        free(server->root);
     }
     free(config->servers);
 
