@@ -48,6 +48,9 @@ typedef struct {
     uint32_t weight;
     bool is_backup;
     bool is_down;
+    bool use_ssl;
+    bool use_ssl_sni;
+    char ssl_server_name[128];
     _Atomic int64_t active_conns;
     _Atomic uint64_t total_requests;
     _Atomic uint64_t failed_requests;
@@ -80,6 +83,9 @@ typedef struct {
     uint64_t health_check_timeout_ms;
     uint32_t health_check_fall;
     uint32_t health_check_rise;
+    bool use_ssl;
+    bool use_ssl_sni;
+    char ssl_server_name[128];
     _Atomic uint32_t round_robin_cursor;
 } upstream_group_t;
 
@@ -95,6 +101,8 @@ typedef struct {
     const void *body;
     size_t body_len;
     bool keep_alive;
+    bool use_ssl;
+    const char *ssl_server_name;
 } apex_proxy_request_t;
 
 /* headers holds the raw status line and header block; body is de-chunked.

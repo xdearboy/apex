@@ -20,6 +20,20 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+static SSL_CTX *g_client_ssl_ctx = NULL;
+static pthread_once_t g_client_ssl_once = PTHREAD_ONCE_INIT;
+
+static void init_client_ssl_ctx(void) {
+    const SSL_METHOD *method = TLS_client_method();
+    g_client_ssl_ctx = SSL_CTX_new(method);
+    if (g_client_ssl_ctx != NULL) {
+        SSL_CTX_set_verify(g_client_ssl_ctx, SSL_VERIFY_NONE, NULL);
+        SSL_CTX_set_mode(g_client_ssl_ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    }
+}
 
 typedef struct {
     char *data;
@@ -44,6 +58,7 @@ typedef struct {
 
 typedef struct {
     int fd;
+    SSL *ssl;
     char *data;
     size_t len;
     size_t capacity;
@@ -635,7 +650,25 @@ static int connect_server(const upstream_server_t *server, uint64_t timeout_ms) 
     return fd;
 }
 
-static int send_all(int fd, const void *data, size_t len) {
+static int send_all(int fd, SSL *ssl, const void *data, size_t len) {
+    if (ssl != NULL) {
+        const char *cursor = data;
+        while (len > 0) {
+            int to_send = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+            int written = SSL_write(ssl, cursor, to_send);
+            if (written > 0) {
+                cursor += (size_t)written;
+                len -= (size_t)written;
+                continue;
+            }
+            int err = SSL_get_error(ssl, written);
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                continue;
+            }
+            return APEX_PROXY_ERR_IO;
+        }
+        return APEX_PROXY_OK;
+    }
     const char *cursor = data;
     while (len > 0) {
         ssize_t sent;
@@ -766,7 +799,26 @@ static int reader_pull(reader_t *reader) {
     }
 
     for (;;) {
-        ssize_t received = recv(reader->fd, reader->data + reader->len, reader->capacity - reader->len, 0);
+        ssize_t received;
+        if (reader->ssl != NULL) {
+            int to_read = (int)(reader->capacity - reader->len);
+            int ret = SSL_read(reader->ssl, reader->data + reader->len, to_read);
+            if (ret > 0) {
+                received = (ssize_t)ret;
+            } else {
+                int err = SSL_get_error(reader->ssl, ret);
+                if (err == SSL_ERROR_ZERO_RETURN) {
+                    received = 0;
+                } else if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                    return APEX_PROXY_ERR_TIMEOUT;
+                } else {
+                    return APEX_PROXY_ERR_IO;
+                }
+            }
+        } else {
+            received = recv(reader->fd, reader->data + reader->len, reader->capacity - reader->len, 0);
+        }
+
         if (received > 0) {
             reader->len += (size_t)received;
             return 1;
@@ -1488,9 +1540,11 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             return result;
         }
 
-        fd = pool_acquire(server, group);
-        bool from_pool = (fd >= 0);
-        if (fd < 0) {
+        bool is_ssl = server->use_ssl || group->use_ssl || request->use_ssl;
+        SSL *ssl = NULL;
+        bool from_pool = false;
+
+        if (is_ssl) {
             fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
                                                                  : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
             if (fd < 0) {
@@ -1501,25 +1555,90 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 last_error = APEX_PROXY_ERR_CONNECT;
                 continue;
             }
+            pthread_once(&g_client_ssl_once, init_client_ssl_ctx);
+            if (g_client_ssl_ctx == NULL) {
+                close(fd);
+                buffer_free(&wire);
+                atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                return APEX_PROXY_ERR_CONNECT;
+            }
+            ssl = SSL_new(g_client_ssl_ctx);
+            if (ssl == NULL) {
+                close(fd);
+                buffer_free(&wire);
+                atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                return APEX_PROXY_ERR_CONNECT;
+            }
+            SSL_set_fd(ssl, fd);
+
+            const char *sni = NULL;
+            if (server->ssl_server_name[0] != '\0') {
+                sni = server->ssl_server_name;
+            } else if (group->ssl_server_name[0] != '\0') {
+                sni = group->ssl_server_name;
+            } else if (request->ssl_server_name != NULL && request->ssl_server_name[0] != '\0') {
+                sni = request->ssl_server_name;
+            } else if (server->use_ssl_sni && server->ip[0] != '\0') {
+                sni = server->ip;
+            }
+            if (sni != NULL) {
+                SSL_set_tlsext_host_name(ssl, sni);
+            }
+
+            apply_io_timeouts(fd, group);
+            if (SSL_connect(ssl) <= 0) {
+                SSL_free(ssl);
+                close(fd);
+                buffer_free(&wire);
+                apex_upstream_record_failure(group, (size_t)selected);
+                atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+                atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                last_error = APEX_PROXY_ERR_CONNECT;
+                continue;
+            }
             thread_pool.total_created++;
-        }
-
-        apply_io_timeouts(fd, group);
-
-        result = send_all(fd, wire.data, wire.len);
-        if (result != APEX_PROXY_OK) {
-            pool_close(fd);
-            fd = -1;
-            if (from_pool) {
-                /* Connection was stale in pool, try fresh connection to the same server */
+        } else {
+            fd = pool_acquire(server, group);
+            from_pool = (fd >= 0);
+            if (fd < 0) {
                 fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
                                                                      : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
-                if (fd >= 0) {
-                    thread_pool.total_created++;
-                    apply_io_timeouts(fd, group);
-                    result = send_all(fd, wire.data, wire.len);
-                } else {
-                    result = APEX_PROXY_ERR_CONNECT;
+                if (fd < 0) {
+                    apex_upstream_record_failure(group, (size_t)selected);
+                    atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+                    atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+                    buffer_free(&wire);
+                    last_error = APEX_PROXY_ERR_CONNECT;
+                    continue;
+                }
+                thread_pool.total_created++;
+            }
+
+            apply_io_timeouts(fd, group);
+        }
+
+        result = send_all(fd, ssl, wire.data, wire.len);
+        if (result != APEX_PROXY_OK) {
+            if (ssl != NULL) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                ssl = NULL;
+                close(fd);
+                fd = -1;
+            } else {
+                pool_close(fd);
+                fd = -1;
+                if (from_pool) {
+                    /* Connection was stale in pool, try fresh connection to the same server */
+                    fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                         : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+                    if (fd >= 0) {
+                        thread_pool.total_created++;
+                        apply_io_timeouts(fd, group);
+                        result = send_all(fd, NULL, wire.data, wire.len);
+                    } else {
+                        result = APEX_PROXY_ERR_CONNECT;
+                    }
                 }
             }
             if (result != APEX_PROXY_OK) {
@@ -1547,13 +1666,22 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             io_timeout = 3600000u;
         }
         reader.fd = fd;
+        reader.ssl = ssl;
         reader.limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
         reader.deadline_ms = monotonic_ms() + io_timeout;
 
         result = read_response(&reader, group, request, response);
         if (result != APEX_PROXY_OK) {
-            pool_close(fd);
-            fd = -1;
+            if (ssl != NULL) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                ssl = NULL;
+                close(fd);
+                fd = -1;
+            } else {
+                pool_close(fd);
+                fd = -1;
+            }
             buffer_free(&wire);
             reader_free(&reader);
             apex_proxy_response_free(response);
@@ -1583,12 +1711,18 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             fd = -1;
         }
 
-        bool reusable = response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
+        bool reusable = !is_ssl && response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
         response->keep_alive = reusable;
         response->server_index = (size_t)selected;
         response->elapsed_us = monotonic_us() - started_us;
 
-        if (reusable) {
+        if (ssl != NULL) {
+            SSL_shutdown(ssl);
+            SSL_free(ssl);
+            ssl = NULL;
+            close(fd);
+            fd = -1;
+        } else if (reusable) {
             pool_release(server, group, fd);
             fd = -1;
         } else if (fd >= 0) {
@@ -1672,7 +1806,33 @@ static void probe_single_server(upstream_group_t *group, upstream_server_t *serv
     }
 
     bool success = true;
-    if (group->health_check_uri[0] != '\0') {
+    bool is_ssl = server->use_ssl || group->use_ssl;
+    SSL *ssl = NULL;
+
+    if (is_ssl) {
+        pthread_once(&g_client_ssl_once, init_client_ssl_ctx);
+        if (g_client_ssl_ctx != NULL) {
+            ssl = SSL_new(g_client_ssl_ctx);
+            if (ssl != NULL) {
+                SSL_set_fd(ssl, fd);
+                const char *sni = (server->ssl_server_name[0] != '\0') ? server->ssl_server_name : group->ssl_server_name;
+                if (sni != NULL && sni[0] != '\0') {
+                    SSL_set_tlsext_host_name(ssl, sni);
+                }
+                if (SSL_connect(ssl) <= 0) {
+                    SSL_free(ssl);
+                    ssl = NULL;
+                    success = false;
+                }
+            } else {
+                success = false;
+            }
+        } else {
+            success = false;
+        }
+    }
+
+    if (success && group->health_check_uri[0] != '\0') {
         char probe_request[256];
         int req_len = snprintf(probe_request, sizeof(probe_request),
                                "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: apex-health-prober\r\nConnection: close\r\n\r\n",
@@ -1684,9 +1844,14 @@ static void probe_single_server(upstream_group_t *group, upstream_server_t *serv
             (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
             (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
-            if (send_all(fd, probe_request, (size_t)req_len) == 0) {
+            if (send_all(fd, ssl, probe_request, (size_t)req_len) == 0) {
                 char response_buf[128];
-                ssize_t n = recv(fd, response_buf, sizeof(response_buf) - 1, 0);
+                ssize_t n;
+                if (ssl != NULL) {
+                    n = (ssize_t)SSL_read(ssl, response_buf, sizeof(response_buf) - 1);
+                } else {
+                    n = recv(fd, response_buf, sizeof(response_buf) - 1, 0);
+                }
                 if (n > 12) {
                     response_buf[n] = '\0';
                     int status = 0;
@@ -1707,9 +1872,14 @@ static void probe_single_server(upstream_group_t *group, upstream_server_t *serv
             }
         }
     }
-    shutdown(fd, SHUT_WR);
-    char drain_buf[512];
-    while (recv(fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0) {}
+    if (ssl != NULL) {
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+    } else {
+        shutdown(fd, SHUT_WR);
+        char drain_buf[512];
+        while (recv(fd, drain_buf, sizeof(drain_buf), MSG_DONTWAIT) > 0) {}
+    }
     close(fd);
 
     if (success) {

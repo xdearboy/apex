@@ -116,6 +116,41 @@ typedef struct {
     int line;
 } apex_config_header_t;
 
+typedef struct {
+    char *name;
+    char *value;
+    bool always;
+    int line;
+} apex_add_header_t;
+
+typedef enum {
+    APEX_SERVER_TOKENS_OFF = 0,
+    APEX_SERVER_TOKENS_ON = 1,
+    APEX_SERVER_TOKENS_CUSTOM = 2,
+} apex_server_tokens_mode_t;
+
+typedef struct {
+    apex_server_tokens_mode_t mode;
+    char custom_value[128];
+    bool set;
+} apex_server_tokens_config_t;
+
+typedef struct {
+    char *key;
+    char *value;
+    bool is_wildcard_prefix;
+    bool is_wildcard_suffix;
+} apex_map_entry_t;
+
+typedef struct {
+    char source_var[64];
+    char target_var[64];
+    char default_value[256];
+    apex_map_entry_t *entries;
+    size_t entry_count;
+    size_t entry_capacity;
+} apex_map_t;
+
 typedef enum {
     APEX_PROXY_TARGET_NONE = 0,
     APEX_PROXY_TARGET_UPSTREAM,
@@ -193,6 +228,15 @@ typedef struct {
     size_t fastcgi_param_capacity;
 
     int http_version;
+    apex_add_header_t *add_headers;
+    size_t add_header_count;
+    size_t add_header_capacity;
+
+    bool proxy_ssl_server_name;
+    char proxy_ssl_name[APEX_CONFIG_HOST_MAX];
+    bool proxy_pass_ssl;
+    bool proxy_pass_dynamic;
+    char proxy_pass_raw[APEX_CONFIG_PATH_MAX];
 } apex_location_config_t;
 
 typedef struct {
@@ -289,6 +333,10 @@ typedef struct {
     bool real_ip_recursive;
     bool has_real_ip_header;
     bool has_real_ip_recursive;
+    apex_add_header_t *add_headers;
+    size_t add_header_count;
+    size_t add_header_capacity;
+    apex_server_tokens_config_t server_tokens;
     int line;
 } apex_server_config_t;
 
@@ -297,7 +345,7 @@ typedef struct {
     uint64_t keepalive_timeout_ms;
     uint64_t client_header_timeout_ms;
     uint64_t client_body_timeout_ms;
-    bool server_tokens;
+    apex_server_tokens_config_t server_tokens;
     apex_rate_limit_zone_t rate_zones[APEX_CONFIG_MAX_RATE_ZONES];
     size_t rate_zone_count;
     apex_conn_limit_zone_t conn_zones[APEX_CONFIG_MAX_CONN_ZONES];
@@ -314,6 +362,12 @@ typedef struct {
     bool real_ip_recursive;
     bool has_real_ip_header;
     bool has_real_ip_recursive;
+    apex_add_header_t *add_headers;
+    size_t add_header_count;
+    size_t add_header_capacity;
+    apex_map_t *maps;
+    size_t map_count;
+    size_t map_capacity;
 } apex_http_config_t;
 
 typedef struct {
@@ -378,6 +432,7 @@ bool apex_rate_limit_check(const apex_runtime_t *runtime, const char *zone_name,
 bool apex_conn_limit_acquire(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip,
                              uint32_t max_conns);
 void apex_conn_limit_release(const apex_runtime_t *runtime, const char *zone_name, const char *client_ip);
+const char *apex_map_lookup(const apex_config_t *config, const char *target_var, const char *source_val);
 
 #ifdef __cplusplus
 }

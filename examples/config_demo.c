@@ -97,7 +97,7 @@ static int test_parse_valid(void) {
     check(config->http.keepalive_timeout_ms == 70000u, "keepalive_timeout duration");
     check(config->http.client_header_timeout_ms == 12000u, "client_header_timeout duration");
     check(config->http.client_body_timeout_ms == 20000u, "client_body_timeout duration");
-    check(config->http.server_tokens, "server_tokens on");
+    check(config->http.server_tokens.set && config->http.server_tokens.mode == APEX_SERVER_TOKENS_ON, "server_tokens on");
     check(config->upstream_count == 2u, "upstream count");
     check(config->server_count == 1u, "server count");
 

@@ -58,7 +58,7 @@ examples/hello_world: examples/hello_world.o $(LIB)
 	$(CC) $(CFLAGS) -o $@ examples/hello_world.o $(LIB) $(LDFLAGS) $(LDLIBS)
 
 examples/proxy_demo: examples/proxy_demo.o src/proxy.o
-	$(CC) $(CFLAGS) -o $@ examples/proxy_demo.o src/proxy.o $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $@ examples/proxy_demo.o src/proxy.o $(LDFLAGS) $(LDLIBS)
 
 examples/config_demo: examples/config_demo.o $(LIB)
 	$(CC) $(CFLAGS) -o $@ examples/config_demo.o $(LIB) $(LDFLAGS) $(LDLIBS)
@@ -94,6 +94,10 @@ test: all
 	$(PYTHON) tests/test_access_log.py ./$(BIN)
 	$(PYTHON) tests/test_fastcgi.py ./$(BIN)
 	$(PYTHON) tests/test_healthcheck.py ./$(BIN)
+	$(PYTHON) tests/test_add_header.py ./$(BIN)
+	$(PYTHON) tests/test_server_tokens.py ./$(BIN)
+	$(PYTHON) tests/test_map.py ./$(BIN)
+	$(PYTHON) tests/test_https_proxy.py ./$(BIN)
 
 check: test
 

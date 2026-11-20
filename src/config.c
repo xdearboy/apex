@@ -1504,6 +1504,89 @@ static bool location_add_header(parser_t *parser, apex_location_config_t *locati
     return true;
 }
 
+static bool config_add_response_header(parser_t *parser, apex_add_header_t **headers_ptr,
+                                       size_t *count_ptr, size_t *capacity_ptr) {
+    const token_t *name = parser_scalar(parser, "a header name");
+    if (name == NULL) {
+        return false;
+    }
+    const token_t *value = parser_scalar(parser, "a header value");
+    if (value == NULL) {
+        return false;
+    }
+    bool always = false;
+    if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *flag = parser_scalar(parser, "'always'");
+        if (flag != NULL && token_is_word(flag, "always")) {
+            always = true;
+        } else if (flag != NULL) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, flag, "unknown flag '%s', expected 'always'", flag->text);
+            return false;
+        }
+    }
+
+    if (!token_to_header_name(name)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "invalid header name");
+        return false;
+    }
+
+    if (*count_ptr >= APEX_CONFIG_MAX_HEADERS) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "too many add_header directives");
+        return false;
+    }
+
+    if (*count_ptr == *capacity_ptr) {
+        size_t capacity = *capacity_ptr ? *capacity_ptr * 2u : 4u;
+        apex_add_header_t *grown = realloc(*headers_ptr, capacity * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        *headers_ptr = grown;
+        *capacity_ptr = capacity;
+    }
+
+    char *name_copy = config_strdup_range(name->text, name->length);
+    char *value_copy = config_strdup_range(value->text, value->length);
+    if (name_copy == NULL || value_copy == NULL) {
+        free(name_copy);
+        free(value_copy);
+        config_oom(parser->error);
+        return false;
+    }
+
+    apex_add_header_t *header = &(*headers_ptr)[(*count_ptr)++];
+    header->name = name_copy;
+    header->value = value_copy;
+    header->always = always;
+    header->line = name->line;
+    return true;
+}
+
+static bool parse_server_tokens_directive(parser_t *parser, apex_server_tokens_config_t *tokens) {
+    const token_t *value = parser_scalar(parser, "on, off, or a custom string");
+    if (value == NULL) {
+        return false;
+    }
+    tokens->set = true;
+    if (token_is_word(value, "on")) {
+        tokens->mode = APEX_SERVER_TOKENS_ON;
+        tokens->custom_value[0] = '\0';
+    } else if (token_is_word(value, "off")) {
+        tokens->mode = APEX_SERVER_TOKENS_OFF;
+        tokens->custom_value[0] = '\0';
+    } else {
+        tokens->mode = APEX_SERVER_TOKENS_CUSTOM;
+        size_t len = value->length;
+        if (len >= sizeof(tokens->custom_value)) {
+            len = sizeof(tokens->custom_value) - 1;
+        }
+        memcpy(tokens->custom_value, value->text, len);
+        tokens->custom_value[len] = '\0';
+    }
+    return true;
+}
+
 static bool tls_add_protocol(parser_t *parser, apex_tls_config_t *tls, const token_t *protocol) {
     if (tls->protocol_count == tls->protocol_capacity) {
         size_t capacity = tls->protocol_capacity ? tls->protocol_capacity * 2u : 4u;
@@ -1648,12 +1731,32 @@ static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *lo
 
     const char *target = value->text;
     size_t length = value->length;
-    if (length >= 7u && strncmp(target, "http://", 7) == 0) {
+
+    bool is_ssl = false;
+    if (length >= 8u && strncmp(target, "https://", 8) == 0) {
+        is_ssl = true;
+        target += 8;
+        length -= 8u;
+    } else if (length >= 7u && strncmp(target, "http://", 7) == 0) {
         target += 7;
         length -= 7u;
     }
+    location->proxy_pass_ssl = is_ssl;
 
-    /* Check if target without port is an upstream name (e.g. "upstream_name" or "http://upstream_name") */
+    /* Check if target contains variables (e.g. $sub_origin) */
+    if (memchr(target, '$', length) != NULL) {
+        location->proxy_pass_dynamic = true;
+        size_t raw_len = value->length;
+        if (raw_len >= sizeof(location->proxy_pass_raw)) {
+            raw_len = sizeof(location->proxy_pass_raw) - 1;
+        }
+        memcpy(location->proxy_pass_raw, value->text, raw_len);
+        location->proxy_pass_raw[raw_len] = '\0';
+        location->target = APEX_PROXY_TARGET_ENDPOINT;
+        return true;
+    }
+
+    /* Check if target without port is an upstream name */
     if (memchr(target, ':', length) == NULL) {
         char name_buf[APEX_CONFIG_NAME_MAX];
         size_t name_len = length;
@@ -1689,10 +1792,18 @@ static bool location_set_proxy_pass(parser_t *parser, apex_location_config_t *lo
     endpoint_text[length] = '\0';
 
     char host[APEX_CONFIG_HOST_MAX];
-    uint16_t port = 0;
-    if (!parse_host_port(endpoint_text, false, false, host, sizeof(host), &port)) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid proxy_pass endpoint '%s'", value->text);
-        return false;
+    uint16_t port = is_ssl ? 443 : 80;
+    if (memchr(endpoint_text, ':', strlen(endpoint_text)) != NULL) {
+        if (!parse_host_port(endpoint_text, false, false, host, sizeof(host), &port)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid proxy_pass endpoint '%s'", value->text);
+            return false;
+        }
+    } else {
+        if (strlen(endpoint_text) >= sizeof(host)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_pass host is too long");
+            return false;
+        }
+        strcpy(host, endpoint_text);
     }
 
     location->endpoint_host = config_strdup_range(host, strlen(host));
@@ -2320,11 +2431,37 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             p->value = config_strdup_range(val->text, val->length);
             p->line = key->line;
             if (!p->name || !p->value) return config_oom(parser->error);
+        } else if (token_is_word(directive, "add_header")) {
+            if (!config_add_response_header(parser, &location->add_headers,
+                                            &location->add_header_count,
+                                            &location->add_header_capacity)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "proxy_ssl_server_name")) {
+            const token_t *value = parser_scalar(parser, "on or off");
+            if (value == NULL) return false;
+            if (token_is_word(value, "on")) {
+                location->proxy_ssl_server_name = true;
+            } else if (token_is_word(value, "off")) {
+                location->proxy_ssl_server_name = false;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_ssl_server_name must be on or off");
+                return false;
+            }
+        } else if (token_is_word(directive, "proxy_ssl_name")) {
+            const token_t *value = parser_scalar(parser, "a server name");
+            if (value == NULL) return false;
+            if (value->length >= sizeof(location->proxy_ssl_name)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_ssl_name is too long");
+                return false;
+            }
+            memcpy(location->proxy_ssl_name, value->text, value->length);
+            location->proxy_ssl_name[value->length] = '\0';
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param");
+                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name");
             return false;
         }
 
@@ -2702,9 +2839,19 @@ static bool parse_server_block(parser_t *parser) {
             if (value == NULL) return false;
             server->root = config_strdup_range(value->text, value->length);
             if (server->root == NULL) return config_oom(parser->error);
+        } else if (token_is_word(directive, "add_header")) {
+            if (!config_add_response_header(parser, &server->add_headers,
+                                            &server->add_header_count,
+                                            &server->add_header_capacity)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "server_tokens")) {
+            if (!parse_server_tokens_directive(parser, &server->server_tokens)) {
+                return false;
+            }
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log");
+            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens");
             return false;
         }
 
@@ -2717,7 +2864,7 @@ static bool parse_server_block(parser_t *parser) {
         return false;
     }
 
-    /* Inherit http-level real_ip and access_log settings */
+    /* Inherit http-level real_ip, access_log, and server_tokens settings */
     if (!server->has_access_log && parser->config->http.has_access_log) {
         server->access_log = parser->config->http.access_log;
         server->has_access_log = true;
@@ -2733,6 +2880,9 @@ static bool parse_server_block(parser_t *parser) {
     if (!server->has_real_ip_recursive && parser->config->http.has_real_ip_recursive) {
         server->real_ip_recursive = parser->config->http.real_ip_recursive;
         server->has_real_ip_recursive = true;
+    }
+    if (!server->server_tokens.set && parser->config->http.server_tokens.set) {
+        server->server_tokens = parser->config->http.server_tokens;
     }
 
     if (!have_listen) {
@@ -3210,16 +3360,13 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
             parser->config->http.client_body_timeout_ms = milliseconds;
         }
     } else if (token_is_word(directive, "server_tokens")) {
-        const token_t *value = parser_scalar(parser, "on or off");
-        if (value == NULL) {
+        if (!parse_server_tokens_directive(parser, &parser->config->http.server_tokens)) {
             return false;
         }
-        if (token_is_word(value, "on")) {
-            parser->config->http.server_tokens = true;
-        } else if (token_is_word(value, "off")) {
-            parser->config->http.server_tokens = false;
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "server_tokens must be on or off");
+    } else if (token_is_word(directive, "add_header")) {
+        if (!config_add_response_header(parser, &parser->config->http.add_headers,
+                                        &parser->config->http.add_header_count,
+                                        &parser->config->http.add_header_capacity)) {
             return false;
         }
     } else if (token_is_word(directive, "limit_req_zone")) {
@@ -3393,6 +3540,233 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
     return true;
 }
 
+static bool map_add_entry_internal(parser_t *parser, apex_map_t *map, const char *key, size_t key_len, const char *val, size_t val_len) {
+    if (map->entry_count == map->entry_capacity) {
+        size_t cap = map->entry_capacity ? map->entry_capacity * 2u : 8u;
+        apex_map_entry_t *grown = realloc(map->entries, cap * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        map->entries = grown;
+        map->entry_capacity = cap;
+    }
+    apex_map_entry_t *entry = &map->entries[map->entry_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->key = config_strdup_range(key, key_len);
+    entry->value = config_strdup_range(val, val_len);
+    if (entry->key == NULL || entry->value == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+    if (entry->key[0] == '*' && entry->key[1] == '.') {
+        entry->is_wildcard_prefix = true;
+    } else if (entry->key[0] == '.') {
+        entry->is_wildcard_prefix = true;
+    } else if (strlen(entry->key) > 2 && entry->key[strlen(entry->key) - 1] == '*' && entry->key[strlen(entry->key) - 2] == '.') {
+        entry->is_wildcard_suffix = true;
+    }
+    return true;
+}
+
+static bool map_load_include_file(parser_t *parser, apex_map_t *map, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (f == NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_IO, parser_peek(parser), "failed to open include file '%s'", path);
+        return false;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), f) != NULL) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+        char *end = p + strlen(p);
+        while (end > p && (*(end - 1) == '\r' || *(end - 1) == '\n' || *(end - 1) == ' ' || *(end - 1) == '\t' || *(end - 1) == ';')) {
+            end--;
+        }
+        *end = '\0';
+        if (*p == '\0') continue;
+        char *space = strpbrk(p, " \t");
+        if (space == NULL) continue;
+        *space = '\0';
+        char *val = space + 1;
+        while (*val == ' ' || *val == '\t') val++;
+        if (strcmp(p, "default") == 0) {
+            snprintf(map->default_value, sizeof(map->default_value), "%s", val);
+        } else {
+            if (!map_add_entry_internal(parser, map, p, strlen(p), val, strlen(val))) {
+                fclose(f);
+                return false;
+            }
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+static bool parse_map_block(parser_t *parser) {
+    const token_t *src_tok = parser_scalar(parser, "a source variable (e.g. $host)");
+    if (src_tok == NULL) {
+        return false;
+    }
+    const token_t *dst_tok = parser_scalar(parser, "a target variable (e.g. $sub_origin)");
+    if (dst_tok == NULL) {
+        return false;
+    }
+
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    apex_http_config_t *http = &parser->config->http;
+    if (http->map_count == http->map_capacity) {
+        size_t new_cap = http->map_capacity ? http->map_capacity * 2u : 4u;
+        apex_map_t *grown = realloc(http->maps, new_cap * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        http->maps = grown;
+        http->map_capacity = new_cap;
+    }
+
+    apex_map_t *map = &http->maps[http->map_count++];
+    memset(map, 0, sizeof(*map));
+
+    /* Source variable: strip leading $ if present */
+    const char *src = src_tok->text;
+    size_t src_len = src_tok->length;
+    if (src_len > 0 && src[0] == '$') {
+        src++;
+        src_len--;
+    }
+    if (src_len >= sizeof(map->source_var)) {
+        src_len = sizeof(map->source_var) - 1;
+    }
+    memcpy(map->source_var, src, src_len);
+    map->source_var[src_len] = '\0';
+
+    /* Target variable: strip leading $ if present */
+    const char *dst = dst_tok->text;
+    size_t dst_len = dst_tok->length;
+    if (dst_len > 0 && dst[0] == '$') {
+        dst++;
+        dst_len--;
+    }
+    if (dst_len >= sizeof(map->target_var)) {
+        dst_len = sizeof(map->target_var) - 1;
+    }
+    memcpy(map->target_var, dst, dst_len);
+    map->target_var[dst_len] = '\0';
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *key_tok = parser_peek(parser);
+        if (key_tok->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, key_tok, "unterminated 'map' block");
+            return false;
+        }
+        if (key_tok->kind != TOKEN_WORD && key_tok->kind != TOKEN_STRING) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, key_tok, "expected map key, 'default', or 'include'");
+            return false;
+        }
+        parser_advance(parser);
+
+        if (token_is_word(key_tok, "include")) {
+            const token_t *path_tok = parser_scalar(parser, "include file path");
+            if (path_tok == NULL) {
+                return false;
+            }
+            char inc_path[APEX_CONFIG_PATH_MAX];
+            size_t plen = path_tok->length;
+            if (plen >= sizeof(inc_path)) {
+                plen = sizeof(inc_path) - 1;
+            }
+            memcpy(inc_path, path_tok->text, plen);
+            inc_path[plen] = '\0';
+            if (!map_load_include_file(parser, map, inc_path)) {
+                return false;
+            }
+        } else if (token_is_word(key_tok, "default")) {
+            const token_t *def_val = parser_scalar(parser, "default value");
+            if (def_val == NULL) {
+                return false;
+            }
+            size_t val_len = def_val->length;
+            if (val_len >= sizeof(map->default_value)) {
+                val_len = sizeof(map->default_value) - 1;
+            }
+            memcpy(map->default_value, def_val->text, val_len);
+            map->default_value[val_len] = '\0';
+        } else {
+            const token_t *val_tok = parser_scalar(parser, "map entry value");
+            if (val_tok == NULL) {
+                return false;
+            }
+            if (!map_add_entry_internal(parser, map, key_tok->text, key_tok->length, val_tok->text, val_tok->length)) {
+                return false;
+            }
+        }
+
+        if (!parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    return parser_expect_rbrace(parser);
+}
+
+const char *apex_map_lookup(const apex_config_t *config, const char *target_var, const char *source_val) {
+    if (config == NULL || target_var == NULL) {
+        return "";
+    }
+    const char *tvar = target_var;
+    if (tvar[0] == '$') {
+        tvar++;
+    }
+    const apex_http_config_t *http = &config->http;
+    for (size_t m = 0; m < http->map_count; m++) {
+        const apex_map_t *map = &http->maps[m];
+        if (strcmp(map->target_var, tvar) != 0) {
+            continue;
+        }
+        if (source_val != NULL && source_val[0] != '\0') {
+            /* 1. Exact match */
+            for (size_t i = 0; i < map->entry_count; i++) {
+                if (!map->entries[i].is_wildcard_prefix && !map->entries[i].is_wildcard_suffix) {
+                    if (strcasecmp(map->entries[i].key, source_val) == 0) {
+                        return map->entries[i].value;
+                    }
+                }
+            }
+            /* 2. Wildcard prefix match: *.example.com or .example.com */
+            size_t src_len = strlen(source_val);
+            for (size_t i = 0; i < map->entry_count; i++) {
+                if (map->entries[i].is_wildcard_prefix) {
+                    const char *dot_suffix = (map->entries[i].key[0] == '*') ? map->entries[i].key + 1 : map->entries[i].key;
+                    size_t sfx_len = strlen(dot_suffix);
+                    if (src_len >= sfx_len && strcasecmp(source_val + (src_len - sfx_len), dot_suffix) == 0) {
+                        return map->entries[i].value;
+                    }
+                    if (strcasecmp(source_val, dot_suffix + 1) == 0) {
+                        return map->entries[i].value;
+                    }
+                }
+            }
+            /* 3. Wildcard suffix match: example.* */
+            for (size_t i = 0; i < map->entry_count; i++) {
+                if (map->entries[i].is_wildcard_suffix) {
+                    size_t pfx_len = strlen(map->entries[i].key) - 1; /* exclude * */
+                    if (strncasecmp(source_val, map->entries[i].key, pfx_len) == 0) {
+                        return map->entries[i].value;
+                    }
+                }
+            }
+        }
+        return map->default_value;
+    }
+    return "";
+}
+
 static bool parse_http_block(parser_t *parser) {
     if (!parser_expect_lbrace(parser)) {
         return false;
@@ -3416,6 +3790,10 @@ static bool parse_http_block(parser_t *parser) {
             }
         } else if (token_is_word(directive, "server")) {
             if (!parse_server_block(parser)) {
+                return false;
+            }
+        } else if (token_is_word(directive, "map")) {
+            if (!parse_map_block(parser)) {
                 return false;
             }
         } else if (token_is_word(directive, "http") || token_is_word(directive, "modules") ||
@@ -3594,7 +3972,8 @@ static void config_init_defaults(apex_config_t *config) {
     config->http.keepalive_timeout_ms = APEX_CONFIG_DEFAULT_KEEPALIVE_MS;
     config->http.client_header_timeout_ms = APEX_CONFIG_DEFAULT_CLIENT_HEADER_MS;
     config->http.client_body_timeout_ms = APEX_CONFIG_DEFAULT_CLIENT_BODY_MS;
-    config->http.server_tokens = false;
+    config->http.server_tokens.mode = APEX_SERVER_TOKENS_ON;
+    config->http.server_tokens.set = true;
 }
 
 int apex_config_parse_string(const char *name, const char *text, size_t length, apex_config_t **config_out,
@@ -3806,6 +4185,11 @@ void apex_config_free(apex_config_t *config) {
                 free(location->fastcgi_params[p_index].value);
             }
             free(location->fastcgi_params);
+            for (size_t ah = 0; ah < location->add_header_count; ah++) {
+                free(location->add_headers[ah].name);
+                free(location->add_headers[ah].value);
+            }
+            free(location->add_headers);
         }
         free(server->locations);
 
@@ -3813,9 +4197,30 @@ void apex_config_free(apex_config_t *config) {
             free(server->error_pages[ep_index].path);
         }
         free(server->error_pages);
+        for (size_t ah = 0; ah < server->add_header_count; ah++) {
+            free(server->add_headers[ah].name);
+            free(server->add_headers[ah].value);
+        }
+        free(server->add_headers);
         free(server->root);
     }
     free(config->servers);
+
+    for (size_t ah = 0; ah < config->http.add_header_count; ah++) {
+        free(config->http.add_headers[ah].name);
+        free(config->http.add_headers[ah].value);
+    }
+    free(config->http.add_headers);
+
+    for (size_t m = 0; m < config->http.map_count; m++) {
+        apex_map_t *map = &config->http.maps[m];
+        for (size_t e = 0; e < map->entry_count; e++) {
+            free(map->entries[e].key);
+            free(map->entries[e].value);
+        }
+        free(map->entries);
+    }
+    free(config->http.maps);
 
     for (size_t module_index = 0; module_index < config->module_count; module_index++) {
         free(config->modules[module_index]);
@@ -3954,7 +4359,8 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
     for (size_t server_index = 0; server_index < config->server_count; server_index++) {
         const apex_server_config_t *server = &config->servers[server_index];
         for (size_t location_index = 0; location_index < server->location_count; location_index++) {
-            if (server->locations[location_index].target == APEX_PROXY_TARGET_ENDPOINT) {
+            if (server->locations[location_index].target == APEX_PROXY_TARGET_ENDPOINT &&
+                !server->locations[location_index].proxy_pass_dynamic) {
                 endpoint_count++;
             }
         }
@@ -3973,7 +4379,7 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         const apex_server_config_t *server = &config->servers[server_index];
         for (size_t location_index = 0; location_index < server->location_count; location_index++) {
             const apex_location_config_t *location = &server->locations[location_index];
-            if (location->target != APEX_PROXY_TARGET_ENDPOINT) {
+            if (location->target != APEX_PROXY_TARGET_ENDPOINT || location->proxy_pass_dynamic) {
                 continue;
             }
 
@@ -3992,6 +4398,21 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
                 apex_runtime_destroy(runtime);
                 return NULL;
             }
+
+            if (location->proxy_pass_ssl) {
+                entry->group.use_ssl = true;
+                entry->group.servers[0].use_ssl = true;
+                if (location->proxy_ssl_name[0] != '\0') {
+                    snprintf(entry->group.ssl_server_name, sizeof(entry->group.ssl_server_name), "%s", location->proxy_ssl_name);
+                    snprintf(entry->group.servers[0].ssl_server_name, sizeof(entry->group.servers[0].ssl_server_name), "%s", location->proxy_ssl_name);
+                } else if (location->proxy_ssl_server_name && location->endpoint_host != NULL) {
+                    snprintf(entry->group.ssl_server_name, sizeof(entry->group.ssl_server_name), "%s", location->endpoint_host);
+                    snprintf(entry->group.servers[0].ssl_server_name, sizeof(entry->group.servers[0].ssl_server_name), "%s", location->endpoint_host);
+                }
+                entry->group.use_ssl_sni = location->proxy_ssl_server_name;
+                entry->group.servers[0].use_ssl_sni = location->proxy_ssl_server_name;
+            }
+
             runtime->endpoint_group_count++;
         }
     }

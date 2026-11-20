@@ -273,6 +273,20 @@ static bool static_is_traversal(const char *path, size_t len) {
     return false;
 }
 
+static size_t static_format_server_header(const apex_server_config_t *server, char *buf, size_t buf_cap) {
+    if (server == NULL || !server->server_tokens.set || server->server_tokens.mode == APEX_SERVER_TOKENS_ON) {
+        return (size_t)snprintf(buf, buf_cap, "Server: apex\r\n");
+    }
+    if (server->server_tokens.mode == APEX_SERVER_TOKENS_CUSTOM) {
+        return (size_t)snprintf(buf, buf_cap, "Server: %s\r\n", server->server_tokens.custom_value);
+    }
+    /* APEX_SERVER_TOKENS_OFF */
+    if (buf_cap > 0) {
+        buf[0] = '\0';
+    }
+    return 0;
+}
+
 void apex_static_serve(const apex_server_config_t *server,
                        const apex_location_config_t *location,
                        const char *request, size_t request_len,
@@ -280,6 +294,8 @@ void apex_static_serve(const apex_server_config_t *server,
                        bool head_request,
                        apex_res_t *res,
                        const char *extra_headers, size_t extra_headers_len) {
+    char server_hdr[160];
+    static_format_server_header(server, server_hdr, sizeof(server_hdr));
     conn_t *connection = res != NULL ? res->conn : NULL;
     if (connection == NULL || location == NULL || location->root == NULL || path == NULL) {
         router_send_error(connection, server, request, request_len, 404, "Not Found", "Not Found\n");
@@ -526,12 +542,13 @@ void apex_static_serve(const apex_server_config_t *server,
                     char header_buf[1024];
                     int hlen = snprintf(header_buf, sizeof(header_buf),
                                         "HTTP/1.1 304 Not Modified\r\n"
-                                        "Server: apex\r\n"
+                                        "%s"
                                         "ETag: %s\r\n"
                                         "Last-Modified: %s\r\n"
                                         "Connection: %s\r\n"
                                         "%.*s"
                                         "\r\n",
+                                        server_hdr,
                                         etag_str, last_mod_str,
                                         connection->close_after_write ? "close" : "keep-alive",
                                         (int)extra_headers_len, extra_headers ? extra_headers : "");
@@ -558,12 +575,13 @@ void apex_static_serve(const apex_server_config_t *server,
                     char header_buf[1024];
                     int hlen = snprintf(header_buf, sizeof(header_buf),
                                         "HTTP/1.1 304 Not Modified\r\n"
-                                        "Server: apex\r\n"
+                                        "%s"
                                         "ETag: %s\r\n"
                                         "Last-Modified: %s\r\n"
                                         "Connection: %s\r\n"
                                         "%.*s"
                                         "\r\n",
+                                        server_hdr,
                                         etag_str, last_mod_str,
                                         connection->close_after_write ? "close" : "keep-alive",
                                         (int)extra_headers_len, extra_headers ? extra_headers : "");
@@ -626,11 +644,12 @@ void apex_static_serve(const apex_server_config_t *server,
                     char h416[512];
                     int n416 = snprintf(h416, sizeof(h416),
                                        "HTTP/1.1 416 Range Not Satisfiable\r\n"
-                                       "Server: apex\r\n"
+                                       "%s"
                                        "Content-Range: bytes */%zu\r\n"
                                        "Content-Length: 0\r\n"
                                        "Connection: %s\r\n"
                                        "\r\n",
+                                       server_hdr,
                                        total_size,
                                        connection->close_after_write ? "close" : "keep-alive");
                     if (n416 > 0 && (size_t)n416 < sizeof(h416)) {
@@ -653,7 +672,7 @@ void apex_static_serve(const apex_server_config_t *server,
     if (is_range) {
         header_len = snprintf(header_buffer, sizeof(header_buffer),
                               "HTTP/1.1 206 Partial Content\r\n"
-                              "Server: apex\r\n"
+                              "%s"
                               "Content-Type: %s\r\n"
                               "Content-Length: %zu\r\n"
                               "Content-Range: bytes %zu-%zu/%zu\r\n"
@@ -663,6 +682,7 @@ void apex_static_serve(const apex_server_config_t *server,
                               "Connection: %s\r\n"
                               "%.*s"
                               "\r\n",
+                              server_hdr,
                               content_type, send_length,
                               (size_t)range_start, (size_t)(range_start + (off_t)send_length - 1), total_size,
                               etag_str, last_mod_str,
@@ -671,7 +691,7 @@ void apex_static_serve(const apex_server_config_t *server,
     } else {
         header_len = snprintf(header_buffer, sizeof(header_buffer),
                               "HTTP/1.1 200 OK\r\n"
-                              "Server: apex\r\n"
+                              "%s"
                               "Content-Type: %s\r\n"
                               "Content-Length: %zu\r\n"
                               "Accept-Ranges: bytes\r\n"
@@ -682,6 +702,7 @@ void apex_static_serve(const apex_server_config_t *server,
                               "Connection: %s\r\n"
                               "%.*s"
                               "\r\n",
+                              server_hdr,
                               content_type, send_length,
                               etag_str, last_mod_str,
                               content_encoding ? "Content-Encoding: " : "",
