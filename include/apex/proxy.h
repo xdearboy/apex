@@ -157,10 +157,15 @@ typedef struct {
     size_t total_closed;
 } apex_proxy_pool_stats_t;
 
+struct apex_resolver_config_s;
+
 void apex_upstream_group_init(upstream_group_t *group);
 int apex_upstream_add_server(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight);
 int apex_upstream_add_server_ex(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight,
                                 bool is_backup, bool is_down);
+int apex_upstream_add_server_resolver(upstream_group_t *group, const char *host, uint16_t port, uint32_t weight,
+                                      bool is_backup, bool is_down, const struct apex_resolver_config_s *resolver);
+void apex_dns_cache_flush(void);
 void apex_upstream_set_policy(upstream_group_t *group, apex_balance_policy_t policy);
 ssize_t apex_upstream_select(upstream_group_t *group);
 ssize_t apex_upstream_select_excluding(upstream_group_t *group, uint64_t excluded_mask);

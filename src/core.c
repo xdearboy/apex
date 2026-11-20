@@ -634,16 +634,13 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
         size_t header_length = (size_t)((crlf_delimiter + 4) - buffer_cursor);
         size_t content_length = 0;
 
-        if (buffer_cursor[0] == 'P' && buffer_cursor[1] == 'O' && buffer_cursor[2] == 'S' &&
-            buffer_cursor[3] == 'T') {
-            char *content_length_header =
-                (char *)memmem(buffer_cursor, header_length, "Content-Length:", 15);
-            if (!content_length_header) {
-                content_length_header = (char *)memmem(buffer_cursor, header_length, "content-length:", 15);
-            }
-            if (content_length_header) {
-                content_length = strtoul(content_length_header + 15, NULL, 10);
-            }
+        char *content_length_header =
+            (char *)memmem(buffer_cursor, header_length, "Content-Length:", 15);
+        if (!content_length_header) {
+            content_length_header = (char *)memmem(buffer_cursor, header_length, "content-length:", 15);
+        }
+        if (content_length_header) {
+            content_length = strtoul(content_length_header + 15, NULL, 10);
         }
 
         if (content_length > sizeof(connection->read_buffer) - header_length) {

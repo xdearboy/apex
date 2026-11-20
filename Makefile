@@ -102,6 +102,11 @@ test: all
 	$(PYTHON) tests/test_https_proxy.py ./$(BIN)
 	$(PYTHON) tests/test_compression.py ./$(BIN)
 	$(PYTHON) tests/test_failover.py ./$(BIN)
+	$(PYTHON) tests/test_cookie_rewrite.py ./$(BIN)
+	$(PYTHON) tests/test_sub_filter.py ./$(BIN)
+	$(PYTHON) tests/test_resolver.py ./$(BIN)
+	$(PYTHON) tests/test_otel.py ./$(BIN)
+	$(PYTHON) tests/test_upstream_api.py ./$(BIN)
 
 check: test
 

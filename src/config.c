@@ -2401,6 +2401,303 @@ static void proxy_intercept_errors_inherit(bool *child_val, bool *child_has,
     }
 }
 
+static bool parse_cookie_directive(parser_t *parser, const token_t *directive,
+                                   apex_cookie_domain_rule_t **domains, size_t *domain_count, size_t *domain_capacity, bool *domain_off,
+                                   apex_cookie_path_rule_t **paths, size_t *path_count, size_t *path_capacity, bool *path_off,
+                                   bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "proxy_cookie_domain")) {
+        const token_t *first = parser_scalar(parser, "domain or 'off'");
+        if (first == NULL) return false;
+        if (token_is_word(first, "off")) {
+            *domain_off = true;
+            *domain_count = 0;
+            return true;
+        }
+        const token_t *second = parser_scalar(parser, "replacement domain");
+        if (second == NULL) return false;
+        if (*domain_count == *domain_capacity) {
+            size_t ncap = *domain_capacity ? *domain_capacity * 2u : 4u;
+            apex_cookie_domain_rule_t *nr = realloc(*domains, ncap * sizeof(apex_cookie_domain_rule_t));
+            if (!nr) return config_oom(parser->error);
+            *domains = nr;
+            *domain_capacity = ncap;
+        }
+        apex_cookie_domain_rule_t *rule = &(*domains)[(*domain_count)++];
+        memset(rule, 0, sizeof(*rule));
+        snprintf(rule->domain, sizeof(rule->domain), "%s", first->text);
+        snprintf(rule->replacement, sizeof(rule->replacement), "%s", second->text);
+        *domain_off = false;
+        return true;
+    } else if (token_is_word(directive, "proxy_cookie_path")) {
+        const token_t *first = parser_scalar(parser, "path or 'off'");
+        if (first == NULL) return false;
+        if (token_is_word(first, "off")) {
+            *path_off = true;
+            *path_count = 0;
+            return true;
+        }
+        const token_t *second = parser_scalar(parser, "replacement path");
+        if (second == NULL) return false;
+        if (*path_count == *path_capacity) {
+            size_t ncap = *path_capacity ? *path_capacity * 2u : 4u;
+            apex_cookie_path_rule_t *nr = realloc(*paths, ncap * sizeof(apex_cookie_path_rule_t));
+            if (!nr) return config_oom(parser->error);
+            *paths = nr;
+            *path_capacity = ncap;
+        }
+        apex_cookie_path_rule_t *rule = &(*paths)[(*path_count)++];
+        memset(rule, 0, sizeof(*rule));
+        snprintf(rule->path, sizeof(rule->path), "%s", first->text);
+        snprintf(rule->replacement, sizeof(rule->replacement), "%s", second->text);
+        *path_off = false;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static bool parse_sub_filter_directive(parser_t *parser, const token_t *directive,
+                                       apex_sub_filter_config_t *sub, bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "sub_filter")) {
+        const token_t *first = parser_scalar(parser, "pattern to match");
+        if (first == NULL) return false;
+        const token_t *second = parser_scalar(parser, "replacement string");
+        if (second == NULL) return false;
+        if (sub->rule_count == sub->rule_capacity) {
+            size_t ncap = sub->rule_capacity ? sub->rule_capacity * 2u : 4u;
+            apex_sub_filter_rule_t *nr = realloc(sub->rules, ncap * sizeof(apex_sub_filter_rule_t));
+            if (!nr) return config_oom(parser->error);
+            sub->rules = nr;
+            sub->rule_capacity = ncap;
+        }
+        apex_sub_filter_rule_t *r = &sub->rules[sub->rule_count++];
+        memset(r, 0, sizeof(*r));
+        snprintf(r->match, sizeof(r->match), "%s", first->text);
+        snprintf(r->replacement, sizeof(r->replacement), "%s", second->text);
+        if (!sub->is_set) {
+            sub->once = true;
+            sub->is_set = true;
+        }
+        return true;
+    } else if (token_is_word(directive, "sub_filter_once")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            sub->once = true;
+        } else if (token_is_word(val, "off")) {
+            sub->once = false;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "sub_filter_once must be on or off");
+            return false;
+        }
+        sub->is_set = true;
+        return true;
+    } else if (token_is_word(directive, "sub_filter_types")) {
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *tok = parser_scalar(parser, "MIME type");
+            if (tok == NULL) return false;
+            if (sub->type_count == sub->type_capacity) {
+                size_t ncap = sub->type_capacity ? sub->type_capacity * 2u : 4u;
+                char **nt = realloc(sub->types, ncap * sizeof(char *));
+                if (!nt) return config_oom(parser->error);
+                sub->types = nt;
+                sub->type_capacity = ncap;
+            }
+            sub->types[sub->type_count++] = config_strdup_range(tok->text, tok->length);
+        }
+        sub->is_set = true;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static void cookie_domain_inherit(apex_cookie_domain_rule_t **child_domains, size_t *child_count, size_t *child_cap, bool child_off,
+                                  const apex_cookie_domain_rule_t *parent_domains, size_t parent_count, bool parent_off) {
+    if (child_off || *child_count > 0 || parent_off || parent_count == 0 || parent_domains == NULL) {
+        return;
+    }
+    apex_cookie_domain_rule_t *copy = malloc(parent_count * sizeof(apex_cookie_domain_rule_t));
+    if (!copy) return;
+    memcpy(copy, parent_domains, parent_count * sizeof(apex_cookie_domain_rule_t));
+    *child_domains = copy;
+    *child_count = parent_count;
+    *child_cap = parent_count;
+}
+
+static void cookie_path_inherit(apex_cookie_path_rule_t **child_paths, size_t *child_count, size_t *child_cap, bool child_off,
+                                const apex_cookie_path_rule_t *parent_paths, size_t parent_count, bool parent_off) {
+    if (child_off || *child_count > 0 || parent_off || parent_count == 0 || parent_paths == NULL) {
+        return;
+    }
+    apex_cookie_path_rule_t *copy = malloc(parent_count * sizeof(apex_cookie_path_rule_t));
+    if (!copy) return;
+    memcpy(copy, parent_paths, parent_count * sizeof(apex_cookie_path_rule_t));
+    *child_paths = copy;
+    *child_count = parent_count;
+    *child_cap = parent_count;
+}
+
+static void sub_filter_inherit(apex_sub_filter_config_t *child, const apex_sub_filter_config_t *parent) {
+    if (child->is_set || !parent->is_set || parent == NULL) {
+        return;
+    }
+    if (parent->rule_count > 0) {
+        apex_sub_filter_rule_t *rcopy = malloc(parent->rule_count * sizeof(apex_sub_filter_rule_t));
+        if (rcopy) {
+            memcpy(rcopy, parent->rules, parent->rule_count * sizeof(apex_sub_filter_rule_t));
+            child->rules = rcopy;
+            child->rule_count = parent->rule_count;
+            child->rule_capacity = parent->rule_count;
+        }
+    }
+    child->once = parent->once;
+    if (parent->type_count > 0) {
+        char **tcopy = malloc(parent->type_count * sizeof(char *));
+        if (tcopy) {
+            for (size_t i = 0; i < parent->type_count; i++) {
+                tcopy[i] = strdup(parent->types[i]);
+            }
+            child->types = tcopy;
+            child->type_count = parent->type_count;
+            child->type_capacity = parent->type_count;
+        }
+    }
+    child->is_set = true;
+}
+
+static bool parse_resolver_directive(parser_t *parser, const token_t *directive,
+                                     apex_resolver_config_t *res, bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "resolver")) {
+        res->server_count = 0;
+        res->valid_ms = 0;
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *tok = parser_scalar(parser, "DNS server IP or valid=<time>");
+            if (tok == NULL) return false;
+            if (strncmp(tok->text, "valid=", 6) == 0) {
+                token_t val_tok = *tok;
+                val_tok.text = tok->text + 6;
+                val_tok.length = tok->length - 6;
+                uint64_t ms = 0;
+                if (!token_to_duration_ms(&val_tok, &ms)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "invalid valid= duration in resolver");
+                    return false;
+                }
+                res->valid_ms = (uint32_t)ms;
+            } else {
+                if (res->server_count < 4) {
+                    snprintf(res->servers[res->server_count++], sizeof(res->servers[0]), "%s", tok->text);
+                }
+            }
+        }
+        if (res->server_count == 0) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "resolver requires at least one server address");
+            return false;
+        }
+        res->is_set = true;
+        return true;
+    } else if (token_is_word(directive, "resolver_timeout")) {
+        const token_t *tok = parser_scalar(parser, "a duration");
+        if (tok == NULL) return false;
+        uint64_t ms = 0;
+        if (!token_to_duration_ms(tok, &ms)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "invalid resolver_timeout");
+            return false;
+        }
+        res->timeout_ms = (uint32_t)ms;
+        res->is_set = true;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static bool parse_otel_directive(parser_t *parser, const token_t *directive,
+                                 apex_otel_config_t *otel, bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "otel")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            otel->enabled = true;
+            if (!otel->is_set) {
+                otel->context_mode = APEX_OTEL_CTX_PROPAGATE;
+            }
+        } else if (token_is_word(val, "off")) {
+            otel->enabled = false;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "otel must be on or off");
+            return false;
+        }
+        otel->is_set = true;
+        return true;
+    } else if (token_is_word(directive, "otel_trace_context")) {
+        const token_t *val = parser_scalar(parser, "on, off, or propagate");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            otel->context_mode = APEX_OTEL_CTX_ON;
+        } else if (token_is_word(val, "off")) {
+            otel->context_mode = APEX_OTEL_CTX_OFF;
+        } else if (token_is_word(val, "propagate")) {
+            otel->context_mode = APEX_OTEL_CTX_PROPAGATE;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "otel_trace_context must be on, off, or propagate");
+            return false;
+        }
+        otel->is_set = true;
+        return true;
+    } else if (token_is_word(directive, "otel_span_name")) {
+        const token_t *val = parser_scalar(parser, "a span name");
+        if (val == NULL) return false;
+        snprintf(otel->span_name, sizeof(otel->span_name), "%s", val->text);
+        otel->is_set = true;
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static bool parse_api_directive(parser_t *parser, const token_t *directive,
+                                apex_api_config_t *api, bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "api")) {
+        api->enabled = true;
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *arg = parser_scalar(parser, "write=on or write=off");
+            if (arg == NULL) return false;
+            if (token_is_word(arg, "write=on")) {
+                api->write_enabled = true;
+            } else if (token_is_word(arg, "write=off")) {
+                api->write_enabled = false;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "unknown api parameter '%s'", arg->text);
+                return false;
+            }
+        }
+        return true;
+    }
+    *handled = false;
+    return true;
+}
+
+static void resolver_inherit(apex_resolver_config_t *child, const apex_resolver_config_t *parent) {
+    if (child->is_set || !parent->is_set || parent == NULL) return;
+    *child = *parent;
+}
+
+static void otel_inherit(apex_otel_config_t *child, const apex_otel_config_t *parent) {
+    if (child->is_set || !parent->is_set || parent == NULL) return;
+    *child = *parent;
+}
+
+static void api_inherit(apex_api_config_t *child, const apex_api_config_t *parent) {
+    if (child->enabled || !parent->enabled || parent == NULL) return;
+    *child = *parent;
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -2876,17 +3173,62 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             if (handled_failover) {
                 /* handled */
             } else {
-                bool handled_compress = false;
-                if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
-                    if (!handled_compress) {
-                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
-                                     directive->text);
-                        parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                            "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, gzip, brotli, zstd");
+                bool handled_cookie = false;
+                if (!parse_cookie_directive(parser, directive,
+                                            &location->cookie_domains, &location->cookie_domain_count,
+                                            &location->cookie_domain_capacity, &location->cookie_domain_off,
+                                            &location->cookie_paths, &location->cookie_path_count,
+                                            &location->cookie_path_capacity, &location->cookie_path_off,
+                                            &handled_cookie)) {
+                    return false;
+                }
+                if (handled_cookie) {
+                    /* handled */
+                } else {
+                    bool handled_sub = false;
+                    if (!parse_sub_filter_directive(parser, directive, &location->sub_filter, &handled_sub)) {
                         return false;
                     }
-                } else {
-                    return false;
+                    if (handled_sub) {
+                        /* handled */
+                    } else {
+                        bool handled_res = false;
+                        if (!parse_resolver_directive(parser, directive, &location->resolver, &handled_res)) {
+                            return false;
+                        }
+                        if (handled_res) {
+                            /* handled */
+                        } else {
+                            bool handled_otel = false;
+                            if (!parse_otel_directive(parser, directive, &location->otel, &handled_otel)) {
+                                return false;
+                            }
+                            if (handled_otel) {
+                                /* handled */
+                            } else {
+                                bool handled_api = false;
+                                if (!parse_api_directive(parser, directive, &location->api, &handled_api)) {
+                                    return false;
+                                }
+                                if (handled_api) {
+                                    /* handled */
+                                } else {
+                                    bool handled_compress = false;
+                                    if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
+                                        if (!handled_compress) {
+                                            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
+                                                         directive->text);
+                                            parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
+                                                                "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, gzip, brotli, zstd");
+                                            return false;
+                                        }
+                                    } else {
+                                        return false;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2957,10 +3299,18 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             if (location->error_pages[i].path == NULL) return config_oom(parser->error);
         }
     }
+    cookie_domain_inherit(&location->cookie_domains, &location->cookie_domain_count, &location->cookie_domain_capacity, location->cookie_domain_off,
+                          server->cookie_domains, server->cookie_domain_count, server->cookie_domain_off);
+    cookie_path_inherit(&location->cookie_paths, &location->cookie_path_count, &location->cookie_path_capacity, location->cookie_path_off,
+                        server->cookie_paths, server->cookie_path_count, server->cookie_path_off);
+    sub_filter_inherit(&location->sub_filter, &server->sub_filter);
+    resolver_inherit(&location->resolver, &server->resolver);
+    otel_inherit(&location->otel, &server->otel);
+    api_inherit(&location->api, &server->api);
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
-        !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0') {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, fastcgi_pass, root, return, stub_status, or metrics");
+        !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0' && !location->api.enabled) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, fastcgi_pass, root, return, stub_status, metrics, or api");
         return false;
     }
     return true;
@@ -3306,18 +3656,63 @@ static bool parse_server_block(parser_t *parser) {
             if (handled_failover) {
                 /* handled */
             } else {
-                bool handled_compress = false;
-                if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
-                    if (!handled_compress) {
-                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-                        parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, gzip, brotli, zstd");
+                bool handled_cookie = false;
+                if (!parse_cookie_directive(parser, directive,
+                                            &server->cookie_domains, &server->cookie_domain_count,
+                                            &server->cookie_domain_capacity, &server->cookie_domain_off,
+                                            &server->cookie_paths, &server->cookie_path_count,
+                                            &server->cookie_path_capacity, &server->cookie_path_off,
+                                            &handled_cookie)) {
+                    return false;
+                }
+                if (handled_cookie) {
+                    /* handled */
+                } else {
+                    bool handled_sub = false;
+                    if (!parse_sub_filter_directive(parser, directive, &server->sub_filter, &handled_sub)) {
                         return false;
                     }
-                } else {
-                    return false;
+                    if (handled_sub) {
+                        /* handled */
+                    } else {
+                        bool handled_res = false;
+                    if (!parse_resolver_directive(parser, directive, &server->resolver, &handled_res)) {
+                        return false;
+                    }
+                    if (handled_res) {
+                        /* handled */
+                    } else {
+                        bool handled_otel = false;
+                        if (!parse_otel_directive(parser, directive, &server->otel, &handled_otel)) {
+                            return false;
+                        }
+                        if (handled_otel) {
+                            /* handled */
+                        } else {
+                            bool handled_api = false;
+                            if (!parse_api_directive(parser, directive, &server->api, &handled_api)) {
+                                return false;
+                            }
+                            if (handled_api) {
+                                /* handled */
+                            } else {
+                                bool handled_compress = false;
+                                if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
+                                    if (!handled_compress) {
+                                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+                                        parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, gzip, brotli, zstd");
+                                        return false;
+                                    }
+                                } else {
+                                    return false;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
+    }
 
         if (!parser_expect_semicolon(parser)) {
             return false;
@@ -3355,6 +3750,13 @@ static bool parse_server_block(parser_t *parser) {
                           &parser->config->http.next_upstream, parser->config->http.has_next_upstream);
     proxy_intercept_errors_inherit(&server->proxy_intercept_errors, &server->has_proxy_intercept_errors,
                                    parser->config->http.proxy_intercept_errors, parser->config->http.has_proxy_intercept_errors);
+    cookie_domain_inherit(&server->cookie_domains, &server->cookie_domain_count, &server->cookie_domain_capacity, server->cookie_domain_off,
+                          parser->config->http.cookie_domains, parser->config->http.cookie_domain_count, parser->config->http.cookie_domain_off);
+    cookie_path_inherit(&server->cookie_paths, &server->cookie_path_count, &server->cookie_path_capacity, server->cookie_path_off,
+                        parser->config->http.cookie_paths, parser->config->http.cookie_path_count, parser->config->http.cookie_path_off);
+    sub_filter_inherit(&server->sub_filter, &parser->config->http.sub_filter);
+    resolver_inherit(&server->resolver, &parser->config->http.resolver);
+    otel_inherit(&server->otel, &parser->config->http.otel);
 
     if (!have_listen) {
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
@@ -4014,6 +4416,39 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
         if (handled_failover) {
             return true;
         }
+        bool handled_cookie = false;
+        if (!parse_cookie_directive(parser, directive,
+                                    &parser->config->http.cookie_domains, &parser->config->http.cookie_domain_count,
+                                    &parser->config->http.cookie_domain_capacity, &parser->config->http.cookie_domain_off,
+                                    &parser->config->http.cookie_paths, &parser->config->http.cookie_path_count,
+                                    &parser->config->http.cookie_path_capacity, &parser->config->http.cookie_path_off,
+                                    &handled_cookie)) {
+            return false;
+        }
+        if (handled_cookie) {
+            return true;
+        }
+        bool handled_sub = false;
+        if (!parse_sub_filter_directive(parser, directive, &parser->config->http.sub_filter, &handled_sub)) {
+            return false;
+        }
+        if (handled_sub) {
+            return true;
+        }
+        bool handled_res = false;
+        if (!parse_resolver_directive(parser, directive, &parser->config->http.resolver, &handled_res)) {
+            return false;
+        }
+        if (handled_res) {
+            return true;
+        }
+        bool handled_otel = false;
+        if (!parse_otel_directive(parser, directive, &parser->config->http.otel, &handled_otel)) {
+            return false;
+        }
+        if (handled_otel) {
+            return true;
+        }
         bool handled_compress = false;
         if (parse_compress_directive(parser, directive, &parser->config->http.compress,
                                      &parser->config->http.has_compress, &handled_compress)) {
@@ -4025,7 +4460,7 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
         }
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, upstream, server, gzip, brotli, zstd");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, upstream, server, gzip, brotli, zstd");
         return false;
     }
     return true;
@@ -4701,6 +5136,13 @@ void apex_config_free(apex_config_t *config) {
                 free(location->error_pages[ep].path);
             }
             free(location->error_pages);
+            free(location->cookie_domains);
+            free(location->cookie_paths);
+            free(location->sub_filter.rules);
+            if (location->sub_filter.types) {
+                for (size_t t = 0; t < location->sub_filter.type_count; t++) free(location->sub_filter.types[t]);
+                free(location->sub_filter.types);
+            }
         }
         free(server->locations);
 
@@ -4715,6 +5157,13 @@ void apex_config_free(apex_config_t *config) {
         free(server->add_headers);
         free(server->root);
         config_free_compress(&server->compress);
+        free(server->cookie_domains);
+        free(server->cookie_paths);
+        free(server->sub_filter.rules);
+        if (server->sub_filter.types) {
+            for (size_t t = 0; t < server->sub_filter.type_count; t++) free(server->sub_filter.types[t]);
+            free(server->sub_filter.types);
+        }
     }
     free(config->servers);
 
@@ -4724,6 +5173,13 @@ void apex_config_free(apex_config_t *config) {
     }
     free(config->http.add_headers);
     config_free_compress(&config->http.compress);
+    free(config->http.cookie_domains);
+    free(config->http.cookie_paths);
+    free(config->http.sub_filter.rules);
+    if (config->http.sub_filter.types) {
+        for (size_t t = 0; t < config->http.sub_filter.type_count; t++) free(config->http.sub_filter.types[t]);
+        free(config->http.sub_filter.types);
+    }
 
     for (size_t m = 0; m < config->http.map_count; m++) {
         apex_map_t *map = &config->http.maps[m];

@@ -269,42 +269,111 @@ static bool router_status_matches_add_header(int status, bool always) {
 }
 
 static _Thread_local char s_current_request_id[36] = {0};
+static _Thread_local char s_current_otel_trace_id[33] = {0};
+static _Thread_local char s_current_otel_span_id[17] = {0};
+static _Thread_local char s_current_otel_parent_id[17] = {0};
+static _Thread_local char s_current_otel_flags[3] = "01";
+static _Thread_local char s_current_otel_tracestate[256] = {0};
+static _Thread_local bool s_current_otel_active = false;
 
-static void router_generate_request_id(char *dst, size_t dst_cap) {
-    if (dst == NULL || dst_cap < 33) return;
-    uint8_t rand_bytes[16];
-    static _Thread_local uint64_t seed = 0;
-    static _Thread_local bool seeded = false;
-    bool got_entropy = false;
-
+static void router_generate_hex(char *dst, size_t num_bytes) {
+    if (dst == NULL || num_bytes == 0) return;
+    uint8_t rand_bytes[32];
+    if (num_bytes > sizeof(rand_bytes)) num_bytes = sizeof(rand_bytes);
     int urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    bool got_entropy = false;
     if (urandom_fd >= 0) {
-        ssize_t n = read(urandom_fd, rand_bytes, sizeof(rand_bytes));
+        ssize_t n = read(urandom_fd, rand_bytes, num_bytes);
         close(urandom_fd);
-        if (n == (ssize_t)sizeof(rand_bytes)) {
+        if (n == (ssize_t)num_bytes) {
             got_entropy = true;
         }
     }
 
     if (!got_entropy) {
+        static _Thread_local uint64_t seed = 0;
+        static _Thread_local bool seeded = false;
         if (!seeded) {
             struct timeval tv;
             gettimeofday(&tv, NULL);
             seed = ((uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec) ^ (uintptr_t)&seed;
             seeded = true;
         }
-        for (size_t i = 0; i < 16; i++) {
+        for (size_t i = 0; i < num_bytes; i++) {
             seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
             rand_bytes[i] = (uint8_t)(seed >> 32);
         }
     }
 
     static const char hex_chars[] = "0123456789abcdef";
-    for (size_t i = 0; i < 16; i++) {
+    for (size_t i = 0; i < num_bytes; i++) {
         dst[i * 2] = hex_chars[(rand_bytes[i] >> 4) & 0x0F];
         dst[i * 2 + 1] = hex_chars[rand_bytes[i] & 0x0F];
     }
-    dst[32] = '\0';
+    dst[num_bytes * 2] = '\0';
+}
+
+static void router_generate_request_id(char *dst, size_t dst_cap) {
+    if (dst == NULL || dst_cap < 33) return;
+    router_generate_hex(dst, 16);
+}
+
+static void router_otel_init(const char *request, size_t request_length, const apex_otel_config_t *otel_cfg) {
+    s_current_otel_trace_id[0] = '\0';
+    s_current_otel_span_id[0] = '\0';
+    s_current_otel_parent_id[0] = '\0';
+    strcpy(s_current_otel_flags, "01");
+    s_current_otel_tracestate[0] = '\0';
+    s_current_otel_active = false;
+
+    if (otel_cfg == NULL || !otel_cfg->enabled) {
+        return;
+    }
+    s_current_otel_active = true;
+
+    const char *tp_val = NULL;
+    size_t tp_len = 0;
+    if (router_find_header(request, request_length, "traceparent", &tp_val, &tp_len) && tp_len >= 55) {
+        if (tp_val[2] == '-' && tp_val[35] == '-' && tp_val[52] == '-') {
+            char trace_id[33];
+            memcpy(trace_id, tp_val + 3, 32);
+            trace_id[32] = '\0';
+
+            char parent_id[17];
+            memcpy(parent_id, tp_val + 36, 16);
+            parent_id[16] = '\0';
+
+            char flags[3];
+            memcpy(flags, tp_val + 53, 2);
+            flags[2] = '\0';
+
+            bool valid_trace = false;
+            for (int i = 0; i < 32; i++) {
+                if (trace_id[i] != '0') valid_trace = true;
+            }
+            if (valid_trace) {
+                memcpy(s_current_otel_trace_id, trace_id, 33);
+                memcpy(s_current_otel_parent_id, parent_id, 17);
+                memcpy(s_current_otel_flags, flags, 3);
+            }
+        }
+    }
+
+    if (s_current_otel_trace_id[0] == '\0') {
+        router_generate_hex(s_current_otel_trace_id, 16);
+        s_current_otel_parent_id[0] = '\0';
+    }
+    router_generate_hex(s_current_otel_span_id, 8);
+
+    const char *ts_val = NULL;
+    size_t ts_len = 0;
+    if (router_find_header(request, request_length, "tracestate", &ts_val, &ts_len)) {
+        if (ts_len >= sizeof(s_current_otel_tracestate)) {
+            ts_len = sizeof(s_current_otel_tracestate) - 1;
+        }
+        memcpy(s_current_otel_tracestate, ts_val, ts_len);
+        s_current_otel_tracestate[ts_len] = '\0';
+    }
 }
 
 static const char *router_resolve_source_var(const char *source_var,
@@ -320,6 +389,21 @@ static const char *router_resolve_source_var(const char *source_var,
             router_generate_request_id(s_current_request_id, sizeof(s_current_request_id));
         }
         return s_current_request_id;
+    }
+    if (strcmp(source_var, "otel_trace_id") == 0) {
+        if (s_current_otel_trace_id[0] == '\0') {
+            router_generate_hex(s_current_otel_trace_id, 16);
+        }
+        return s_current_otel_trace_id;
+    }
+    if (strcmp(source_var, "otel_span_id") == 0) {
+        if (s_current_otel_span_id[0] == '\0') {
+            router_generate_hex(s_current_otel_span_id, 8);
+        }
+        return s_current_otel_span_id;
+    }
+    if (strcmp(source_var, "otel_parent_id") == 0) {
+        return s_current_otel_parent_id;
     }
     if (strcmp(source_var, "host") == 0 || strcmp(source_var, "http_host") == 0) {
         return host ? host : "";
@@ -382,6 +466,21 @@ static void router_expand_string_ex(const apex_runtime_t *runtime,
                 }
                 subst = s_current_request_id;
                 subst_len = strlen(s_current_request_id);
+            } else if (var_len == 13 && strncmp(var, "otel_trace_id", 13) == 0) {
+                if (s_current_otel_trace_id[0] == '\0') {
+                    router_generate_hex(s_current_otel_trace_id, 16);
+                }
+                subst = s_current_otel_trace_id;
+                subst_len = strlen(s_current_otel_trace_id);
+            } else if (var_len == 12 && strncmp(var, "otel_span_id", 12) == 0) {
+                if (s_current_otel_span_id[0] == '\0') {
+                    router_generate_hex(s_current_otel_span_id, 8);
+                }
+                subst = s_current_otel_span_id;
+                subst_len = strlen(s_current_otel_span_id);
+            } else if (var_len == 14 && strncmp(var, "otel_parent_id", 14) == 0) {
+                subst = s_current_otel_parent_id;
+                subst_len = strlen(s_current_otel_parent_id);
             } else if (var_len == 4 && strncmp(var, "host", 4) == 0) {
                 subst = host;
                 subst_len = host_len;
@@ -688,6 +787,12 @@ static bool build_request_headers(const char *request, size_t request_length,
                     router_header_name_equal(line, name_len, "X-Forwarded-Host")) {
                     skip_header = true;
                 }
+                if (location != NULL && location->otel.enabled && location->otel.context_mode != APEX_OTEL_CTX_OFF) {
+                    if (router_header_name_equal(line, name_len, "traceparent") ||
+                        (router_header_name_equal(line, name_len, "tracestate") && s_current_otel_tracestate[0] != '\0')) {
+                        skip_header = true;
+                    }
+                }
             }
 
             if (!skip_header && !router_header_is_overridden(line, line_length, location)) {
@@ -745,6 +850,24 @@ static bool build_request_headers(const char *request, size_t request_length,
             !router_buffer_append_string(&buffer, "\r\n")) {
             router_buffer_free(&buffer);
             return false;
+        }
+    }
+
+    if (location != NULL && location->otel.enabled && location->otel.context_mode != APEX_OTEL_CTX_OFF) {
+        char tp_buf[128];
+        snprintf(tp_buf, sizeof(tp_buf), "traceparent: 00-%s-%s-%s\r\n",
+                 s_current_otel_trace_id, s_current_otel_span_id, s_current_otel_flags);
+        if (!router_buffer_append_string(&buffer, tp_buf)) {
+            router_buffer_free(&buffer);
+            return false;
+        }
+        if (s_current_otel_tracestate[0] != '\0') {
+            if (!router_buffer_append_string(&buffer, "tracestate: ") ||
+                !router_buffer_append_string(&buffer, s_current_otel_tracestate) ||
+                !router_buffer_append_string(&buffer, "\r\n")) {
+                router_buffer_free(&buffer);
+                return false;
+            }
         }
     }
 
@@ -1212,6 +1335,368 @@ static bool router_compress_response(const apex_compress_config_t *compress,
     return true;
 }
 
+static void router_get_cookie_rules(const apex_server_config_t *server,
+                                    const apex_location_config_t *location,
+                                    const apex_http_config_t *http,
+                                    const apex_cookie_domain_rule_t **out_domains, size_t *out_domain_count,
+                                    const apex_cookie_path_rule_t **out_paths, size_t *out_path_count) {
+    *out_domains = NULL;
+    *out_domain_count = 0;
+    *out_paths = NULL;
+    *out_path_count = 0;
+
+    if (location != NULL && location->cookie_domain_off) {
+        /* disabled in location */
+    } else if (location != NULL && location->cookie_domain_count > 0) {
+        *out_domains = location->cookie_domains;
+        *out_domain_count = location->cookie_domain_count;
+    } else if (server != NULL && server->cookie_domain_off) {
+        /* disabled in server */
+    } else if (server != NULL && server->cookie_domain_count > 0) {
+        *out_domains = server->cookie_domains;
+        *out_domain_count = server->cookie_domain_count;
+    } else if (http != NULL && !http->cookie_domain_off && http->cookie_domain_count > 0) {
+        *out_domains = http->cookie_domains;
+        *out_domain_count = http->cookie_domain_count;
+    }
+
+    if (location != NULL && location->cookie_path_off) {
+        /* disabled in location */
+    } else if (location != NULL && location->cookie_path_count > 0) {
+        *out_paths = location->cookie_paths;
+        *out_path_count = location->cookie_path_count;
+    } else if (server != NULL && server->cookie_path_off) {
+        /* disabled in server */
+    } else if (server != NULL && server->cookie_path_count > 0) {
+        *out_paths = server->cookie_paths;
+        *out_path_count = server->cookie_path_count;
+    } else if (http != NULL && !http->cookie_path_off && http->cookie_path_count > 0) {
+        *out_paths = http->cookie_paths;
+        *out_path_count = http->cookie_path_count;
+    }
+}
+
+static bool router_rewrite_cookie_line(const char *line, size_t line_length,
+                                       const apex_cookie_domain_rule_t *domains, size_t domain_count,
+                                       const apex_cookie_path_rule_t *paths, size_t path_count,
+                                       char *out_buf, size_t out_capacity, size_t *out_len) {
+    if ((domain_count == 0 && path_count == 0) || out_buf == NULL || out_capacity == 0) {
+        return false;
+    }
+
+    const char *colon = memchr(line, ':', line_length);
+    if (colon == NULL) {
+        return false;
+    }
+
+    size_t name_len = (size_t)(colon - line);
+    if (!router_header_name_equal(line, name_len, "Set-Cookie")) {
+        return false;
+    }
+
+    const char *p = colon + 1;
+    const char *end = line + line_length;
+    while (p < end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+
+    size_t written = 0;
+    int w = snprintf(out_buf, out_capacity, "Set-Cookie: ");
+    if (w < 0 || (size_t)w >= out_capacity) return false;
+    written += (size_t)w;
+
+    bool modified = false;
+    bool is_first = true;
+
+    while (p < end) {
+        const char *semi = memchr(p, ';', (size_t)(end - p));
+        const char *attr_end = semi ? semi : end;
+
+        const char *attr_start = p;
+        while (attr_start < attr_end && (*attr_start == ' ' || *attr_start == '\t')) {
+            attr_start++;
+        }
+        const char *attr_val_end = attr_end;
+        while (attr_val_end > attr_start && (attr_val_end[-1] == ' ' || attr_val_end[-1] == '\t')) {
+            attr_val_end--;
+        }
+
+        size_t attr_len = (size_t)(attr_val_end - attr_start);
+        if (attr_len > 0) {
+            if (!is_first) {
+                if (written + 2 >= out_capacity) return false;
+                memcpy(out_buf + written, "; ", 2);
+                written += 2;
+            }
+
+            if (is_first) {
+                if (written + attr_len >= out_capacity) return false;
+                memcpy(out_buf + written, attr_start, attr_len);
+                written += attr_len;
+                is_first = false;
+            } else {
+                const char *eq = memchr(attr_start, '=', attr_len);
+                if (eq != NULL) {
+                    size_t key_len = (size_t)(eq - attr_start);
+                    const char *val_start = eq + 1;
+                    while (val_start < attr_val_end && (*val_start == ' ' || *val_start == '\t')) val_start++;
+                    size_t val_len = (size_t)(attr_val_end - val_start);
+
+                    char key_buf[32];
+                    if (key_len < sizeof(key_buf)) {
+                        memcpy(key_buf, attr_start, key_len);
+                        key_buf[key_len] = '\0';
+                    } else {
+                        key_buf[0] = '\0';
+                    }
+
+                    if (strcasecmp(key_buf, "domain") == 0 && domain_count > 0) {
+                        char dom_val[APEX_CONFIG_HOST_MAX];
+                        if (val_len < sizeof(dom_val)) {
+                            memcpy(dom_val, val_start, val_len);
+                            dom_val[val_len] = '\0';
+                        } else {
+                            dom_val[0] = '\0';
+                        }
+
+                        bool dom_matched = false;
+                        char new_dom[APEX_CONFIG_HOST_MAX * 2];
+                        new_dom[0] = '\0';
+
+                        for (size_t d = 0; d < domain_count; d++) {
+                            const char *rule_dom = domains[d].domain;
+                            const char *rep_dom = domains[d].replacement;
+                            size_t rule_len = strlen(rule_dom);
+                            size_t c_len = strlen(dom_val);
+
+                            if (rule_dom[0] == '.') {
+                                if (c_len >= rule_len && strcasecmp(dom_val + (c_len - rule_len), rule_dom) == 0) {
+                                    size_t prefix_len = c_len - rule_len;
+                                    snprintf(new_dom, sizeof(new_dom), "%.*s%s", (int)prefix_len, dom_val, rep_dom);
+                                    dom_matched = true;
+                                    break;
+                                } else if (c_len + 1 == rule_len && strcasecmp(dom_val, rule_dom + 1) == 0) {
+                                    snprintf(new_dom, sizeof(new_dom), "%s", rep_dom[0] == '.' ? rep_dom + 1 : rep_dom);
+                                    dom_matched = true;
+                                    break;
+                                }
+                            } else {
+                                if (strcasecmp(dom_val, rule_dom) == 0) {
+                                    snprintf(new_dom, sizeof(new_dom), "%s", rep_dom);
+                                    dom_matched = true;
+                                    break;
+                                } else if (dom_val[0] == '.' && strcasecmp(dom_val + 1, rule_dom) == 0) {
+                                    snprintf(new_dom, sizeof(new_dom), "%s%s", rep_dom[0] == '.' ? "" : ".", rep_dom);
+                                    dom_matched = true;
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (dom_matched) {
+                            modified = true;
+                            int rw = snprintf(out_buf + written, out_capacity - written, "Domain=%s", new_dom);
+                            if (rw < 0 || written + (size_t)rw >= out_capacity) return false;
+                            written += (size_t)rw;
+                        } else {
+                            if (written + attr_len >= out_capacity) return false;
+                            memcpy(out_buf + written, attr_start, attr_len);
+                            written += attr_len;
+                        }
+                    } else if (strcasecmp(key_buf, "path") == 0 && path_count > 0) {
+                        char path_val[APEX_CONFIG_PATH_MAX];
+                        if (val_len < sizeof(path_val)) {
+                            memcpy(path_val, val_start, val_len);
+                            path_val[val_len] = '\0';
+                        } else {
+                            path_val[0] = '\0';
+                        }
+
+                        bool path_matched = false;
+                        char new_path[APEX_CONFIG_PATH_MAX * 2];
+                        new_path[0] = '\0';
+
+                        for (size_t pidx = 0; pidx < path_count; pidx++) {
+                            const char *rule_path = paths[pidx].path;
+                            const char *rep_path = paths[pidx].replacement;
+                            size_t rule_len = strlen(rule_path);
+
+                            if (strncmp(path_val, rule_path, rule_len) == 0) {
+                                snprintf(new_path, sizeof(new_path), "%s%s", rep_path, path_val + rule_len);
+                                path_matched = true;
+                                break;
+                            }
+                        }
+
+                        if (path_matched) {
+                            modified = true;
+                            int rw = snprintf(out_buf + written, out_capacity - written, "Path=%s", new_path);
+                            if (rw < 0 || written + (size_t)rw >= out_capacity) return false;
+                            written += (size_t)rw;
+                        } else {
+                            if (written + attr_len >= out_capacity) return false;
+                            memcpy(out_buf + written, attr_start, attr_len);
+                            written += attr_len;
+                        }
+                    } else {
+                        if (written + attr_len >= out_capacity) return false;
+                        memcpy(out_buf + written, attr_start, attr_len);
+                        written += attr_len;
+                    }
+                } else {
+                    if (written + attr_len >= out_capacity) return false;
+                    memcpy(out_buf + written, attr_start, attr_len);
+                    written += attr_len;
+                }
+            }
+        }
+
+        if (semi != NULL) {
+            p = semi + 1;
+        } else {
+            break;
+        }
+    }
+
+    if (!modified) {
+        return false;
+    }
+
+    *out_len = written;
+    return true;
+}
+
+static const apex_sub_filter_config_t *router_get_sub_filter(const apex_server_config_t *server,
+                                                             const apex_location_config_t *location,
+                                                             const apex_http_config_t *http) {
+    if (location != NULL && location->sub_filter.is_set) {
+        return &location->sub_filter;
+    }
+    if (server != NULL && server->sub_filter.is_set) {
+        return &server->sub_filter;
+    }
+    if (http != NULL && http->sub_filter.is_set) {
+        return &http->sub_filter;
+    }
+    return NULL;
+}
+
+static bool router_apply_sub_filter(const apex_sub_filter_config_t *sub,
+                                    const char *response_headers, size_t response_headers_len,
+                                    int status,
+                                    const void *in_body, size_t in_len,
+                                    void **out_body, size_t *out_len) {
+    if (sub == NULL || !sub->is_set || sub->rule_count == 0 || in_body == NULL || in_len == 0) {
+        return false;
+    }
+    if (status == 204 || status == 304 || (status >= 100 && status < 200)) {
+        return false;
+    }
+
+    const char *ct_val = NULL;
+    size_t ct_len = 0;
+    char ct_buf[128] = "text/html";
+    if (response_headers != NULL && response_headers_len > 0) {
+        if (router_find_header(response_headers, response_headers_len, "Content-Type", &ct_val, &ct_len)) {
+            if (ct_len < sizeof(ct_buf)) {
+                memcpy(ct_buf, ct_val, ct_len);
+                ct_buf[ct_len] = '\0';
+            }
+        }
+    }
+
+    bool type_matches = false;
+    if (sub->type_count == 0) {
+        if (strncasecmp(ct_buf, "text/html", 9) == 0) {
+            type_matches = true;
+        }
+    } else {
+        for (size_t t = 0; t < sub->type_count; t++) {
+            const char *expected = sub->types[t];
+            if (strcmp(expected, "*") == 0) {
+                type_matches = true;
+                break;
+            }
+            if (strncasecmp(ct_buf, expected, strlen(expected)) == 0) {
+                type_matches = true;
+                break;
+            }
+        }
+    }
+
+    if (!type_matches) {
+        return false;
+    }
+
+    const char *cur_data = (const char *)in_body;
+    size_t cur_len = in_len;
+    char *allocated_intermediate = NULL;
+
+    for (size_t r = 0; r < sub->rule_count; r++) {
+        const char *match = sub->rules[r].match;
+        const char *repl = sub->rules[r].replacement;
+        size_t match_len = strlen(match);
+        size_t repl_len = strlen(repl);
+
+        if (match_len == 0) continue;
+
+        size_t match_count = 0;
+        const char *scan = cur_data;
+        const char *scan_end = cur_data + cur_len;
+        while (scan <= scan_end - match_len) {
+            if (memcmp(scan, match, match_len) == 0) {
+                match_count++;
+                if (sub->once) break;
+                scan += match_len;
+            } else {
+                scan++;
+            }
+        }
+
+        if (match_count == 0) continue;
+
+        size_t new_len = cur_len + match_count * repl_len - match_count * match_len;
+        char *new_buf = malloc(new_len ? new_len : 1u);
+        if (new_buf == NULL) {
+            free(allocated_intermediate);
+            return false;
+        }
+
+        const char *src = cur_data;
+        char *dst = new_buf;
+        size_t replaced = 0;
+
+        while (src <= scan_end - match_len) {
+            if (memcmp(src, match, match_len) == 0 && (!sub->once || replaced == 0)) {
+                if (repl_len > 0) {
+                    memcpy(dst, repl, repl_len);
+                    dst += repl_len;
+                }
+                src += match_len;
+                replaced++;
+            } else {
+                *dst++ = *src++;
+            }
+        }
+        while (src < scan_end) {
+            *dst++ = *src++;
+        }
+
+        free(allocated_intermediate);
+        allocated_intermediate = new_buf;
+        cur_data = new_buf;
+        cur_len = new_len;
+    }
+
+    if (allocated_intermediate == NULL) {
+        return false;
+    }
+
+    *out_body = allocated_intermediate;
+    *out_len = cur_len;
+    return true;
+}
+
 static void router_write_proxy_response(conn_t *connection, const apex_runtime_t *runtime,
                                         const apex_server_config_t *server,
                                         const apex_location_config_t *location,
@@ -1233,6 +1718,21 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
 
     bool no_body = status == 204 || status == 304 || (status >= 100 && status < 200);
 
+    const apex_sub_filter_config_t *sub = router_get_sub_filter(server, location, runtime ? runtime->config ? &runtime->config->http : NULL : NULL);
+    void *filtered_body = NULL;
+    size_t filtered_body_len = 0;
+    bool is_filtered = false;
+    if (sub != NULL && !head_request && !no_body) {
+        if (router_apply_sub_filter(sub, headers, headers_length, status,
+                                    response->body, response->body_len,
+                                    &filtered_body, &filtered_body_len)) {
+            is_filtered = true;
+        }
+    }
+
+    const void *active_body = is_filtered ? filtered_body : response->body;
+    size_t active_body_len = is_filtered ? filtered_body_len : response->body_len;
+
     const apex_compress_config_t *compress = apex_config_get_compress(server, location, runtime ? runtime->config : NULL);
     void *compressed_body = NULL;
     size_t compressed_body_len = 0;
@@ -1242,20 +1742,28 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
     if (compress != NULL && !head_request && !no_body) {
         if (router_compress_response(compress, request, request_length,
                                      headers, headers_length,
-                                     status, response->body, response->body_len,
+                                     status, active_body, active_body_len,
                                      &compressed_body, &compressed_body_len, &comp_algo)) {
             is_compressed = true;
         }
     }
 
-    const void *body_to_send = is_compressed ? compressed_body : response->body;
-    size_t body_len_to_send = is_compressed ? compressed_body_len : response->body_len;
+    const void *body_to_send = is_compressed ? compressed_body : active_body;
+    size_t body_len_to_send = is_compressed ? compressed_body_len : active_body_len;
 
     apex_conn_write(connection, headers, (size_t)(status_end - headers));
     apex_conn_write(connection, "\r\n", 2u);
 
     bool no_content_length = true;
     bool seen_vary = false;
+
+    const apex_cookie_domain_rule_t *cookie_domains = NULL;
+    size_t cookie_domain_count = 0;
+    const apex_cookie_path_rule_t *cookie_paths = NULL;
+    size_t cookie_path_count = 0;
+    router_get_cookie_rules(server, location, runtime ? runtime->config ? &runtime->config->http : NULL : NULL,
+                            &cookie_domains, &cookie_domain_count,
+                            &cookie_paths, &cookie_path_count);
 
     size_t position = (size_t)(status_end - headers) + 2u;
     while (position < headers_length) {
@@ -1271,12 +1779,25 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
 
         const char *colon = memchr(line, ':', line_length);
         bool skip = false;
+        char rewritten_cookie[APEX_CONFIG_HOST_MAX * 4];
+        size_t rewritten_cookie_len = 0;
+        bool cookie_rewritten = false;
+
         if (colon != NULL) {
             size_t name_length = (size_t)(colon - line);
             while (name_length > 0 && (line[name_length - 1u] == ' ' || line[name_length - 1u] == '\t')) {
                 name_length--;
             }
-            if (router_header_name_equal(line, name_length, "Server")) {
+            if (router_header_name_equal(line, name_length, "Set-Cookie") &&
+                (cookie_domain_count > 0 || cookie_path_count > 0)) {
+                if (router_rewrite_cookie_line(line, line_length,
+                                               cookie_domains, cookie_domain_count,
+                                               cookie_paths, cookie_path_count,
+                                               rewritten_cookie, sizeof(rewritten_cookie),
+                                               &rewritten_cookie_len)) {
+                    cookie_rewritten = true;
+                }
+            } else if (router_header_name_equal(line, name_length, "Server")) {
                 skip = true;
             } else if (status != 101 && (router_header_name_equal(line, name_length, "Transfer-Encoding") ||
                                   router_header_name_equal(line, name_length, "Connection") ||
@@ -1289,7 +1810,7 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
                 skip = true;
             } else if (router_header_name_equal(line, name_length, "Content-Length")) {
                 no_content_length = false;
-                if (!head_request || no_body || is_compressed) {
+                if (!head_request || no_body || is_compressed || is_filtered) {
                     skip = true;
                 }
             } else if (is_compressed && router_header_name_equal(line, name_length, "Content-Encoding")) {
@@ -1300,7 +1821,11 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
         }
 
         if (!skip) {
-            apex_conn_write(connection, line, line_length);
+            if (cookie_rewritten) {
+                apex_conn_write(connection, rewritten_cookie, rewritten_cookie_len);
+            } else {
+                apex_conn_write(connection, line, line_length);
+            }
             apex_conn_write(connection, "\r\n", 2u);
         }
         position += line_length + 2u;
@@ -1353,7 +1878,10 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
     if (compressed_body != NULL) {
         free(compressed_body);
     }
-    if (res != NULL && is_compressed) {
+    if (filtered_body != NULL) {
+        free(filtered_body);
+    }
+    if (res != NULL && (is_compressed || is_filtered)) {
         res->last_body_bytes = body_len_to_send;
     }
 }
@@ -1618,7 +2146,10 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                     snprintf(dynamic_group.ssl_server_name, sizeof(dynamic_group.ssl_server_name), "%s", dyn_host);
                 }
 
-                if (apex_upstream_add_server(&dynamic_group, dyn_host, dyn_port, 1) != 0) {
+                const apex_resolver_config_t *res_cfg = (route->location != NULL && route->location->resolver.is_set)
+                    ? &route->location->resolver
+                    : (server != NULL && server->resolver.is_set ? &server->resolver : (runtime && runtime->config ? &runtime->config->http.resolver : NULL));
+                if (apex_upstream_add_server_resolver(&dynamic_group, dyn_host, dyn_port, 1, false, false, res_cfg) != 0) {
                     free(target_text);
                     router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "failed to resolve dynamic upstream host\n");
                     return;
@@ -2438,6 +2969,374 @@ static void router_trigger_logging(apex_pipeline_ctx_t *ctx, int fallback_status
     }
 }
 
+static bool json_find_string(const char *json, size_t json_len, const char *key, char *out, size_t out_cap) {
+    if (json == NULL || key == NULL || out == NULL || out_cap == 0) return false;
+    char search_pattern[128];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
+    const char *found = memmem(json, json_len, search_pattern, strlen(search_pattern));
+    if (found == NULL) return false;
+    const char *colon = memchr(found + strlen(search_pattern), ':', json_len - (size_t)(found + strlen(search_pattern) - json));
+    if (colon == NULL) return false;
+    const char *p = colon + 1;
+    while (p < json + json_len && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= json + json_len || *p != '"') return false;
+    p++;
+    const char *val_start = p;
+    while (p < json + json_len && *p != '"') p++;
+    if (p >= json + json_len) return false;
+    size_t val_len = (size_t)(p - val_start);
+    if (val_len >= out_cap) val_len = out_cap - 1;
+    memcpy(out, val_start, val_len);
+    out[val_len] = '\0';
+    return true;
+}
+
+static bool json_find_int(const char *json, size_t json_len, const char *key, int *out) {
+    if (json == NULL || key == NULL || out == NULL) return false;
+    char search_pattern[128];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
+    const char *found = memmem(json, json_len, search_pattern, strlen(search_pattern));
+    if (found == NULL) return false;
+    const char *colon = memchr(found + strlen(search_pattern), ':', json_len - (size_t)(found + strlen(search_pattern) - json));
+    if (colon == NULL) return false;
+    const char *p = colon + 1;
+    while (p < json + json_len && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p >= json + json_len) return false;
+    *out = atoi(p);
+    return true;
+}
+
+static bool json_find_bool(const char *json, size_t json_len, const char *key, bool *out) {
+    if (json == NULL || key == NULL || out == NULL) return false;
+    char search_pattern[128];
+    snprintf(search_pattern, sizeof(search_pattern), "\"%s\"", key);
+    const char *found = memmem(json, json_len, search_pattern, strlen(search_pattern));
+    if (found == NULL) return false;
+    const char *colon = memchr(found + strlen(search_pattern), ':', json_len - (size_t)(found + strlen(search_pattern) - json));
+    if (colon == NULL) return false;
+    const char *p = colon + 1;
+    while (p < json + json_len && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+    if (p + 4 <= json + json_len && strncmp(p, "true", 4) == 0) {
+        *out = true;
+        return true;
+    }
+    if (p + 5 <= json + json_len && strncmp(p, "false", 5) == 0) {
+        *out = false;
+        return true;
+    }
+    return false;
+}
+
+static void router_handle_api_request(conn_t *connection, const apex_runtime_t *runtime,
+                                      const apex_server_config_t *server,
+                                      const apex_location_config_t *location,
+                                      const char *method, size_t method_len,
+                                      const char *path, size_t path_len,
+                                      const char *body, size_t body_len,
+                                      apex_res_t *res,
+                                      const char *extra_headers, size_t extra_headers_len,
+                                      const char *client_ip) {
+    (void)client_ip;
+    (void)extra_headers;
+    (void)extra_headers_len;
+
+    if (connection == NULL || runtime == NULL || runtime->config == NULL) {
+        return;
+    }
+
+    char meth[16];
+    if (method_len >= sizeof(meth)) method_len = sizeof(meth) - 1;
+    memcpy(meth, method, method_len);
+    meth[method_len] = '\0';
+
+    char req_path[APEX_CONFIG_PATH_MAX];
+    if (path_len >= sizeof(req_path)) path_len = sizeof(req_path) - 1;
+    memcpy(req_path, path, path_len);
+    req_path[path_len] = '\0';
+    char *q = strchr(req_path, '?');
+    if (q != NULL) *q = '\0';
+
+    char body_buf[16384];
+    int status_code = 200;
+    const char *reason = "OK";
+    size_t resp_len = 0;
+
+    const char *rel = NULL;
+    if (location != NULL && location->path[0] != '\0' &&
+        strncmp(req_path, location->path, strlen(location->path)) == 0) {
+        rel = req_path + strlen(location->path);
+        while (*rel == '/') rel++;
+    }
+
+    const char *sub = NULL;
+    bool is_root_discovery = false;
+
+    if (rel != NULL && *rel == '\0') {
+        is_root_discovery = true;
+    } else if (strcmp(req_path, "/api") == 0 || strcmp(req_path, "/api/") == 0) {
+        is_root_discovery = true;
+    } else if (rel != NULL && strncmp(rel, "http/upstreams", 14) == 0) {
+        sub = rel + 14;
+    } else if (strncmp(req_path, "/api/http/upstreams", 19) == 0) {
+        sub = req_path + 19;
+    }
+
+    if (is_root_discovery) {
+        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                                    "{\"version\":\"1.0\",\"http\":{\"upstreams\":\"/api/http/upstreams\"}}\n");
+    } else if (sub != NULL) {
+        if (*sub == '/') sub++;
+
+        if (*sub == '\0') {
+            if (strcmp(meth, "GET") != 0 && strcmp(meth, "HEAD") != 0) {
+                status_code = 405;
+                reason = "Method Not Allowed";
+                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+            } else {
+                size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "{");
+                for (size_t u = 0; u < runtime->config->upstream_count && offset + 64 < sizeof(body_buf); u++) {
+                    const char *uname = runtime->config->upstreams[u].name;
+                    const upstream_group_t *grp = &runtime->groups[u];
+                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                                              "%s\"%s\":{\"servers\":[", u > 0 ? "," : "", uname);
+                    for (size_t s = 0; s < grp->server_count && offset + 128 < sizeof(body_buf); s++) {
+                        const upstream_server_t *srv = &grp->servers[s];
+                        int64_t act = atomic_load_explicit(&srv->active_conns, memory_order_relaxed);
+                        uint64_t reqs = atomic_load_explicit(&srv->total_requests, memory_order_relaxed);
+                        uint64_t fails = atomic_load_explicit(&srv->failed_requests, memory_order_relaxed);
+                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                            "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s,\"active\":%lld,\"requests\":%llu,\"fails\":%llu}",
+                            s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
+                            (unsigned int)srv->weight, srv->is_down ? "true" : "false",
+                            srv->is_backup ? "true" : "false", (long long)act,
+                            (unsigned long long)reqs, (unsigned long long)fails);
+                    }
+                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]}");
+                }
+                offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "}\n");
+                resp_len = offset;
+            }
+        } else {
+            char group_name[128];
+            size_t g_idx = 0;
+            const char *p = sub;
+            while (*p != '\0' && *p != '/' && g_idx + 1 < sizeof(group_name)) {
+                group_name[g_idx++] = *p++;
+            }
+            group_name[g_idx] = '\0';
+
+            upstream_group_t *matched_group = NULL;
+            for (size_t u = 0; u < runtime->config->upstream_count; u++) {
+                if (strcmp(runtime->config->upstreams[u].name, group_name) == 0) {
+                    matched_group = (upstream_group_t *)&runtime->groups[u];
+                    break;
+                }
+            }
+
+            if (matched_group == NULL) {
+                status_code = 404;
+                reason = "Not Found";
+                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"upstream group not found\"}\n");
+            } else if (*p == '\0' || strcmp(p, "/") == 0) {
+                if (strcmp(meth, "GET") != 0 && strcmp(meth, "HEAD") != 0) {
+                    status_code = 405;
+                    reason = "Method Not Allowed";
+                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                } else {
+                    size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"servers\":[");
+                    for (size_t s = 0; s < matched_group->server_count && offset + 128 < sizeof(body_buf); s++) {
+                        const upstream_server_t *srv = &matched_group->servers[s];
+                        int64_t act = atomic_load_explicit(&srv->active_conns, memory_order_relaxed);
+                        uint64_t reqs = atomic_load_explicit(&srv->total_requests, memory_order_relaxed);
+                        uint64_t fails = atomic_load_explicit(&srv->failed_requests, memory_order_relaxed);
+                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                            "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s,\"active\":%lld,\"requests\":%llu,\"fails\":%llu}",
+                            s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
+                            (unsigned int)srv->weight, srv->is_down ? "true" : "false",
+                            srv->is_backup ? "true" : "false", (long long)act,
+                            (unsigned long long)reqs, (unsigned long long)fails);
+                    }
+                    offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]}\n");
+                    resp_len = offset;
+                }
+            } else if (strncmp(p, "/servers", 8) == 0) {
+                const char *sp = p + 8;
+                if (*sp == '/') sp++;
+                if (*sp == '\0') {
+                    if (strcmp(meth, "POST") == 0) {
+                        if (!location->api.write_enabled) {
+                            status_code = 403;
+                            reason = "Forbidden";
+                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                        } else {
+                            char srv_str[128];
+                            srv_str[0] = '\0';
+                            int weight_val = 1;
+                            bool down_val = false;
+                            bool backup_val = false;
+
+                            json_find_string(body, body_len, "server", srv_str, sizeof(srv_str));
+                            json_find_int(body, body_len, "weight", &weight_val);
+                            json_find_bool(body, body_len, "down", &down_val);
+                            json_find_bool(body, body_len, "backup", &backup_val);
+
+                            if (srv_str[0] == '\0') {
+                                status_code = 400;
+                                reason = "Bad Request";
+                                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"missing server field\"}\n");
+                            } else {
+                                char shost[128];
+                                uint16_t sport = 80;
+                                const char *scolon = strchr(srv_str, ':');
+                                if (scolon != NULL) {
+                                    size_t hlen = (size_t)(scolon - srv_str);
+                                    if (hlen >= sizeof(shost)) hlen = sizeof(shost) - 1;
+                                    memcpy(shost, srv_str, hlen);
+                                    shost[hlen] = '\0';
+                                    sport = (uint16_t)atoi(scolon + 1);
+                                    if (sport == 0) sport = 80;
+                                } else {
+                                    snprintf(shost, sizeof(shost), "%s", srv_str);
+                                }
+
+                                int added = apex_upstream_add_server_ex(matched_group, shost, sport,
+                                                                        weight_val > 0 ? (uint32_t)weight_val : 1u,
+                                                                        backup_val, down_val);
+                                if (added < 0) {
+                                    status_code = 400;
+                                    reason = "Bad Request";
+                                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"failed to add server to upstream group\"}\n");
+                                } else {
+                                    status_code = 201;
+                                    reason = "Created";
+                                    resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                                        "{\"server\":\"%s\",\"weight\":%d,\"down\":%s,\"backup\":%s}\n",
+                                        srv_str, weight_val > 0 ? weight_val : 1,
+                                        down_val ? "true" : "false", backup_val ? "true" : "false");
+                                }
+                            }
+                        }
+                    } else if (strcmp(meth, "GET") == 0 || strcmp(meth, "HEAD") == 0) {
+                        size_t offset = (size_t)snprintf(body_buf, sizeof(body_buf), "[");
+                        for (size_t s = 0; s < matched_group->server_count && offset + 128 < sizeof(body_buf); s++) {
+                            const upstream_server_t *srv = &matched_group->servers[s];
+                            offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset,
+                                "%s{\"server\":\"%s:%u\",\"weight\":%u,\"down\":%s,\"backup\":%s}",
+                                s > 0 ? "," : "", srv->ip, (unsigned int)srv->port,
+                                (unsigned int)srv->weight, srv->is_down ? "true" : "false",
+                                srv->is_backup ? "true" : "false");
+                        }
+                        offset += (size_t)snprintf(body_buf + offset, sizeof(body_buf) - offset, "]\n");
+                        resp_len = offset;
+                    } else {
+                        status_code = 405;
+                        reason = "Method Not Allowed";
+                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                    }
+                } else {
+                    const char *target_addr = sp;
+                    upstream_server_t *target_srv = NULL;
+                    size_t target_idx = 0;
+
+                    for (size_t s = 0; s < matched_group->server_count; s++) {
+                        char curr_addr[128];
+                        snprintf(curr_addr, sizeof(curr_addr), "%s:%u",
+                                 matched_group->servers[s].ip, matched_group->servers[s].port);
+                        if (strcmp(curr_addr, target_addr) == 0) {
+                            target_srv = &matched_group->servers[s];
+                            target_idx = s;
+                            break;
+                        }
+                    }
+
+                    if (target_srv == NULL) {
+                        status_code = 404;
+                        reason = "Not Found";
+                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"server not found in upstream group\"}\n");
+                    } else if (strcmp(meth, "PATCH") == 0) {
+                        if (!location->api.write_enabled) {
+                            status_code = 403;
+                            reason = "Forbidden";
+                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                        } else {
+                            bool down_val = false;
+                            if (json_find_bool(body, body_len, "down", &down_val)) {
+                                target_srv->is_down = down_val;
+                            }
+                            int weight_val = 0;
+                            if (json_find_int(body, body_len, "weight", &weight_val) && weight_val > 0) {
+                                target_srv->weight = (uint32_t)weight_val;
+                            }
+                            status_code = 200;
+                            reason = "OK";
+                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                                "{\"server\":\"%s\",\"weight\":%u,\"down\":%s,\"backup\":%s}\n",
+                                target_addr, (unsigned int)target_srv->weight,
+                                target_srv->is_down ? "true" : "false",
+                                target_srv->is_backup ? "true" : "false");
+                        }
+                    } else if (strcmp(meth, "DELETE") == 0) {
+                        if (!location->api.write_enabled) {
+                            status_code = 403;
+                            reason = "Forbidden";
+                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"API write disabled\"}\n");
+                        } else {
+                            if (target_idx + 1 < matched_group->server_count) {
+                                memmove(&matched_group->servers[target_idx],
+                                        &matched_group->servers[target_idx + 1],
+                                        (matched_group->server_count - target_idx - 1) * sizeof(upstream_server_t));
+                            }
+                            matched_group->server_count--;
+                            status_code = 200;
+                            reason = "OK";
+                            resp_len = (size_t)snprintf(body_buf, sizeof(body_buf),
+                                "{\"status\":\"removed\",\"server\":\"%s\"}\n", target_addr);
+                        }
+                    } else {
+                        status_code = 405;
+                        reason = "Method Not Allowed";
+                        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"Method Not Allowed\"}\n");
+                    }
+                }
+            } else {
+                status_code = 404;
+                reason = "Not Found";
+                resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"endpoint not found\"}\n");
+            }
+        }
+    } else {
+        status_code = 404;
+        reason = "Not Found";
+        resp_len = (size_t)snprintf(body_buf, sizeof(body_buf), "{\"error\":\"unknown api path\"}\n");
+    }
+
+    const apex_server_tokens_config_t *tokens = router_get_server_tokens(runtime, server);
+    char server_hdr[128];
+    router_format_server_header(tokens, server_hdr, sizeof(server_hdr));
+
+    char header[512];
+    int written = snprintf(header, sizeof(header),
+                           "HTTP/1.1 %d %s\r\n"
+                           "%s"
+                           "Content-Type: application/json\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Connection: %s\r\n\r\n",
+                           status_code, reason, server_hdr, resp_len,
+                           connection->close_after_write ? "close" : "keep-alive");
+    if (written > 0 && (size_t)written < sizeof(header)) {
+        apex_conn_write(connection, header, (size_t)written);
+        if (strcmp(meth, "HEAD") != 0 && resp_len > 0) {
+            apex_conn_write(connection, body_buf, resp_len);
+        }
+    }
+
+    apex_record_status(status_code);
+    if (res != NULL) {
+        res->last_status = status_code;
+        res->last_body_bytes = resp_len;
+    }
+}
+
 void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, const char *body, size_t body_len,
                    apex_res_t *res) {
     const apex_runtime_t *runtime = app->generation != NULL ? app->generation->runtime : NULL;
@@ -2630,6 +3529,11 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         if (apex_runtime_match(runtime, host, host_length, path, match_path_length, &route)) {
             ctx.server = route.server;
             ctx.location = route.location;
+
+            const apex_otel_config_t *otel_cfg = (route.location != NULL && route.location->otel.is_set)
+                ? &route.location->otel
+                : (route.server != NULL && route.server->otel.is_set ? &route.server->otel : (runtime && runtime->config ? &runtime->config->http.otel : NULL));
+            router_otel_init(req_buf, header_len, otel_cfg);
 
             /* Resolve real client IP */
             const apex_real_ip_rule_t *real_ip_rules = NULL;
@@ -2980,6 +3884,17 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                         apex_conn_limit_release(runtime, conn_zone, client_ip);
                     }
                     router_trigger_logging(&ctx, 200, (size_t)blen, client_ip);
+                    return;
+                }
+
+                if (route.location->api.enabled) {
+                    router_handle_api_request(res->conn, runtime, route.server, route.location,
+                                              req_buf, method_len, path, path_len, body, body_len,
+                                              res, ctx.extra_headers, ctx.extra_headers_len, client_ip);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
+                    router_trigger_logging(&ctx, res ? res->last_status : 200, res ? res->last_body_bytes : 0, client_ip);
                     return;
                 }
 

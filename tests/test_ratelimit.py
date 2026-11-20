@@ -30,12 +30,16 @@ def free_port():
         return s.getsockname()[1]
 
 
+g_slow_event = threading.Event()
+
+
 class BackendHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
         if "/slow" in self.path:
-            time.sleep(0.4)
+            g_slow_event.set()
+            time.sleep(0.5)
         body = b"backend-ok"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
@@ -209,9 +213,11 @@ http {{
             status, _, _ = client.request("GET", "/conn/slow")
             results.append(status)
 
+        g_slow_event.clear()
         t = threading.Thread(target=worker)
         t.start()
-        time.sleep(0.08)  # ensure slow request is active
+        g_slow_event.wait(timeout=2.0)
+        time.sleep(0.02)  # ensure request is holding connection
 
         # Concurrently send second request
         status2, _, _ = self.client.request("GET", "/conn")

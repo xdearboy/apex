@@ -153,6 +153,58 @@ typedef struct {
 } apex_map_t;
 
 typedef struct {
+    char domain[APEX_CONFIG_HOST_MAX];
+    char replacement[APEX_CONFIG_HOST_MAX];
+} apex_cookie_domain_rule_t;
+
+typedef struct {
+    char path[APEX_CONFIG_PATH_MAX];
+    char replacement[APEX_CONFIG_PATH_MAX];
+} apex_cookie_path_rule_t;
+
+typedef struct {
+    char match[256];
+    char replacement[256];
+} apex_sub_filter_rule_t;
+
+typedef struct {
+    apex_sub_filter_rule_t *rules;
+    size_t rule_count;
+    size_t rule_capacity;
+    bool once;
+    char **types;
+    size_t type_count;
+    size_t type_capacity;
+    bool is_set;
+} apex_sub_filter_config_t;
+
+typedef struct apex_resolver_config_s {
+    char servers[4][APEX_CONFIG_HOST_MAX];
+    size_t server_count;
+    uint32_t valid_ms;
+    uint32_t timeout_ms;
+    bool is_set;
+} apex_resolver_config_t;
+
+typedef enum {
+    APEX_OTEL_CTX_OFF = 0,
+    APEX_OTEL_CTX_ON,
+    APEX_OTEL_CTX_PROPAGATE,
+} apex_otel_ctx_mode_t;
+
+typedef struct {
+    bool enabled;
+    apex_otel_ctx_mode_t context_mode;
+    char span_name[128];
+    bool is_set;
+} apex_otel_config_t;
+
+typedef struct {
+    bool enabled;
+    bool write_enabled;
+} apex_api_config_t;
+
+typedef struct {
     int status_code;
     char *path;
     int line;
@@ -254,6 +306,22 @@ typedef struct {
     bool has_next_upstream;
     bool proxy_intercept_errors;
     bool has_proxy_intercept_errors;
+
+    apex_cookie_domain_rule_t *cookie_domains;
+    size_t cookie_domain_count;
+    size_t cookie_domain_capacity;
+    bool cookie_domain_off;
+
+    apex_cookie_path_rule_t *cookie_paths;
+    size_t cookie_path_count;
+    size_t cookie_path_capacity;
+    bool cookie_path_off;
+
+    apex_sub_filter_config_t sub_filter;
+
+    apex_resolver_config_t resolver;
+    apex_otel_config_t otel;
+    apex_api_config_t api;
 } apex_location_config_t;
 
 typedef struct {
@@ -354,6 +422,18 @@ typedef struct {
     bool has_next_upstream;
     bool proxy_intercept_errors;
     bool has_proxy_intercept_errors;
+    apex_cookie_domain_rule_t *cookie_domains;
+    size_t cookie_domain_count;
+    size_t cookie_domain_capacity;
+    bool cookie_domain_off;
+    apex_cookie_path_rule_t *cookie_paths;
+    size_t cookie_path_count;
+    size_t cookie_path_capacity;
+    bool cookie_path_off;
+    apex_sub_filter_config_t sub_filter;
+    apex_resolver_config_t resolver;
+    apex_otel_config_t otel;
+    apex_api_config_t api;
     int line;
 } apex_server_config_t;
 
@@ -391,6 +471,17 @@ typedef struct {
     bool has_next_upstream;
     bool proxy_intercept_errors;
     bool has_proxy_intercept_errors;
+    apex_cookie_domain_rule_t *cookie_domains;
+    size_t cookie_domain_count;
+    size_t cookie_domain_capacity;
+    bool cookie_domain_off;
+    apex_cookie_path_rule_t *cookie_paths;
+    size_t cookie_path_count;
+    size_t cookie_path_capacity;
+    bool cookie_path_off;
+    apex_sub_filter_config_t sub_filter;
+    apex_resolver_config_t resolver;
+    apex_otel_config_t otel;
 } apex_http_config_t;
 
 typedef struct {

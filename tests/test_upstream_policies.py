@@ -18,7 +18,11 @@ import threading
 import time
 import unittest
 
-APEX = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.abspath("./apex")
+APEX = os.path.abspath("./apex")
+for arg in sys.argv[1:]:
+    if not arg.startswith("-") and os.path.isfile(arg):
+        APEX = os.path.abspath(arg)
+        break
 START_TIMEOUT = 10.0
 STOP_TIMEOUT = 5.0
 
@@ -37,6 +41,9 @@ class IdentHandler(http.server.BaseHTTPRequestHandler):
         hook = getattr(self.server, "on_request", None)
         if hook:
             hook()
+        evt = getattr(self.server, "delay_event", None)
+        if evt:
+            evt.wait(timeout=10.0)
         delay = getattr(self.server, "delay", 0)
         if delay > 0:
             time.sleep(delay)
@@ -59,6 +66,7 @@ def start_backend(name, delay=0):
     server.backend_name = name
     server.delay = delay
     server.on_request = None
+    server.delay_event = None
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, port
@@ -97,7 +105,7 @@ class UpstreamPoliciesTest(unittest.TestCase):
         cls.b2_server, cls.b2_port = start_backend("backend-down")
         cls.fail_primary_server, cls.fail_primary_port = start_backend("failover-primary")
         cls.backup_server, cls.backup_port = start_backend("backend-backup")
-        cls.slow_server, cls.slow_port = start_backend("backend-slow", delay=2.5)
+        cls.slow_server, cls.slow_port = start_backend("backend-slow", delay=0)
         cls.fast_server, cls.fast_port = start_backend("backend-fast", delay=0)
 
         cls.port = free_port()
@@ -229,9 +237,11 @@ http {{
         self.assertEqual(body, "backend-backup")
 
     def test_03_least_conn_routing(self):
-        # In least_conn_pool, slow server takes 1.0s, fast takes 0ms
+        # In least_conn_pool, slow server is paused while fast server responds
         slow_in_flight = threading.Event()
+        release_slow = threading.Event()
         self.slow_server.on_request = slow_in_flight.set
+        self.slow_server.delay_event = release_slow
 
         def slow_worker():
             client = RawHttpClient(self.port)
@@ -252,8 +262,10 @@ http {{
             if body == "backend-fast":
                 fast_hits += 1
 
+        release_slow.set()
         t.join()
         self.slow_server.on_request = None
+        self.slow_server.delay_event = None
         self.assertEqual(fast_hits, 5)
 
     def test_04_ip_hash_consistency(self):
