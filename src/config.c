@@ -4,6 +4,7 @@
 
 #include "apex/config.h"
 #include "apex/module.h"
+#include "apex/cache.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -2074,11 +2075,90 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
                 return false;
             }
             location->limit_conn_status = (int)code;
+        } else if (token_is_word(directive, "stub_status")) {
+            location->stub_status = true;
+            if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *val = parser_scalar(parser, "stub_status arg");
+                if (val != NULL && token_is_word(val, "off")) {
+                    location->stub_status = false;
+                }
+            }
+        } else if (token_is_word(directive, "metrics")) {
+            location->metrics = true;
+            if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *val = parser_scalar(parser, "metrics arg");
+                if (val != NULL && token_is_word(val, "off")) {
+                    location->metrics = false;
+                }
+            }
+        } else if (token_is_word(directive, "proxy_cache")) {
+            const token_t *val = parser_scalar(parser, "cache zone name or off");
+            if (val == NULL) return false;
+            if (token_is_word(val, "off")) {
+                location->proxy_cache[0] = '\0';
+            } else {
+                snprintf(location->proxy_cache, sizeof(location->proxy_cache), "%s", val->text);
+            }
+        } else if (token_is_word(directive, "proxy_cache_key")) {
+            const token_t *val = parser_scalar(parser, "cache key");
+            if (val == NULL) return false;
+            snprintf(location->proxy_cache_key, sizeof(location->proxy_cache_key), "%s", val->text);
+        } else if (token_is_word(directive, "proxy_cache_bypass")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *arg = parser_scalar(parser, "bypass variable");
+                if (arg == NULL) return false;
+                if (location->proxy_cache_bypass[0] != '\0') {
+                    strncat(location->proxy_cache_bypass, " ",
+                            sizeof(location->proxy_cache_bypass) - strlen(location->proxy_cache_bypass) - 1);
+                }
+                strncat(location->proxy_cache_bypass, arg->text,
+                        sizeof(location->proxy_cache_bypass) - strlen(location->proxy_cache_bypass) - 1);
+            }
+        } else if (token_is_word(directive, "proxy_cache_valid")) {
+            token_t tokens[8];
+            size_t count = 0;
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *tok = parser_scalar(parser, "proxy_cache_valid parameter");
+                if (tok == NULL) return false;
+                if (count < 8) {
+                    tokens[count++] = *tok;
+                }
+            }
+            if (count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_valid requires arguments");
+                return false;
+            }
+            uint64_t valid_ms = 0;
+            if (!token_to_duration_ms(&tokens[count - 1], &valid_ms)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, &tokens[count - 1],
+                             "invalid cache validity duration '%s'", tokens[count - 1].text);
+                return false;
+            }
+            if (count == 1) {
+                int default_codes[] = {200, 301, 302};
+                for (size_t c = 0; c < 3 && location->cache_valid_rule_count < 8; c++) {
+                    location->cache_valid_rules[location->cache_valid_rule_count].status_code = default_codes[c];
+                    location->cache_valid_rules[location->cache_valid_rule_count].valid_ms = valid_ms;
+                    location->cache_valid_rule_count++;
+                }
+            } else {
+                for (size_t c = 0; c < count - 1 && location->cache_valid_rule_count < 8; c++) {
+                    int code = 0;
+                    if (token_is_word(&tokens[c], "any")) {
+                        code = 0;
+                    } else {
+                        code = atoi(tokens[c].text);
+                    }
+                    location->cache_valid_rules[location->cache_valid_rule_count].status_code = code;
+                    location->cache_valid_rules[location->cache_valid_rule_count].valid_ms = valid_ms;
+                    location->cache_valid_rule_count++;
+                }
+            }
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
                          directive->text);
             parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                "proxy_http_version, return, allow, deny, limit_req, limit_conn");
+                                "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid");
             return false;
         }
 
@@ -2090,8 +2170,25 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     if (!parser_expect_rbrace(parser)) {
         return false;
     }
-    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, root, or return");
+
+    /* Inherit server cache settings if not explicitly configured in location */
+    if (location->proxy_cache[0] == '\0' && server->proxy_cache[0] != '\0') {
+        snprintf(location->proxy_cache, sizeof(location->proxy_cache), "%s", server->proxy_cache);
+        if (location->proxy_cache_key[0] == '\0' && server->proxy_cache_key[0] != '\0') {
+            snprintf(location->proxy_cache_key, sizeof(location->proxy_cache_key), "%s", server->proxy_cache_key);
+        }
+        if (location->proxy_cache_bypass[0] == '\0' && server->proxy_cache_bypass[0] != '\0') {
+            snprintf(location->proxy_cache_bypass, sizeof(location->proxy_cache_bypass), "%s", server->proxy_cache_bypass);
+        }
+        if (location->cache_valid_rule_count == 0 && server->cache_valid_rule_count > 0) {
+            location->cache_valid_rule_count = server->cache_valid_rule_count;
+            memcpy(location->cache_valid_rules, server->cache_valid_rules, sizeof(server->cache_valid_rules));
+        }
+    }
+
+    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
+        !location->stub_status && !location->metrics) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, root, return, stub_status, or metrics");
         return false;
     }
     return true;
@@ -2327,9 +2424,72 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
             server->limit_conn_status = (int)code;
+        } else if (token_is_word(directive, "proxy_cache")) {
+            const token_t *val = parser_scalar(parser, "cache zone name or off");
+            if (val == NULL) return false;
+            if (token_is_word(val, "off")) {
+                server->proxy_cache[0] = '\0';
+            } else {
+                snprintf(server->proxy_cache, sizeof(server->proxy_cache), "%s", val->text);
+            }
+        } else if (token_is_word(directive, "proxy_cache_key")) {
+            const token_t *val = parser_scalar(parser, "cache key");
+            if (val == NULL) return false;
+            snprintf(server->proxy_cache_key, sizeof(server->proxy_cache_key), "%s", val->text);
+        } else if (token_is_word(directive, "proxy_cache_bypass")) {
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *arg = parser_scalar(parser, "bypass variable");
+                if (arg == NULL) return false;
+                if (server->proxy_cache_bypass[0] != '\0') {
+                    strncat(server->proxy_cache_bypass, " ",
+                            sizeof(server->proxy_cache_bypass) - strlen(server->proxy_cache_bypass) - 1);
+                }
+                strncat(server->proxy_cache_bypass, arg->text,
+                        sizeof(server->proxy_cache_bypass) - strlen(server->proxy_cache_bypass) - 1);
+            }
+        } else if (token_is_word(directive, "proxy_cache_valid")) {
+            token_t tokens[8];
+            size_t count = 0;
+            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+                const token_t *tok = parser_scalar(parser, "proxy_cache_valid parameter");
+                if (tok == NULL) return false;
+                if (count < 8) {
+                    tokens[count++] = *tok;
+                }
+            }
+            if (count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_valid requires arguments");
+                return false;
+            }
+            uint64_t valid_ms = 0;
+            if (!token_to_duration_ms(&tokens[count - 1], &valid_ms)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, &tokens[count - 1],
+                             "invalid cache validity duration '%s'", tokens[count - 1].text);
+                return false;
+            }
+            if (count == 1) {
+                int default_codes[] = {200, 301, 302};
+                for (size_t c = 0; c < 3 && server->cache_valid_rule_count < 8; c++) {
+                    server->cache_valid_rules[server->cache_valid_rule_count].status_code = default_codes[c];
+                    server->cache_valid_rules[server->cache_valid_rule_count].valid_ms = valid_ms;
+                    server->cache_valid_rule_count++;
+                }
+            } else {
+                for (size_t c = 0; c < count - 1 && server->cache_valid_rule_count < 8; c++) {
+                    int code = 0;
+                    if (token_is_word(&tokens[c], "any")) {
+                        code = 0;
+                    } else {
+                        code = atoi(tokens[c].text);
+                    }
+                    server->cache_valid_rules[server->cache_valid_rule_count].status_code = code;
+                    server->cache_valid_rules[server->cache_valid_rule_count].valid_ms = valid_ms;
+                    server->cache_valid_rule_count++;
+                }
+            }
         } else {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn");
+            parser_hint(parser, "server accepts listen, server_name, tls, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid");
             return false;
         }
 
@@ -2909,10 +3069,66 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
             return false;
         }
         parser->config->http.conn_zone_count++;
+    } else if (token_is_word(directive, "proxy_cache_path")) {
+        if (parser->config->http.cache_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many cache zones (max %u)",
+                         APEX_CONFIG_MAX_RATE_ZONES);
+            return false;
+        }
+        apex_cache_zone_config_t *zone = &parser->config->http.cache_zones[parser->config->http.cache_zone_count];
+        memset(zone, 0, sizeof(*zone));
+
+        const token_t *path_arg = parser_scalar(parser, "cache path");
+        if (path_arg == NULL) return false;
+        snprintf(zone->path, sizeof(zone->path), "%s", path_arg->text);
+        zone->inactive_ms = 600000; /* default 10m */
+        zone->max_size = 1024ULL * 1024ULL * 1024ULL; /* default 1GB */
+        zone->keys_zone_size = 10 * 1024 * 1024; /* default 10MB */
+
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *arg = parser_scalar(parser, "proxy_cache_path parameter");
+            if (arg == NULL) return false;
+            if (strncmp(arg->text, "keys_zone=", 10) == 0) {
+                const char *spec = arg->text + 10;
+                const char *colon = strchr(spec, ':');
+                if (colon != NULL) {
+                    size_t name_len = (size_t)(colon - spec);
+                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                    memcpy(zone->name, spec, name_len);
+                    zone->name[name_len] = '\0';
+                    if (!parse_size_str(colon + 1, &zone->keys_zone_size)) {
+                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid keys_zone size '%s'", colon + 1);
+                        return false;
+                    }
+                } else {
+                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
+                }
+            } else if (strncmp(arg->text, "max_size=", 9) == 0) {
+                if (!parse_size_str(arg->text + 9, &zone->max_size)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid max_size '%s'", arg->text + 9);
+                    return false;
+                }
+            } else if (strncmp(arg->text, "inactive=", 9) == 0) {
+                token_t temp_tok = *arg;
+                temp_tok.text = arg->text + 9;
+                temp_tok.length = strlen(temp_tok.text);
+                if (!token_to_duration_ms(&temp_tok, &zone->inactive_ms)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid inactive duration '%s'", arg->text + 9);
+                    return false;
+                }
+            } else if (strncmp(arg->text, "levels=", 7) == 0) {
+                /* standard nginx levels=1:2 (supported) */
+            }
+        }
+        if (zone->name[0] == '\0') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_path requires keys_zone=<name>:<size>");
+            return false;
+        }
+        parser->config->http.cache_zone_count++;
     } else {
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, upstream, server");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, upstream, server");
         return false;
     }
     return true;
@@ -3530,6 +3746,10 @@ apex_runtime_t *apex_runtime_create(const apex_config_t *config, apex_config_err
         }
     }
 
+    if (config->http.cache_zone_count > 0) {
+        runtime->cache_manager = apex_cache_manager_create(config);
+    }
+
     apex_health_prober_start(runtime->groups, runtime->group_count);
     return runtime;
 }
@@ -3540,6 +3760,10 @@ void apex_runtime_destroy(apex_runtime_t *runtime) {
     }
     apex_health_prober_stop();
     apex_module_registry_destroy(runtime);
+    if (runtime->cache_manager != NULL) {
+        apex_cache_manager_destroy((apex_cache_manager_t *)runtime->cache_manager);
+        runtime->cache_manager = NULL;
+    }
     if (runtime->rate_limiter != NULL) {
         rate_limiter_t *limiter = (rate_limiter_t *)runtime->rate_limiter;
         for (size_t i = 0; i < APEX_RATELIMIT_SHARDS; i++) {

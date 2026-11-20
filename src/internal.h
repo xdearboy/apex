@@ -43,6 +43,7 @@ typedef enum { APEX_TLS_HANDSHAKE, APEX_TLS_READY } tls_phase_t;
 typedef struct conn {
     int fd;
     uint8_t active;
+    uint8_t conn_state; /* 0: READING, 1: WRITING, 2: WAITING */
     uint32_t read_length;
     uint32_t write_length;
     uint32_t write_offset;
@@ -64,6 +65,37 @@ typedef struct conn {
     size_t sendfile_remain;
     uint8_t corked;
 } conn_t;
+
+typedef struct {
+    _Atomic uint64_t accepts;
+    _Atomic uint64_t handled;
+    _Atomic uint64_t requests;
+    _Atomic int64_t active_connections;
+    _Atomic int64_t reading_connections;
+    _Atomic int64_t writing_connections;
+    _Atomic int64_t waiting_connections;
+    _Atomic uint64_t responses_2xx;
+    _Atomic uint64_t responses_3xx;
+    _Atomic uint64_t responses_4xx;
+    _Atomic uint64_t responses_5xx;
+    _Atomic uint64_t cache_hits;
+    _Atomic uint64_t cache_misses;
+    _Atomic uint64_t cache_bypasses;
+} apex_server_stats_t;
+
+extern apex_server_stats_t g_apex_stats;
+
+static inline void apex_record_status(int status) {
+    if (status >= 200 && status < 300) {
+        atomic_fetch_add_explicit(&g_apex_stats.responses_2xx, 1, memory_order_relaxed);
+    } else if (status >= 300 && status < 400) {
+        atomic_fetch_add_explicit(&g_apex_stats.responses_3xx, 1, memory_order_relaxed);
+    } else if (status >= 400 && status < 500) {
+        atomic_fetch_add_explicit(&g_apex_stats.responses_4xx, 1, memory_order_relaxed);
+    } else if (status >= 500 && status < 600) {
+        atomic_fetch_add_explicit(&g_apex_stats.responses_5xx, 1, memory_order_relaxed);
+    }
+}
 
 void apex_conn_write(conn_t *connection, const void *data, size_t length);
 void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t length);

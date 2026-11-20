@@ -1,4 +1,5 @@
 #include "internal.h"
+#include "apex/cache.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -295,6 +296,7 @@ static void router_send_redirect(conn_t *connection, int status_code, const char
     if (connection == NULL || connection->fd < 0) {
         return;
     }
+    apex_record_status(status_code);
     const char *reason = "Moved Permanently";
     switch (status_code) {
     case 301: reason = "Moved Permanently"; break;
@@ -662,6 +664,7 @@ void router_send_error_ex(conn_t *connection, const apex_server_config_t *server
     if (connection == NULL || connection->fd < 0) {
         return;
     }
+    apex_record_status(status);
 
     const char *extra = (extra_headers != NULL && extra_headers_len > 0) ? extra_headers : "";
     int extra_len = (extra_headers != NULL && extra_headers_len > 0) ? (int)extra_headers_len : 0;
@@ -816,6 +819,7 @@ static void router_write_proxy_response(conn_t *connection, const apex_server_co
     const char *headers = response->headers;
     size_t headers_length = response->headers_len;
     int status = response->status;
+    apex_record_status(status);
 
     const char *status_end = router_find_crlf(headers, headers_length);
     if (status_end == NULL) {
@@ -1038,12 +1042,11 @@ tunnel_done:
     close(upstream_fd);
     client_conn->close_after_write = 1;
     client_conn->read_length = 0;
-}
-
-static void router_forward_request(apex_config_route_t *route, const char *request, size_t request_length,
-                                   const char *method, size_t method_length, const char *target,
-                                   size_t target_length, const char *body, size_t body_length, apex_res_t *res,
-                                   const char *extra_headers, size_t extra_headers_len) {
+}static void router_forward_request(const apex_runtime_t *runtime, apex_config_route_t *route,
+                                    const char *request, size_t request_length,
+                                    const char *method, size_t method_length, const char *target,
+                                    size_t target_length, const char *body, size_t body_length, apex_res_t *res,
+                                    const char *extra_headers, size_t extra_headers_len) {
     conn_t *connection = res->conn;
     const apex_server_config_t *server = route ? route->server : NULL;
     if (route->group == NULL) {
@@ -1084,6 +1087,89 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
         }
         memcpy(host, host_value, host_length);
         host[host_length] = '\0';
+    }
+
+    const char *cache_zone = (route->location != NULL && route->location->proxy_cache[0] != '\0')
+        ? route->location->proxy_cache
+        : (server != NULL ? server->proxy_cache : "");
+
+    bool caching_enabled = (cache_zone[0] != '\0' && runtime != NULL && runtime->cache_manager != NULL);
+    bool is_get = (method_length == 3 && memcmp(method, "GET", 3) == 0);
+    bool is_head = (method_length == 4 && memcmp(method, "HEAD", 4) == 0);
+    bool method_cacheable = (is_get || is_head);
+
+    bool bypass = false;
+    if (caching_enabled) {
+        const char *bypass_cfg = (route->location != NULL && route->location->proxy_cache_bypass[0] != '\0')
+            ? route->location->proxy_cache_bypass
+            : (server != NULL ? server->proxy_cache_bypass : "");
+        if (bypass_cfg[0] != '\0') {
+            if (strstr(bypass_cfg, "$http_pragma") != NULL) {
+                const char *prag = NULL; size_t prag_len = 0;
+                if (router_find_header(request, request_length, "Pragma", &prag, &prag_len) &&
+                    memmem(prag, prag_len, "no-cache", 8) != NULL) {
+                    bypass = true;
+                }
+            }
+            if (!bypass && strstr(bypass_cfg, "$http_authorization") != NULL) {
+                const char *auth = NULL; size_t auth_len = 0;
+                if (router_find_header(request, request_length, "Authorization", &auth, &auth_len)) {
+                    bypass = true;
+                }
+            }
+            if (!bypass && strstr(bypass_cfg, "$http_cache_control") != NULL) {
+                const char *cc = NULL; size_t cc_len = 0;
+                if (router_find_header(request, request_length, "Cache-Control", &cc, &cc_len) &&
+                    memmem(cc, cc_len, "no-cache", 8) != NULL) {
+                    bypass = true;
+                }
+            }
+            if (!bypass && strstr(bypass_cfg, "$arg_nocache") != NULL) {
+                if (memmem(target, target_length, "nocache=1", 9) != NULL ||
+                    memmem(target, target_length, "nocache=true", 12) != NULL) {
+                    bypass = true;
+                }
+            }
+            if (!bypass && strstr(bypass_cfg, "$cookie_nocache") != NULL) {
+                const char *ck = NULL; size_t ck_len = 0;
+                if (router_find_header(request, request_length, "Cookie", &ck, &ck_len) &&
+                    memmem(ck, ck_len, "nocache", 7) != NULL) {
+                    bypass = true;
+                }
+            }
+        }
+    }
+
+    char cache_key[256];
+    if (caching_enabled && method_cacheable) {
+        const char *scheme = (connection != NULL && connection->transport == APEX_TRANSPORT_TLS) ? "https" : "http";
+        snprintf(cache_key, sizeof(cache_key), "%s:%s:%s:%s", scheme, method_text, host[0] ? host : "localhost", target_text);
+
+        if (!bypass) {
+            apex_cached_response_t cached = {0};
+            if (apex_cache_lookup((apex_cache_manager_t *)runtime->cache_manager, cache_zone, cache_key, &cached)) {
+                atomic_fetch_add_explicit(&g_apex_stats.cache_hits, 1, memory_order_relaxed);
+                char hit_extra[1024];
+                snprintf(hit_extra, sizeof(hit_extra), "%sX-Cache: HIT\r\n", extra_headers != NULL ? extra_headers : "");
+                apex_proxy_response_t cached_proxy_resp = {
+                    .status = cached.status,
+                    .headers = cached.headers,
+                    .headers_len = cached.headers_len,
+                    .body = cached.body,
+                    .body_len = cached.body_len,
+                    .upstream_fd = -1,
+                };
+                router_write_proxy_response(connection, server, request, request_length, &cached_proxy_resp,
+                                            is_head, hit_extra, strlen(hit_extra));
+                apex_cached_response_free(&cached);
+                free(target_text);
+                return;
+            } else {
+                atomic_fetch_add_explicit(&g_apex_stats.cache_misses, 1, memory_order_relaxed);
+            }
+        } else {
+            atomic_fetch_add_explicit(&g_apex_stats.cache_bypasses, 1, memory_order_relaxed);
+        }
     }
 
     char *headers = NULL;
@@ -1127,8 +1213,35 @@ static void router_forward_request(apex_config_route_t *route, const char *reque
         return;
     }
 
+    char combined_extra[1024];
+    if (caching_enabled) {
+        const char *status_str = bypass ? "BYPASS" : "MISS";
+        snprintf(combined_extra, sizeof(combined_extra), "%sX-Cache: %s\r\n",
+                 extra_headers != NULL ? extra_headers : "", status_str);
+    } else if (extra_headers != NULL && extra_headers_len > 0) {
+        snprintf(combined_extra, sizeof(combined_extra), "%s", extra_headers);
+    } else {
+        combined_extra[0] = '\0';
+    }
+
+    if (caching_enabled && !bypass && method_cacheable) {
+        const apex_cache_valid_rule_t *rules = route->location->cache_valid_rules;
+        size_t rule_count = route->location->cache_valid_rule_count;
+        if (rule_count == 0 && server != NULL) {
+            rules = server->cache_valid_rules;
+            rule_count = server->cache_valid_rule_count;
+        }
+        uint64_t valid_ms = apex_cache_evaluate_validity(proxy_response.headers, proxy_response.headers_len,
+                                                         proxy_response.status, rules, rule_count);
+        if (valid_ms > 0) {
+            apex_cache_store((apex_cache_manager_t *)runtime->cache_manager, cache_zone, cache_key,
+                             proxy_response.status, proxy_response.headers, proxy_response.headers_len,
+                             proxy_response.body, proxy_response.body_len, valid_ms);
+        }
+    }
+
     router_write_proxy_response(connection, server, request, request_length, &proxy_response,
-                                strcasecmp(method_text, "HEAD") == 0, extra_headers, extra_headers_len);
+                                strcasecmp(method_text, "HEAD") == 0, combined_extra, strlen(combined_extra));
 
     if (proxy_response.status == 101 && proxy_response.upstream_fd >= 0) {
         /* Flush written 101 response headers to client socket */
@@ -1360,6 +1473,7 @@ void apex_res_send(apex_res_t *res, int status, const void *body, size_t body_le
     if (connection->fd < 0) {
         return;
     }
+    apex_record_status(status);
 
     if (status == 200) {
         if (!body || body_len == 0) {
@@ -1419,6 +1533,7 @@ void apex_dispatch(apex_app_t *app, const char *req_buf, size_t header_len, cons
 
 void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const char *req_buf, size_t header_len,
                            const char *body, size_t body_len, apex_res_t *res) {
+    atomic_fetch_add_explicit(&g_apex_stats.requests, 1, memory_order_relaxed);
     if (req_buf[0] == 'G' && req_buf[1] == 'E' && req_buf[2] == 'T' && req_buf[3] == ' ') {
         const char *path = req_buf + 4;
         if (path[0] == '/' && path[1] == ' ') {
@@ -1738,8 +1853,144 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
                 /* Phase 6: RESPONSE_FILTER */
                 apex_pipeline_run_phase(&ctx, APEX_PHASE_RESPONSE_FILTER);
 
+                if (route.location->stub_status) {
+                    uint64_t accepts = atomic_load_explicit(&g_apex_stats.accepts, memory_order_relaxed);
+                    uint64_t handled = atomic_load_explicit(&g_apex_stats.handled, memory_order_relaxed);
+                    uint64_t requests = atomic_load_explicit(&g_apex_stats.requests, memory_order_relaxed);
+                    int64_t active = atomic_load_explicit(&g_apex_stats.active_connections, memory_order_relaxed);
+                    int64_t reading = atomic_load_explicit(&g_apex_stats.reading_connections, memory_order_relaxed);
+                    int64_t writing = atomic_load_explicit(&g_apex_stats.writing_connections, memory_order_relaxed);
+                    int64_t waiting = atomic_load_explicit(&g_apex_stats.waiting_connections, memory_order_relaxed);
+                    if (active < 0) active = 0;
+                    if (reading < 0) reading = 0;
+                    if (writing < 0) writing = 0;
+                    if (waiting < 0) waiting = 0;
+
+                    char body_buf[256];
+                    int blen = snprintf(body_buf, sizeof(body_buf),
+                                        "Active connections: %lld \n"
+                                        "server accepts handled requests\n"
+                                        " %llu %llu %llu \n"
+                                        "Reading: %lld Writing: %lld Waiting: %lld \n",
+                                        (long long)active,
+                                        (unsigned long long)accepts,
+                                        (unsigned long long)handled,
+                                        (unsigned long long)requests,
+                                        (long long)reading,
+                                        (long long)writing,
+                                        (long long)waiting);
+                    char resp_buf[512];
+                    int rlen = snprintf(resp_buf, sizeof(resp_buf),
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Server: apex\r\n"
+                                        "Content-Type: text/plain\r\n"
+                                        "Content-Length: %d\r\n"
+                                        "Connection: %s\r\n"
+                                        "%.*s"
+                                        "\r\n",
+                                        blen,
+                                        res->conn->close_after_write ? "close" : "keep-alive",
+                                        (int)ctx.extra_headers_len, ctx.extra_headers);
+                    apex_conn_write(res->conn, resp_buf, (size_t)rlen);
+                    if (method_len != 4 || memcmp(req_buf, "HEAD", 4) != 0) {
+                        apex_conn_write(res->conn, body_buf, (size_t)blen);
+                    }
+                    apex_record_status(200);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+
+                if (route.location->metrics) {
+                    uint64_t accepts = atomic_load_explicit(&g_apex_stats.accepts, memory_order_relaxed);
+                    uint64_t handled = atomic_load_explicit(&g_apex_stats.handled, memory_order_relaxed);
+                    uint64_t requests = atomic_load_explicit(&g_apex_stats.requests, memory_order_relaxed);
+                    int64_t active = atomic_load_explicit(&g_apex_stats.active_connections, memory_order_relaxed);
+                    int64_t reading = atomic_load_explicit(&g_apex_stats.reading_connections, memory_order_relaxed);
+                    int64_t writing = atomic_load_explicit(&g_apex_stats.writing_connections, memory_order_relaxed);
+                    int64_t waiting = atomic_load_explicit(&g_apex_stats.waiting_connections, memory_order_relaxed);
+                    if (active < 0) active = 0;
+                    if (reading < 0) reading = 0;
+                    if (writing < 0) writing = 0;
+                    if (waiting < 0) waiting = 0;
+
+                    uint64_t r2xx = atomic_load_explicit(&g_apex_stats.responses_2xx, memory_order_relaxed);
+                    uint64_t r3xx = atomic_load_explicit(&g_apex_stats.responses_3xx, memory_order_relaxed);
+                    uint64_t r4xx = atomic_load_explicit(&g_apex_stats.responses_4xx, memory_order_relaxed);
+                    uint64_t r5xx = atomic_load_explicit(&g_apex_stats.responses_5xx, memory_order_relaxed);
+                    uint64_t chits = atomic_load_explicit(&g_apex_stats.cache_hits, memory_order_relaxed);
+                    uint64_t cmiss = atomic_load_explicit(&g_apex_stats.cache_misses, memory_order_relaxed);
+                    uint64_t cbyp = atomic_load_explicit(&g_apex_stats.cache_bypasses, memory_order_relaxed);
+
+                    char body_buf[2048];
+                    int blen = snprintf(body_buf, sizeof(body_buf),
+                                        "# HELP apex_connections_active Active client connections\n"
+                                        "# TYPE apex_connections_active gauge\n"
+                                        "apex_connections_active %lld\n\n"
+                                        "# HELP apex_connections_reading Connections reading request\n"
+                                        "# TYPE apex_connections_reading gauge\n"
+                                        "apex_connections_reading %lld\n\n"
+                                        "# HELP apex_connections_writing Connections writing response\n"
+                                        "# TYPE apex_connections_writing gauge\n"
+                                        "apex_connections_writing %lld\n\n"
+                                        "# HELP apex_connections_waiting Connections waiting for request\n"
+                                        "# TYPE apex_connections_waiting gauge\n"
+                                        "apex_connections_waiting %lld\n\n"
+                                        "# HELP apex_connections_accepted_total Total accepted connections\n"
+                                        "# TYPE apex_connections_accepted_total counter\n"
+                                        "apex_connections_accepted_total %llu\n\n"
+                                        "# HELP apex_connections_handled_total Total handled connections\n"
+                                        "# TYPE apex_connections_handled_total counter\n"
+                                        "apex_connections_handled_total %llu\n\n"
+                                        "# HELP apex_http_requests_total Total HTTP requests handled\n"
+                                        "# TYPE apex_http_requests_total counter\n"
+                                        "apex_http_requests_total %llu\n\n"
+                                        "# HELP apex_http_responses_total Total HTTP responses sent by status code class\n"
+                                        "# TYPE apex_http_responses_total counter\n"
+                                        "apex_http_responses_total{code=\"2xx\"} %llu\n"
+                                        "apex_http_responses_total{code=\"3xx\"} %llu\n"
+                                        "apex_http_responses_total{code=\"4xx\"} %llu\n"
+                                        "apex_http_responses_total{code=\"5xx\"} %llu\n\n"
+                                        "# HELP apex_cache_requests_total Cache requests by status\n"
+                                        "# TYPE apex_cache_requests_total counter\n"
+                                        "apex_cache_requests_total{status=\"hit\"} %llu\n"
+                                        "apex_cache_requests_total{status=\"miss\"} %llu\n"
+                                        "apex_cache_requests_total{status=\"bypass\"} %llu\n",
+                                        (long long)active, (long long)reading, (long long)writing, (long long)waiting,
+                                        (unsigned long long)accepts, (unsigned long long)handled,
+                                        (unsigned long long)requests,
+                                        (unsigned long long)r2xx, (unsigned long long)r3xx,
+                                        (unsigned long long)r4xx, (unsigned long long)r5xx,
+                                        (unsigned long long)chits, (unsigned long long)cmiss, (unsigned long long)cbyp);
+
+                    char resp_buf[512];
+                    int rlen = snprintf(resp_buf, sizeof(resp_buf),
+                                        "HTTP/1.1 200 OK\r\n"
+                                        "Server: apex\r\n"
+                                        "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n"
+                                        "Content-Length: %d\r\n"
+                                        "Connection: %s\r\n"
+                                        "%.*s"
+                                        "\r\n",
+                                        blen,
+                                        res->conn->close_after_write ? "close" : "keep-alive",
+                                        (int)ctx.extra_headers_len, ctx.extra_headers);
+                    apex_conn_write(res->conn, resp_buf, (size_t)rlen);
+                    if (method_len != 4 || memcmp(req_buf, "HEAD", 4) != 0) {
+                        apex_conn_write(res->conn, body_buf, (size_t)blen);
+                    }
+                    apex_record_status(200);
+                    if (conn_acquired) {
+                        apex_conn_limit_release(runtime, conn_zone, client_ip);
+                    }
+                    apex_pipeline_run_phase(&ctx, APEX_PHASE_LOGGING);
+                    return;
+                }
+
                 if (route.location->target != APEX_PROXY_TARGET_NONE) {
-                    router_forward_request(&route, req_buf, header_len, req_buf, method_len, path, path_len, body,
+                    router_forward_request(runtime, &route, req_buf, header_len, req_buf, method_len, path, path_len, body,
                                            body_len, res, ctx.extra_headers, ctx.extra_headers_len);
                     if (conn_acquired) {
                         apex_conn_limit_release(runtime, conn_zone, client_ip);

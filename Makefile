@@ -13,9 +13,9 @@ endif
 
 LIB = libapex.a
 BIN = apex
-SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c src/module.c src/static.c
+SRCS = src/core.c src/router.c src/proxy.c src/config.c src/tls.c src/h2.c src/module.c src/static.c src/cache.c
 OBJS = $(SRCS:.c=.o)
-HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h include/apex/module.h include/apex/static.h src/internal.h
+HEADERS = include/apex.h include/apex/proxy.h include/apex/config.h include/apex/module.h include/apex/static.h include/apex/cache.h src/internal.h
 
 TLS_CFLAGS := $(shell pkg-config --cflags libssl libcrypto 2>/dev/null)
 TLS_LIBS := $(shell pkg-config --libs libssl libcrypto 2>/dev/null || printf '%s ' -lssl -lcrypto)
@@ -88,6 +88,8 @@ test: all
 	$(PYTHON) tests/test_websocket.py ./$(BIN)
 	$(PYTHON) tests/test_upstream_policies.py ./$(BIN)
 	$(PYTHON) tests/test_ratelimit.py ./$(BIN)
+	$(PYTHON) tests/test_stub_status.py ./$(BIN)
+	$(PYTHON) tests/test_cache.py ./$(BIN)
 
 check: test
 

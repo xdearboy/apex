@@ -537,6 +537,7 @@ void apex_static_serve(const apex_server_config_t *server,
                                         (int)extra_headers_len, extra_headers ? extra_headers : "");
                     if (hlen > 0 && (size_t)hlen < sizeof(header_buf)) {
                         apex_conn_write(connection, header_buf, (size_t)hlen);
+                        apex_record_status(304);
                     }
                     return;
                 }
@@ -564,6 +565,7 @@ void apex_static_serve(const apex_server_config_t *server,
                                         (int)extra_headers_len, extra_headers ? extra_headers : "");
                     if (hlen > 0 && (size_t)hlen < sizeof(header_buf)) {
                         apex_conn_write(connection, header_buf, (size_t)hlen);
+                        apex_record_status(304);
                     }
                     return;
                 }
@@ -625,6 +627,7 @@ void apex_static_serve(const apex_server_config_t *server,
                                        connection->close_after_write ? "close" : "keep-alive");
                     if (n416 > 0 && (size_t)n416 < sizeof(h416)) {
                         apex_conn_write(connection, h416, (size_t)n416);
+                        apex_record_status(416);
                     }
                     return;
                 }
@@ -679,6 +682,7 @@ void apex_static_serve(const apex_server_config_t *server,
 
     if (header_len > 0 && (size_t)header_len < sizeof(header_buffer)) {
         apex_conn_write(connection, header_buffer, (size_t)header_len);
+        apex_record_status(is_range ? 206 : 200);
         if (!head_request && send_length > 0) {
             if (cached_memory != NULL) {
                 apex_conn_write(connection, cached_memory + range_start, send_length);

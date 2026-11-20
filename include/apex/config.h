@@ -45,6 +45,19 @@ typedef struct {
 } apex_conn_limit_zone_t;
 
 typedef struct {
+    int status_code;
+    uint64_t valid_ms;
+} apex_cache_valid_rule_t;
+
+typedef struct {
+    char name[64];
+    char path[APEX_CONFIG_PATH_MAX];
+    size_t keys_zone_size;
+    size_t max_size;
+    uint64_t inactive_ms;
+} apex_cache_zone_config_t;
+
+typedef struct {
     bool allow;   /* true for allow, false for deny */
     bool is_all;  /* true if matches all */
     bool is_ipv6;
@@ -130,6 +143,15 @@ typedef struct {
     uint32_t limit_conn_max;
     int limit_conn_status;
 
+    bool stub_status;
+    bool metrics;
+
+    char proxy_cache[64];
+    char proxy_cache_key[128];
+    char proxy_cache_bypass[64];
+    apex_cache_valid_rule_t cache_valid_rules[8];
+    size_t cache_valid_rule_count;
+
     int http_version;
 } apex_location_config_t;
 
@@ -213,6 +235,11 @@ typedef struct {
     char limit_conn_zone[64];
     uint32_t limit_conn_max;
     int limit_conn_status;
+    char proxy_cache[64];
+    char proxy_cache_key[128];
+    char proxy_cache_bypass[64];
+    apex_cache_valid_rule_t cache_valid_rules[8];
+    size_t cache_valid_rule_count;
     int line;
 } apex_server_config_t;
 
@@ -226,6 +253,8 @@ typedef struct {
     size_t rate_zone_count;
     apex_conn_limit_zone_t conn_zones[APEX_CONFIG_MAX_CONN_ZONES];
     size_t conn_zone_count;
+    apex_cache_zone_config_t cache_zones[APEX_CONFIG_MAX_RATE_ZONES];
+    size_t cache_zone_count;
 } apex_http_config_t;
 
 typedef struct {
@@ -257,6 +286,7 @@ typedef struct {
     size_t endpoint_group_count;
     struct apex_module_registry *module_registry;
     void *rate_limiter;
+    void *cache_manager;
 } apex_runtime_t;
 
 typedef struct {

@@ -17,6 +17,8 @@ typedef struct {
     socklen_t address_length;
 } listen_endpoint_t;
 
+apex_server_stats_t g_apex_stats = {0};
+
 static int close_fd(int *fd);
 static bool configure_client(int fd);
 static void register_connection(worker_arg_t *worker, int fd);
@@ -102,7 +104,16 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
         if (close_fd(&connection->fd) != 0) {
             atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
         }
+        atomic_fetch_sub_explicit(&g_apex_stats.active_connections, 1, memory_order_relaxed);
+        if (connection->conn_state == 0) {
+            atomic_fetch_sub_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
+        } else if (connection->conn_state == 1) {
+            atomic_fetch_sub_explicit(&g_apex_stats.writing_connections, 1, memory_order_relaxed);
+        } else if (connection->conn_state == 2) {
+            atomic_fetch_sub_explicit(&g_apex_stats.waiting_connections, 1, memory_order_relaxed);
+        }
         connection->active = 0;
+        connection->conn_state = 0;
         worker->connection_count--;
         connection->read_length = 0;
         connection->write_length = 0;
@@ -275,7 +286,12 @@ static void register_connection(worker_arg_t *worker, int fd) {
     memset(connection, 0, sizeof(*connection));
     connection->fd = fd;
     connection->active = 1;
+    connection->conn_state = 0; /* READING */
     worker->connection_count++;
+    atomic_fetch_add_explicit(&g_apex_stats.accepts, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_apex_stats.handled, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_apex_stats.active_connections, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
     if (fd > worker->highest_fd) {
         worker->highest_fd = fd;
     }
@@ -297,6 +313,16 @@ static void register_connection(worker_arg_t *worker, int fd) {
 void apex_conn_write(conn_t *connection, const void *data, size_t length) {
     if (connection == NULL || data == NULL || length == 0) {
         return;
+    }
+
+    if (connection->conn_state != 1) {
+        if (connection->conn_state == 0) {
+            atomic_fetch_sub_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
+        } else if (connection->conn_state == 2) {
+            atomic_fetch_sub_explicit(&g_apex_stats.waiting_connections, 1, memory_order_relaxed);
+        }
+        connection->conn_state = 1;
+        atomic_fetch_add_explicit(&g_apex_stats.writing_connections, 1, memory_order_relaxed);
     }
 
     bool aux_pending = connection->aux_length > connection->aux_offset;
@@ -328,6 +354,15 @@ void apex_conn_sendfile(conn_t *connection, int file_fd, off_t offset, size_t le
             close(file_fd);
         }
         return;
+    }
+    if (connection->conn_state != 1) {
+        if (connection->conn_state == 0) {
+            atomic_fetch_sub_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
+        } else if (connection->conn_state == 2) {
+            atomic_fetch_sub_explicit(&g_apex_stats.waiting_connections, 1, memory_order_relaxed);
+        }
+        connection->conn_state = 1;
+        atomic_fetch_add_explicit(&g_apex_stats.writing_connections, 1, memory_order_relaxed);
     }
 #if defined(__linux__)
     if (connection->transport == APEX_TRANSPORT_PLAIN) {
@@ -483,6 +518,12 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
         return;
     }
 
+    if (!pending && connection->conn_state == 1) {
+        connection->conn_state = 2; /* WAITING */
+        atomic_fetch_sub_explicit(&g_apex_stats.writing_connections, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_apex_stats.waiting_connections, 1, memory_order_relaxed);
+    }
+
     if (pending && !connection->epollout_active) {
         struct epoll_event event_config;
         event_config.events = EPOLLOUT | EPOLLRDHUP | EPOLLET;
@@ -532,6 +573,12 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
     if (connection->h2 != NULL) {
         h2_read(worker, connection);
         return;
+    }
+
+    if (connection->conn_state == 2) {
+        connection->conn_state = 0; /* READING */
+        atomic_fetch_sub_explicit(&g_apex_stats.waiting_connections, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_apex_stats.reading_connections, 1, memory_order_relaxed);
     }
 
     while (connection->fd >= 0) {
