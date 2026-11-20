@@ -42,6 +42,31 @@ typedef enum {
     APEX_PROXY_ERR_ALLOC = -8,
 } apex_proxy_error_t;
 
+#define APEX_NEXT_UPSTREAM_NONE           0u
+#define APEX_NEXT_UPSTREAM_ERROR          (1u << 0)
+#define APEX_NEXT_UPSTREAM_TIMEOUT        (1u << 1)
+#define APEX_NEXT_UPSTREAM_INVALID_HEADER (1u << 2)
+#define APEX_NEXT_UPSTREAM_HTTP_500       (1u << 3)
+#define APEX_NEXT_UPSTREAM_HTTP_502       (1u << 4)
+#define APEX_NEXT_UPSTREAM_HTTP_503       (1u << 5)
+#define APEX_NEXT_UPSTREAM_HTTP_504       (1u << 6)
+#define APEX_NEXT_UPSTREAM_HTTP_403       (1u << 7)
+#define APEX_NEXT_UPSTREAM_HTTP_404       (1u << 8)
+#define APEX_NEXT_UPSTREAM_HTTP_429       (1u << 9)
+#define APEX_NEXT_UPSTREAM_NON_IDEMPOTENT (1u << 10)
+#define APEX_NEXT_UPSTREAM_OFF            (1u << 11)
+
+#define APEX_NEXT_UPSTREAM_DEFAULT        (APEX_NEXT_UPSTREAM_ERROR | APEX_NEXT_UPSTREAM_TIMEOUT)
+
+typedef struct {
+    uint32_t conditions;
+    uint32_t tries;
+    uint64_t timeout_ms;
+    bool has_conditions;
+    bool has_tries;
+    bool has_timeout;
+} apex_next_upstream_config_t;
+
 typedef struct {
     char ip[64];
     uint16_t port;
@@ -103,6 +128,9 @@ typedef struct {
     bool keep_alive;
     bool use_ssl;
     const char *ssl_server_name;
+    uint32_t next_upstream_conditions;
+    uint32_t next_upstream_tries;
+    uint64_t next_upstream_timeout_ms;
 } apex_proxy_request_t;
 
 /* headers holds the raw status line and header block; body is de-chunked.

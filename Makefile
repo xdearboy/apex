@@ -101,6 +101,7 @@ test: all
 	$(PYTHON) tests/test_map.py ./$(BIN)
 	$(PYTHON) tests/test_https_proxy.py ./$(BIN)
 	$(PYTHON) tests/test_compression.py ./$(BIN)
+	$(PYTHON) tests/test_failover.py ./$(BIN)
 
 check: test
 

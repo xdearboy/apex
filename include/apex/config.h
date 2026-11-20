@@ -152,6 +152,12 @@ typedef struct {
     size_t entry_capacity;
 } apex_map_t;
 
+typedef struct {
+    int status_code;
+    char *path;
+    int line;
+} apex_error_page_config_t;
+
 typedef enum {
     APEX_PROXY_TARGET_NONE = 0,
     APEX_PROXY_TARGET_UPSTREAM,
@@ -240,6 +246,14 @@ typedef struct {
     char proxy_pass_raw[APEX_CONFIG_PATH_MAX];
     apex_compress_config_t compress;
     bool has_compress;
+
+    apex_error_page_config_t *error_pages;
+    size_t error_page_count;
+    size_t error_page_capacity;
+    apex_next_upstream_config_t next_upstream;
+    bool has_next_upstream;
+    bool proxy_intercept_errors;
+    bool has_proxy_intercept_errors;
 } apex_location_config_t;
 
 typedef struct {
@@ -292,12 +306,6 @@ typedef struct {
 } apex_tls_config_t;
 
 typedef struct {
-    int status_code;
-    char *path;
-    int line;
-} apex_error_page_config_t;
-
-typedef struct {
     char listen_host[APEX_CONFIG_HOST_MAX];
     uint16_t listen_port;
     bool listen_tls;
@@ -342,6 +350,10 @@ typedef struct {
     apex_server_tokens_config_t server_tokens;
     apex_compress_config_t compress;
     bool has_compress;
+    apex_next_upstream_config_t next_upstream;
+    bool has_next_upstream;
+    bool proxy_intercept_errors;
+    bool has_proxy_intercept_errors;
     int line;
 } apex_server_config_t;
 
@@ -375,6 +387,10 @@ typedef struct {
     size_t map_capacity;
     apex_compress_config_t compress;
     bool has_compress;
+    apex_next_upstream_config_t next_upstream;
+    bool has_next_upstream;
+    bool proxy_intercept_errors;
+    bool has_proxy_intercept_errors;
 } apex_http_config_t;
 
 typedef struct {

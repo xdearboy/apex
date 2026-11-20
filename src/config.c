@@ -1249,6 +1249,7 @@ static const char *const reserved_words[] = {
     "keepalive",  "connect_timeout", "read_timeout", "idle_timeout", "certificate",  "private_key",
     "protocols",  "ciphers",       "client_auth",    "proxy_pass",   "proxy_set_header",
     "proxy_connect_timeout", "proxy_read_timeout", "proxy_http_version", "round_robin", "p2c",
+    "proxy_next_upstream", "proxy_next_upstream_tries", "proxy_next_upstream_timeout", "proxy_intercept_errors",
     "index",      "try_files",     "sendfile",       "etag",         "precompressed", "gzip_static",
     "brotli_static",
     "on",         "off",           "optional",       "required",
@@ -1428,6 +1429,46 @@ static bool server_add_error_page(parser_t *parser, apex_server_config_t *server
     }
 
     apex_error_page_config_t *entry = &server->error_pages[server->error_page_count++];
+    entry->status_code = status_code;
+    entry->path = copy;
+    entry->line = path->line;
+    return true;
+}
+
+static bool location_add_error_page(parser_t *parser, apex_location_config_t *location, int status_code,
+                                    const token_t *path) {
+    if (location->error_page_count >= 32u) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location declares too many error pages");
+        return false;
+    }
+
+    if (location->error_page_count == location->error_page_capacity) {
+        size_t capacity = location->error_page_capacity ? location->error_page_capacity * 2u : 4u;
+        apex_error_page_config_t *grown = realloc(location->error_pages, capacity * sizeof(*grown));
+        if (grown == NULL) {
+            config_oom(parser->error);
+            return false;
+        }
+        location->error_pages = grown;
+        location->error_page_capacity = capacity;
+    }
+
+    char *copy = config_strdup_range(path->text, path->length);
+    if (copy == NULL) {
+        config_oom(parser->error);
+        return false;
+    }
+
+    for (size_t index = 0; index < location->error_page_count; index++) {
+        if (location->error_pages[index].status_code == status_code) {
+            free(location->error_pages[index].path);
+            location->error_pages[index].path = copy;
+            location->error_pages[index].line = path->line;
+            return true;
+        }
+    }
+
+    apex_error_page_config_t *entry = &location->error_pages[location->error_page_count++];
     entry->status_code = status_code;
     entry->path = copy;
     entry->line = path->line;
@@ -2241,6 +2282,125 @@ static void config_free_compress(apex_compress_config_t *compress) {
     }
 }
 
+static bool parse_failover_directive(parser_t *parser, const token_t *directive,
+                                     apex_next_upstream_config_t *next_upstream, bool *has_next_upstream,
+                                     bool *proxy_intercept_errors, bool *has_proxy_intercept_errors,
+                                     bool *handled) {
+    *handled = true;
+    if (token_is_word(directive, "proxy_next_upstream")) {
+        uint32_t flags = 0;
+        size_t count = 0;
+        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            const token_t *tok = parser_scalar(parser, "proxy_next_upstream parameter");
+            if (tok == NULL) return false;
+            count++;
+            if (token_is_word(tok, "error")) {
+                flags |= APEX_NEXT_UPSTREAM_ERROR;
+            } else if (token_is_word(tok, "timeout")) {
+                flags |= APEX_NEXT_UPSTREAM_TIMEOUT;
+            } else if (token_is_word(tok, "invalid_header")) {
+                flags |= APEX_NEXT_UPSTREAM_INVALID_HEADER;
+            } else if (token_is_word(tok, "http_500")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_500;
+            } else if (token_is_word(tok, "http_502")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_502;
+            } else if (token_is_word(tok, "http_503")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_503;
+            } else if (token_is_word(tok, "http_504")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_504;
+            } else if (token_is_word(tok, "http_403")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_403;
+            } else if (token_is_word(tok, "http_404")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_404;
+            } else if (token_is_word(tok, "http_429")) {
+                flags |= APEX_NEXT_UPSTREAM_HTTP_429;
+            } else if (token_is_word(tok, "non_idempotent")) {
+                flags |= APEX_NEXT_UPSTREAM_NON_IDEMPOTENT;
+            } else if (token_is_word(tok, "off")) {
+                flags |= APEX_NEXT_UPSTREAM_OFF;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok,
+                             "invalid proxy_next_upstream parameter '%s'", tok->text);
+                return false;
+            }
+        }
+        if (count == 0) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive,
+                         "proxy_next_upstream requires at least one parameter");
+            return false;
+        }
+        next_upstream->conditions = flags;
+        next_upstream->has_conditions = true;
+        *has_next_upstream = true;
+    } else if (token_is_word(directive, "proxy_next_upstream_tries")) {
+        const token_t *tok = parser_scalar(parser, "number of tries");
+        if (tok == NULL) return false;
+        uint64_t tries = 0;
+        if (!token_to_u64(tok, 0, UINT32_MAX, &tries)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "invalid proxy_next_upstream_tries");
+            return false;
+        }
+        next_upstream->tries = (uint32_t)tries;
+        next_upstream->has_tries = true;
+        *has_next_upstream = true;
+    } else if (token_is_word(directive, "proxy_next_upstream_timeout")) {
+        const token_t *val = parser_scalar(parser, "a duration");
+        if (val == NULL) return false;
+        uint64_t ms = 0;
+        if (!token_to_duration_ms(val, &ms)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid proxy_next_upstream_timeout");
+            return false;
+        }
+        next_upstream->timeout_ms = ms;
+        next_upstream->has_timeout = true;
+        *has_next_upstream = true;
+    } else if (token_is_word(directive, "proxy_intercept_errors")) {
+        const token_t *val = parser_scalar(parser, "on or off");
+        if (val == NULL) return false;
+        if (token_is_word(val, "on")) {
+            *proxy_intercept_errors = true;
+            *has_proxy_intercept_errors = true;
+        } else if (token_is_word(val, "off")) {
+            *proxy_intercept_errors = false;
+            *has_proxy_intercept_errors = true;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "proxy_intercept_errors must be on or off");
+            return false;
+        }
+    } else {
+        *handled = false;
+    }
+    return true;
+}
+
+static void next_upstream_inherit(apex_next_upstream_config_t *child, bool *child_has,
+                                  const apex_next_upstream_config_t *parent, bool parent_has) {
+    if (!parent_has || parent == NULL) return;
+    if (parent->has_conditions && !child->has_conditions) {
+        child->conditions = parent->conditions;
+        child->has_conditions = true;
+        *child_has = true;
+    }
+    if (parent->has_tries && !child->has_tries) {
+        child->tries = parent->tries;
+        child->has_tries = true;
+        *child_has = true;
+    }
+    if (parent->has_timeout && !child->has_timeout) {
+        child->timeout_ms = parent->timeout_ms;
+        child->has_timeout = true;
+        *child_has = true;
+    }
+}
+
+static void proxy_intercept_errors_inherit(bool *child_val, bool *child_has,
+                                           bool parent_val, bool parent_has) {
+    if (!*child_has && parent_has) {
+        *child_val = parent_val;
+        *child_has = true;
+    }
+}
+
 static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
     const token_t *begin = parser_peek(parser);
     bool exact = false;
@@ -2673,18 +2833,61 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
             }
             memcpy(location->proxy_ssl_name, value->text, value->length);
             location->proxy_ssl_name[value->length] = '\0';
-        } else {
-            bool handled_compress = false;
-            if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
-                if (!handled_compress) {
-                    parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
-                                 directive->text);
-                    parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                        "proxy_http_version, return, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, gzip, brotli, zstd");
+        } else if (token_is_word(directive, "error_page")) {
+            int codes[16];
+            size_t code_count = 0;
+            while (parser_peek(parser)->kind == TOKEN_WORD &&
+                   isdigit((unsigned char)parser_peek(parser)->text[0])) {
+                const token_t *code_token = parser_scalar(parser, "an HTTP status code");
+                if (code_token == NULL) {
                     return false;
                 }
-            } else {
+                uint64_t code_val = 0;
+                if (!token_to_u64(code_token, 300, 599, &code_val)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, code_token, "invalid HTTP error status code");
+                    return false;
+                }
+                if (code_count < sizeof(codes) / sizeof(codes[0])) {
+                    codes[code_count++] = (int)code_val;
+                }
+            }
+            if (code_count == 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "error_page requires at least one status code");
                 return false;
+            }
+            const token_t *path_token = parser_scalar(parser, "a file path for error_page");
+            if (path_token == NULL) {
+                return false;
+            }
+            for (size_t c = 0; c < code_count; c++) {
+                if (!location_add_error_page(parser, location, codes[c], path_token)) {
+                    return false;
+                }
+            }
+        } else {
+            bool handled_failover = false;
+            if (!parse_failover_directive(parser, directive, &location->next_upstream,
+                                          &location->has_next_upstream,
+                                          &location->proxy_intercept_errors,
+                                          &location->has_proxy_intercept_errors,
+                                          &handled_failover)) {
+                return false;
+            }
+            if (handled_failover) {
+                /* handled */
+            } else {
+                bool handled_compress = false;
+                if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
+                    if (!handled_compress) {
+                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
+                                     directive->text);
+                        parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
+                                            "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, gzip, brotli, zstd");
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
             }
         }
 
@@ -2737,6 +2940,22 @@ static bool parse_location_block(parser_t *parser, apex_server_config_t *server)
     }
     if (!compress_config_inherit(&location->compress, &location->has_compress, &server->compress, server->has_compress)) {
         return config_oom(parser->error);
+    }
+    next_upstream_inherit(&location->next_upstream, &location->has_next_upstream,
+                          &server->next_upstream, server->has_next_upstream);
+    proxy_intercept_errors_inherit(&location->proxy_intercept_errors, &location->has_proxy_intercept_errors,
+                                   server->proxy_intercept_errors, server->has_proxy_intercept_errors);
+    if (location->error_page_count == 0 && server->error_page_count > 0) {
+        location->error_pages = calloc(server->error_page_count, sizeof(apex_error_page_config_t));
+        if (location->error_pages == NULL) return config_oom(parser->error);
+        location->error_page_count = server->error_page_count;
+        location->error_page_capacity = server->error_page_count;
+        for (size_t i = 0; i < server->error_page_count; i++) {
+            location->error_pages[i].status_code = server->error_pages[i].status_code;
+            location->error_pages[i].line = server->error_pages[i].line;
+            location->error_pages[i].path = config_strdup_range(server->error_pages[i].path, strlen(server->error_pages[i].path));
+            if (location->error_pages[i].path == NULL) return config_oom(parser->error);
+        }
     }
 
     if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
@@ -3076,15 +3295,27 @@ static bool parse_server_block(parser_t *parser) {
                 return false;
             }
         } else {
-            bool handled_compress = false;
-            if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
-                if (!handled_compress) {
-                    parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-                    parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, gzip, brotli, zstd");
+            bool handled_failover = false;
+            if (!parse_failover_directive(parser, directive, &server->next_upstream,
+                                          &server->has_next_upstream,
+                                          &server->proxy_intercept_errors,
+                                          &server->has_proxy_intercept_errors,
+                                          &handled_failover)) {
+                return false;
+            }
+            if (handled_failover) {
+                /* handled */
+            } else {
+                bool handled_compress = false;
+                if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
+                    if (!handled_compress) {
+                        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+                        parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, gzip, brotli, zstd");
+                        return false;
+                    }
+                } else {
                     return false;
                 }
-            } else {
-                return false;
             }
         }
 
@@ -3120,6 +3351,10 @@ static bool parse_server_block(parser_t *parser) {
     if (!compress_config_inherit(&server->compress, &server->has_compress, &parser->config->http.compress, parser->config->http.has_compress)) {
         return config_oom(parser->error);
     }
+    next_upstream_inherit(&server->next_upstream, &server->has_next_upstream,
+                          &parser->config->http.next_upstream, parser->config->http.has_next_upstream);
+    proxy_intercept_errors_inherit(&server->proxy_intercept_errors, &server->has_proxy_intercept_errors,
+                                   parser->config->http.proxy_intercept_errors, parser->config->http.has_proxy_intercept_errors);
 
     if (!have_listen) {
         parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
@@ -3768,6 +4003,17 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
         }
         parser->config->http.has_real_ip_recursive = true;
     } else {
+        bool handled_failover = false;
+        if (!parse_failover_directive(parser, directive, &parser->config->http.next_upstream,
+                                      &parser->config->http.has_next_upstream,
+                                      &parser->config->http.proxy_intercept_errors,
+                                      &parser->config->http.has_proxy_intercept_errors,
+                                      &handled_failover)) {
+            return false;
+        }
+        if (handled_failover) {
+            return true;
+        }
         bool handled_compress = false;
         if (parse_compress_directive(parser, directive, &parser->config->http.compress,
                                      &parser->config->http.has_compress, &handled_compress)) {
@@ -3779,7 +4025,7 @@ static bool parse_http_directive(parser_t *parser, const token_t *directive) {
         }
         parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
         parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, upstream, server, gzip, brotli, zstd");
+                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, upstream, server, gzip, brotli, zstd");
         return false;
     }
     return true;
@@ -4451,6 +4697,10 @@ void apex_config_free(apex_config_t *config) {
             }
             free(location->add_headers);
             config_free_compress(&location->compress);
+            for (size_t ep = 0; ep < location->error_page_count; ep++) {
+                free(location->error_pages[ep].path);
+            }
+            free(location->error_pages);
         }
         free(server->locations);
 

@@ -916,6 +916,105 @@ static void router_error_details(int status, const char *default_reason,
     }
 }
 
+static const char *router_find_error_page(const apex_server_config_t *server,
+                                          const apex_location_config_t *location,
+                                          int status) {
+    if (location != NULL && location->error_pages != NULL) {
+        for (size_t i = 0; i < location->error_page_count; i++) {
+            if (location->error_pages[i].status_code == status) {
+                return location->error_pages[i].path;
+            }
+        }
+    }
+    if (server != NULL && server->error_pages != NULL) {
+        for (size_t i = 0; i < server->error_page_count; i++) {
+            if (server->error_pages[i].status_code == status) {
+                return server->error_pages[i].path;
+            }
+        }
+    }
+    return NULL;
+}
+
+static bool router_send_custom_error_page(conn_t *connection, const apex_server_config_t *server,
+                                          const apex_location_config_t *location,
+                                          int status, const char *reason,
+                                          const char *extra_headers, size_t extra_headers_len) {
+    const char *err_page_path = router_find_error_page(server, location, status);
+    if (err_page_path == NULL) {
+        return false;
+    }
+    int file_fd = open(err_page_path, O_RDONLY | O_CLOEXEC);
+    if (file_fd < 0) {
+        return false;
+    }
+    struct stat st;
+    if (fstat(file_fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+        st.st_size > 2u * 1024u * 1024u) {
+        close(file_fd);
+        return false;
+    }
+    size_t file_size = (size_t)st.st_size;
+    char *file_buf = malloc(file_size);
+    if (file_buf == NULL) {
+        close(file_fd);
+        return false;
+    }
+    ssize_t n = read(file_fd, file_buf, file_size);
+    close(file_fd);
+    if (n != (ssize_t)file_size) {
+        free(file_buf);
+        return false;
+    }
+
+    apex_record_status(status);
+    const apex_server_tokens_config_t *tokens = router_get_server_tokens(NULL, server);
+    char server_hdr[160];
+    router_format_server_header(tokens, server_hdr, sizeof(server_hdr));
+
+    char add_headers_buf[1024];
+    size_t add_headers_len = router_build_add_headers(NULL, server, location, status,
+                                                      NULL, 0, NULL, 0, NULL, 0, "http", 4,
+                                                      0, add_headers_buf, sizeof(add_headers_buf));
+
+    char combined_extra[1024];
+    int extra_len = 0;
+    if ((extra_headers != NULL && extra_headers_len > 0) || add_headers_len > 0) {
+        extra_len = snprintf(combined_extra, sizeof(combined_extra), "%.*s%.*s",
+                             (int)(extra_headers != NULL ? extra_headers_len : 0),
+                             extra_headers != NULL ? extra_headers : "",
+                             (int)add_headers_len, add_headers_buf);
+        if (extra_len < 0 || (size_t)extra_len >= sizeof(combined_extra)) {
+            extra_len = 0;
+            combined_extra[0] = '\0';
+        }
+    } else {
+        combined_extra[0] = '\0';
+    }
+
+    const char *content_type = router_determine_content_type(err_page_path);
+    char header[1024];
+    int written = snprintf(header, sizeof(header),
+                           "HTTP/1.1 %d %s\r\n"
+                           "%s"
+                           "Content-Type: %s\r\n"
+                           "Content-Length: %zu\r\n"
+                           "Connection: %s\r\n"
+                           "%.*s"
+                           "\r\n",
+                           status, reason ? reason : "Error", server_hdr, content_type, file_size,
+                           connection->close_after_write ? "close" : "keep-alive",
+                           extra_len, combined_extra);
+    if (written > 0 && (size_t)written < sizeof(header)) {
+        apex_conn_write(connection, header, (size_t)written);
+        apex_conn_write(connection, file_buf, file_size);
+        free(file_buf);
+        return true;
+    }
+    free(file_buf);
+    return false;
+}
+
 void router_send_error_ex(conn_t *connection, const apex_server_config_t *server,
                           const char *request, size_t request_length,
                           int status, const char *reason, const char *message,
@@ -951,53 +1050,9 @@ void router_send_error_ex(conn_t *connection, const apex_server_config_t *server
     const char *extra = combined_extra;
 
     /* 1. Custom error_page if configured */
-    if (server != NULL && server->error_pages != NULL) {
-        for (size_t i = 0; i < server->error_page_count; i++) {
-            if (server->error_pages[i].status_code == status) {
-                const char *path = server->error_pages[i].path;
-                int file_fd = open(path, O_RDONLY | O_CLOEXEC);
-                if (file_fd >= 0) {
-                    struct stat st;
-                    if (fstat(file_fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0 &&
-                        st.st_size <= 2u * 1024u * 1024u) {
-                    size_t file_size = (size_t)st.st_size;
-                    char *file_buf = malloc(file_size);
-                    if (file_buf != NULL) {
-                        ssize_t n = read(file_fd, file_buf, file_size);
-                        close(file_fd);
-                        if (n == (ssize_t)file_size) {
-                            const char *content_type = router_determine_content_type(path);
-                            char header[1024];
-                            int written = snprintf(header, sizeof(header),
-                                                   "HTTP/1.1 %d %s\r\n"
-                                                   "%s"
-                                                   "Content-Type: %s\r\n"
-                                                   "Content-Length: %zu\r\n"
-                                                   "Connection: %s\r\n"
-                                                   "%.*s"
-                                                   "\r\n",
-                                                   status, reason, server_hdr, content_type, file_size,
-                                                   connection->close_after_write ? "close" : "keep-alive",
-                                                   extra_len, extra);
-                            if (written > 0 && (size_t)written < sizeof(header)) {
-                                apex_conn_write(connection, header, (size_t)written);
-                                apex_conn_write(connection, file_buf, file_size);
-                                free(file_buf);
-                                return;
-                            }
-                        }
-                        free(file_buf);
-                    } else {
-                        close(file_fd);
-                    }
-                } else {
-                    close(file_fd);
-                }
-            }
-            break;
-        }
+    if (router_send_custom_error_page(connection, server, NULL, status, reason, extra_headers, extra_headers_len)) {
+        return;
     }
-}
 
     const char *title = NULL;
     const char *desc = NULL;
@@ -1696,6 +1751,39 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         eff_ip = fallback_ip;
     }
 
+    uint32_t next_conditions = APEX_NEXT_UPSTREAM_DEFAULT;
+    uint32_t next_tries = 0;
+    uint64_t next_timeout_ms = 0;
+    bool intercept_errors = false;
+
+    if (route->location != NULL) {
+        if (route->location->next_upstream.has_conditions) {
+            next_conditions = route->location->next_upstream.conditions;
+        }
+        if (route->location->next_upstream.has_tries) {
+            next_tries = route->location->next_upstream.tries;
+        }
+        if (route->location->next_upstream.has_timeout) {
+            next_timeout_ms = route->location->next_upstream.timeout_ms;
+        }
+        if (route->location->has_proxy_intercept_errors) {
+            intercept_errors = route->location->proxy_intercept_errors;
+        }
+    } else if (route->server != NULL) {
+        if (route->server->next_upstream.has_conditions) {
+            next_conditions = route->server->next_upstream.conditions;
+        }
+        if (route->server->next_upstream.has_tries) {
+            next_tries = route->server->next_upstream.tries;
+        }
+        if (route->server->next_upstream.has_timeout) {
+            next_timeout_ms = route->server->next_upstream.timeout_ms;
+        }
+        if (route->server->has_proxy_intercept_errors) {
+            intercept_errors = route->server->proxy_intercept_errors;
+        }
+    }
+
     apex_proxy_request_t proxy_request = {
         .method = method_text,
         .target = target_text,
@@ -1707,6 +1795,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         .body_len = body_length,
         .keep_alive = connection->close_after_write == 0,
         .use_ssl = (route->group != NULL && route->group->use_ssl),
+        .next_upstream_conditions = next_conditions,
+        .next_upstream_tries = next_tries,
+        .next_upstream_timeout_ms = next_timeout_ms,
     };
     char ssl_sni_buf[128] = {0};
     if (route->location != NULL && route->location->proxy_ssl_name[0] != '\0') {
@@ -1735,9 +1826,36 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         const char *reason = status == 504 ? "Gateway Timeout" : "Bad Gateway";
         char message[160];
         snprintf(message, sizeof(message), "upstream error: %s\n", apex_proxy_strerror(result));
-        router_send_error(connection, server, request, request_length, status, reason, message);
+        if (!router_send_custom_error_page(connection, server, route->location, status, reason, NULL, 0)) {
+            router_send_error(connection, server, request, request_length, status, reason, message);
+        }
         free(target_text);
         return;
+    }
+
+    if (intercept_errors && proxy_response.status >= 300) {
+        const char *title = NULL;
+        const char *desc = NULL;
+        router_error_details(proxy_response.status, NULL, &title, &desc);
+        const char *reason = title ? title : "Error";
+        if (router_send_custom_error_page(connection, server, route->location,
+                                          proxy_response.status, reason,
+                                          extra_headers, extra_headers_len)) {
+            if (res != NULL) {
+                res->last_status = proxy_response.status;
+                res->last_body_bytes = 0;
+                res->last_upstream_status = proxy_response.status;
+                res->last_upstream_time_us = proxy_response.elapsed_us;
+                if (route->group != NULL && proxy_response.server_index < route->group->server_count) {
+                    snprintf(res->last_upstream_addr, sizeof(res->last_upstream_addr), "%s:%u",
+                             route->group->servers[proxy_response.server_index].ip,
+                             (unsigned)route->group->servers[proxy_response.server_index].port);
+                }
+            }
+            apex_proxy_response_free(&proxy_response);
+            free(target_text);
+            return;
+        }
     }
 
     if (res != NULL) {

@@ -97,7 +97,7 @@ class UpstreamPoliciesTest(unittest.TestCase):
         cls.b2_server, cls.b2_port = start_backend("backend-down")
         cls.fail_primary_server, cls.fail_primary_port = start_backend("failover-primary")
         cls.backup_server, cls.backup_port = start_backend("backend-backup")
-        cls.slow_server, cls.slow_port = start_backend("backend-slow", delay=1.0)
+        cls.slow_server, cls.slow_port = start_backend("backend-slow", delay=2.5)
         cls.fast_server, cls.fast_port = start_backend("backend-fast", delay=0)
 
         cls.port = free_port()

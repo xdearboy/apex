@@ -321,6 +321,16 @@ static bool is_http_method(const char *method) {
     return true;
 }
 
+static bool is_idempotent_method(const char *method) {
+    if (method == NULL) return false;
+    return (strcasecmp(method, "GET") == 0 ||
+            strcasecmp(method, "HEAD") == 0 ||
+            strcasecmp(method, "OPTIONS") == 0 ||
+            strcasecmp(method, "TRACE") == 0 ||
+            strcasecmp(method, "PUT") == 0 ||
+            strcasecmp(method, "DELETE") == 0);
+}
+
 static bool is_request_target(const char *target) {
     if (target == NULL || target[0] == '\0') {
         return false;
@@ -1509,10 +1519,20 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         return APEX_PROXY_ERR_TOO_LARGE;
     }
 
+    uint32_t conditions = request->next_upstream_conditions;
+    if (conditions == 0) {
+        conditions = APEX_NEXT_UPSTREAM_DEFAULT;
+    }
+    bool next_disabled = (conditions & APEX_NEXT_UPSTREAM_OFF) != 0;
+
     uint32_t max_retries = group->max_retries;
-    if (group->server_count <= 1) {
+    if (next_disabled) {
         max_retries = 0;
-    } else if (max_retries >= group->server_count) {
+    } else if (request->next_upstream_tries > 0) {
+        max_retries = request->next_upstream_tries > 1 ? request->next_upstream_tries - 1 : 0;
+    } else if (group->server_count <= 1) {
+        max_retries = 0;
+    } else {
         max_retries = (uint32_t)(group->server_count - 1u);
     }
 
@@ -1521,6 +1541,13 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
     uint64_t started_us = monotonic_us();
 
     for (uint32_t attempt = 0; attempt <= max_retries; attempt++) {
+        if (attempt > 0 && request->next_upstream_timeout_ms > 0) {
+            uint64_t elapsed_ms = (monotonic_us() - started_us) / 1000ULL;
+            if (elapsed_ms >= request->next_upstream_timeout_ms) {
+                break;
+            }
+        }
+
         ssize_t selected = apex_upstream_select_request(group, tried_mask, request != NULL ? request->client_ip : NULL);
         if (selected < 0) {
             break;
@@ -1553,7 +1580,10 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                 buffer_free(&wire);
                 last_error = APEX_PROXY_ERR_CONNECT;
-                continue;
+                if (!next_disabled && (conditions & APEX_NEXT_UPSTREAM_ERROR) && attempt < max_retries) {
+                    continue;
+                }
+                return last_error;
             }
             pthread_once(&g_client_ssl_once, init_client_ssl_ctx);
             if (g_client_ssl_ctx == NULL) {
@@ -1594,7 +1624,10 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                 last_error = APEX_PROXY_ERR_CONNECT;
-                continue;
+                if (!next_disabled && (conditions & APEX_NEXT_UPSTREAM_ERROR) && attempt < max_retries) {
+                    continue;
+                }
+                return last_error;
             }
             thread_pool.total_created++;
         } else {
@@ -1609,7 +1642,10 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                     buffer_free(&wire);
                     last_error = APEX_PROXY_ERR_CONNECT;
-                    continue;
+                    if (!next_disabled && (conditions & APEX_NEXT_UPSTREAM_ERROR) && attempt < max_retries) {
+                        continue;
+                    }
+                    return last_error;
                 }
                 thread_pool.total_created++;
             }
@@ -1651,7 +1687,14 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                 last_error = result;
-                continue;
+                bool can_retry = !next_disabled &&
+                                 (conditions & APEX_NEXT_UPSTREAM_ERROR) &&
+                                 (attempt < max_retries) &&
+                                 (is_idempotent_method(request->method) || (conditions & APEX_NEXT_UPSTREAM_NON_IDEMPOTENT));
+                if (can_retry) {
+                    continue;
+                }
+                return result;
             }
         }
         atomic_fetch_add_explicit(&server->bytes_sent, wire.len, memory_order_relaxed);
@@ -1685,19 +1728,70 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             buffer_free(&wire);
             reader_free(&reader);
             apex_proxy_response_free(response);
+            apex_upstream_record_failure(group, (size_t)selected);
             atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
             atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
             last_error = result;
 
-            /* Retry next server if no response bytes were read yet and retries remain */
-            if (reader.position == 0 && attempt < max_retries) {
-                apex_upstream_record_failure(group, (size_t)selected);
+            uint32_t matched_flag = 0;
+            if (result == APEX_PROXY_ERR_TIMEOUT) {
+                matched_flag = APEX_NEXT_UPSTREAM_TIMEOUT;
+            } else if (result == APEX_PROXY_ERR_PROTOCOL) {
+                matched_flag = APEX_NEXT_UPSTREAM_INVALID_HEADER;
+            } else {
+                matched_flag = APEX_NEXT_UPSTREAM_ERROR;
+            }
+
+            bool retry_method_ok = is_idempotent_method(request->method) || (conditions & APEX_NEXT_UPSTREAM_NON_IDEMPOTENT);
+            if (!next_disabled && (conditions & matched_flag) && (attempt < max_retries) && retry_method_ok) {
                 continue;
             }
             return result;
         }
 
-        apex_upstream_record_success(group, (size_t)selected);
+        bool status_matched = false;
+        if (response->status == 500 && (conditions & APEX_NEXT_UPSTREAM_HTTP_500)) status_matched = true;
+        else if (response->status == 502 && (conditions & APEX_NEXT_UPSTREAM_HTTP_502)) status_matched = true;
+        else if (response->status == 503 && (conditions & APEX_NEXT_UPSTREAM_HTTP_503)) status_matched = true;
+        else if (response->status == 504 && (conditions & APEX_NEXT_UPSTREAM_HTTP_504)) status_matched = true;
+        else if (response->status == 403 && (conditions & APEX_NEXT_UPSTREAM_HTTP_403)) status_matched = true;
+        else if (response->status == 404 && (conditions & APEX_NEXT_UPSTREAM_HTTP_404)) status_matched = true;
+        else if (response->status == 429 && (conditions & APEX_NEXT_UPSTREAM_HTTP_429)) status_matched = true;
+
+        bool retry_method_ok = is_idempotent_method(request->method) || (conditions & APEX_NEXT_UPSTREAM_NON_IDEMPOTENT);
+        bool timeout_ok = true;
+        if (request->next_upstream_timeout_ms > 0) {
+            uint64_t elapsed_ms = (monotonic_us() - started_us) / 1000ULL;
+            if (elapsed_ms >= request->next_upstream_timeout_ms) {
+                timeout_ok = false;
+            }
+        }
+
+        if (status_matched && !next_disabled && (attempt < max_retries) && retry_method_ok && timeout_ok) {
+            apex_upstream_record_failure(group, (size_t)selected);
+            atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
+            atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
+            if (ssl != NULL) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                ssl = NULL;
+                close(fd);
+                fd = -1;
+            } else if (fd >= 0) {
+                pool_close(fd);
+                fd = -1;
+            }
+            buffer_free(&wire);
+            reader_free(&reader);
+            apex_proxy_response_free(response);
+            continue;
+        }
+
+        if (response->status >= 500) {
+            apex_upstream_record_failure(group, (size_t)selected);
+        } else {
+            apex_upstream_record_success(group, (size_t)selected);
+        }
         if (response->status == 101) {
             response->upstream_fd = fd;
             size_t unread = reader.len - reader.position;
