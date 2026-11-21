@@ -844,9 +844,6 @@ static int reader_pull(reader_t *reader) {
     if (reader->eof) {
         return 0;
     }
-    if (reader->position > 0) {
-        reader_compact(reader);
-    }
     if (reader->deadline_ms != 0 && monotonic_ms() >= reader->deadline_ms) {
         return APEX_PROXY_ERR_TIMEOUT;
     }
@@ -1217,6 +1214,8 @@ static int read_response(reader_t *reader, const upstream_group_t *group, const 
     response->headers = headers;
     response->headers_len = headers_len;
     response->headers_dynamic = headers_dynamic;
+
+    reader_compact(reader);
 
     bool head_request = strcasecmp(request->method, "HEAD") == 0;
     bool no_body = head_request || status == 204 || status == 304 || status == 101;
