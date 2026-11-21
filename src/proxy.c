@@ -853,7 +853,9 @@ static int reader_pull(reader_t *reader) {
     if (reader->eof) {
         return 0;
     }
-    /* Socket SO_RCVTIMEO kernel timeout handles deadline efficiently */
+    if (reader->deadline_ms != 0 && monotonic_ms() >= reader->deadline_ms) {
+        return APEX_PROXY_ERR_TIMEOUT;
+    }
     if (!reader_reserve(reader, 8192u)) {
         return APEX_PROXY_ERR_TOO_LARGE;
     }
