@@ -823,6 +823,9 @@ static void begin_drain(worker_arg_t *worker) {
         perror("apex: epoll_ctl stop listener");
         atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
     }
+    if (close_fd(&worker->listen_fd) != 0) {
+        atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
+    }
     worker->listen_fd = -1;
     for (int fd = 0; fd <= worker->highest_fd; fd++) {
         conn_t *connection = &worker->connections[fd];
@@ -1115,7 +1118,7 @@ static int create_listener_socket(const listen_endpoint_t *endpoint) {
     return fd;
 }
 
-static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoint, int shared_listen_fd) {
+static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoint) {
     worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (worker->epoll_fd < 0) {
         perror("apex: epoll_create1");
@@ -1124,18 +1127,30 @@ static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoin
     worker->wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (worker->wake_fd < 0) {
         perror("apex: eventfd worker");
+        close_fd(&worker->epoll_fd);
         return -1;
     }
-    worker->listen_fd = shared_listen_fd;
-    struct epoll_event event = {.events = EPOLLIN | EPOLLEXCLUSIVE, .data.fd = worker->listen_fd};
+    worker->listen_fd = create_listener_socket(endpoint);
+    if (worker->listen_fd < 0) {
+        close_fd(&worker->wake_fd);
+        close_fd(&worker->epoll_fd);
+        return -1;
+    }
+    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.fd = worker->listen_fd};
     if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->listen_fd, &event) != 0) {
         perror("apex: epoll_ctl listener");
+        close_fd(&worker->listen_fd);
+        close_fd(&worker->wake_fd);
+        close_fd(&worker->epoll_fd);
         return -1;
     }
     event.events = EPOLLIN;
     event.data.fd = worker->wake_fd;
     if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->wake_fd, &event) != 0) {
         perror("apex: epoll_ctl worker control");
+        close_fd(&worker->listen_fd);
+        close_fd(&worker->wake_fd);
+        close_fd(&worker->epoll_fd);
         return -1;
     }
     worker->connections = mmap(NULL, sizeof(conn_t) * MAX_FDS, PROT_READ | PROT_WRITE,
@@ -1143,6 +1158,9 @@ static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoin
     if (worker->connections == MAP_FAILED) {
         worker->connections = NULL;
         perror("apex: mmap connections");
+        close_fd(&worker->listen_fd);
+        close_fd(&worker->wake_fd);
+        close_fd(&worker->epoll_fd);
         return -1;
     }
     /* Zero-filled mappings use active == 0, so startup need not dirty every
@@ -1222,7 +1240,6 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
 
     int result = 1;
     int signal_fd = -1;
-    int shared_listen_fd = -1;
     size_t worker_count = 0;
     size_t started = 0;
     worker_arg_t *workers = NULL;
@@ -1349,14 +1366,8 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         atomic_init(&workers[index].finished, false);
         workers[index].cpu = (int)available_cpus[index % num_cpus];
     }
-    shared_listen_fd = create_listener_socket(&listener);
-    if (shared_listen_fd < 0) {
-        goto cleanup;
-    }
     for (index = 0; index < worker_count; index++) {
-        if (prepare_worker(&workers[index], &listener, shared_listen_fd) != 0) {
-            close(shared_listen_fd);
-            shared_listen_fd = -1;
+        if (prepare_worker(&workers[index], &listener) != 0) {
             goto cleanup;
         }
     }
@@ -1456,15 +1467,6 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
     }
 
 cleanup:
-    if (shared_listen_fd >= 0) {
-        close(shared_listen_fd);
-        shared_listen_fd = -1;
-        if (workers != NULL) {
-            for (size_t i = 0; i < worker_count; i++) {
-                workers[i].listen_fd = -1;
-            }
-        }
-    }
     atomic_store_explicit(&control.shutdown, WORKERS_STOPPING, memory_order_release);
     if (started > 0 && wake_workers(workers, started) != 0) {
         result = 1;

@@ -27,7 +27,10 @@
 #define H2_MAX_BODY_BYTES (8u * 1024u * 1024u)
 #define H2_MAX_REQUEST_HEADER_BYTES (32u * 1024u)
 #define H2_MAX_RESPONSE_BYTES (16u * 1024u * 1024u)
-#define H2_WINDOW_INCREMENT (256u * 1024u)
+#define H2_INITIAL_WINDOW_SIZE (4u * 1024u * 1024u)
+#define H2_MAX_FRAME_SIZE 16777215u
+#define H2_CONN_WINDOW_INCREMENT (0x7fffffff - 65535)
+#define H2_OUTPUT_BUF_SIZE (256u * 1024u)
 
 typedef struct {
     char *name;
@@ -76,6 +79,14 @@ typedef struct h2_conn {
     conn_t *owner;
     worker_arg_t *worker;
     h2_stream_t *streams;
+
+    /* nghttp2 emits a response's HEADERS and DATA in separate send-callback
+     * invocations. Stage contiguous frames here so TLS writes them together.
+     * A full buffer makes the callback report backpressure; nghttp2 retries
+     * the same frame after h2_flush drains this buffer. */
+    uint8_t output[H2_OUTPUT_BUF_SIZE];
+    size_t output_length;
+    size_t output_offset;
 } h2_conn_t;
 
 static void h2_log(const char *message, int error_code) {
@@ -447,16 +458,35 @@ static void h2_submit_frames(h2_conn_t *h2, h2_stream_t *stream, const nghttp2_n
 
 /* Resolves the materialized h1 response into one contiguous byte range.
  * apex_conn_write keeps small chunks in write_buffer and spills oversized
- * chunks into aux_buffer, and the h1 path sends them back to back, so a
- * split response is concatenated here; otherwise we point into the single
- * non-empty buffer with zero copies. Returns false on allocation failure. */
-static bool h2_response_blob(conn_t *virtual_conn, char **blob, size_t *blob_length, char **owned) {
+ * chunks into aux_buffer, and the h1 path sends them back to back. When
+ * headers fit entirely in write_buffer (ending with CRLFCRLF) and the body is
+ * in aux_buffer, we hand off aux_buffer to separate_body with zero copies;
+ * otherwise split responses are concatenated into a newly allocated buffer.
+ * Returns false on allocation failure. */
+static bool h2_response_blob(conn_t *virtual_conn, char **blob, size_t *blob_length, char **owned,
+                             const char **separate_body, size_t *separate_body_length, char **separate_body_owned) {
     char *first = virtual_conn->write_buffer;
     size_t first_length = virtual_conn->write_length;
     char *second = virtual_conn->aux_buffer;
     size_t second_length = virtual_conn->aux_length;
 
+    *separate_body = NULL;
+    *separate_body_length = 0;
+    *separate_body_owned = NULL;
+
     if (first_length > 0 && second_length > 0) {
+        if (first_length >= 4u && memcmp(first + first_length - 4u, "\r\n\r\n", 4u) == 0) {
+            *blob = first;
+            *blob_length = first_length;
+            *owned = NULL;
+            *separate_body = second;
+            *separate_body_length = second_length;
+            *separate_body_owned = second;
+            virtual_conn->aux_buffer = NULL;
+            virtual_conn->aux_capacity = 0;
+            virtual_conn->aux_length = 0;
+            return true;
+        }
         if (first_length > SIZE_MAX - second_length) {
             return false;
         }
@@ -489,7 +519,11 @@ static void h2_translate_response(h2_conn_t *h2, h2_stream_t *stream) {
     char *blob = NULL;
     char *owned = NULL;
     size_t blob_length = 0;
-    if (!h2_response_blob(virtual_conn, &blob, &blob_length, &owned)) {
+    const char *separate_body = NULL;
+    size_t separate_body_length = 0;
+    char *separate_body_owned = NULL;
+    if (!h2_response_blob(virtual_conn, &blob, &blob_length, &owned,
+                          &separate_body, &separate_body_length, &separate_body_owned)) {
         owned = NULL;
         goto malformed;
     }
@@ -554,9 +588,15 @@ static void h2_translate_response(h2_conn_t *h2, h2_stream_t *stream) {
         cursor = line_end_inner + 2u;
     }
 
-    stream->response_body = body;
-    stream->response_owned = owned;
-    stream->response_body_length = blob_length - (size_t)(body - blob);
+    if (separate_body != NULL) {
+        stream->response_body = separate_body;
+        stream->response_owned = separate_body_owned;
+        stream->response_body_length = separate_body_length;
+    } else {
+        stream->response_body = body;
+        stream->response_owned = owned;
+        stream->response_body_length = blob_length - (size_t)(body - blob);
+    }
     stream->response_offset = 0;
     h2_submit_frames(h2, stream, nva, nva_count);
     return;
@@ -564,6 +604,7 @@ static void h2_translate_response(h2_conn_t *h2, h2_stream_t *stream) {
 malformed:
     {
         free(owned);
+        free(separate_body_owned);
         stream->response_owned = NULL;
         static const char body_text[] = "upstream produced an invalid response\n";
         static const char type_text[] = "text/plain";
@@ -712,14 +753,31 @@ static ssize_t h2_send(nghttp2_session *session, const uint8_t *data, size_t len
     (void)session;
     (void)flags;
     h2_conn_t *h2 = user_data;
-    int written = apex_transport_write(h2->owner, data, length);
-    if (written > 0) {
-        return written;
-    }
-    if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+    if (length > sizeof(h2->output) - h2->output_length) {
         return NGHTTP2_ERR_WOULDBLOCK;
     }
-    return NGHTTP2_ERR_CALLBACK_FAILURE;
+    memcpy(h2->output + h2->output_length, data, length);
+    h2->output_length += length;
+    return (ssize_t)length;
+}
+
+/* Returns 1 once empty, 0 for transport backpressure, and -1 on failure. */
+static int h2_flush_output(h2_conn_t *h2) {
+    while (h2->output_offset < h2->output_length) {
+        int written = apex_transport_write(h2->owner, h2->output + h2->output_offset,
+                                           h2->output_length - h2->output_offset);
+        if (written > 0) {
+            h2->output_offset += (size_t)written;
+            continue;
+        }
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            return 0;
+        }
+        return -1;
+    }
+    h2->output_length = 0;
+    h2->output_offset = 0;
+    return 1;
 }
 
 /* Session lifecycle ----------------------------------------------------------*/
@@ -753,10 +811,11 @@ int h2_connection_create(conn_t *connection, worker_arg_t *worker) {
 
     const nghttp2_settings_entry settings[] = {
         {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, H2_MAX_STREAMS},
-        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, H2_WINDOW_INCREMENT},
+        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, H2_INITIAL_WINDOW_SIZE},
+        {NGHTTP2_SETTINGS_MAX_FRAME_SIZE, H2_MAX_FRAME_SIZE},
     };
-    if (nghttp2_submit_settings(h2->session, NGHTTP2_FLAG_NONE, settings, 2u) != 0 ||
-        nghttp2_submit_window_update(h2->session, NGHTTP2_FLAG_NONE, 0, (int32_t)H2_WINDOW_INCREMENT) != 0) {
+    if (nghttp2_submit_settings(h2->session, NGHTTP2_FLAG_NONE, settings, 3u) != 0 ||
+        nghttp2_submit_window_update(h2->session, NGHTTP2_FLAG_NONE, 0, (int32_t)H2_CONN_WINDOW_INCREMENT) != 0) {
         nghttp2_session_del(h2->session);
         free(h2);
         return -1;
@@ -834,40 +893,53 @@ void h2_flush(worker_arg_t *worker, conn_t *connection) {
     if (h2 == NULL || connection->fd < 0) {
         return;
     }
-    if (nghttp2_session_want_write(h2->session)) {
+
+    for (;;) {
+        int output_result = h2_flush_output(h2);
+        if (output_result < 0) {
+            apex_close_connection(worker, connection);
+            return;
+        }
+        if (output_result == 0) {
+            apex_arm_connection_output(worker, connection);
+            return;
+        }
+        if (!nghttp2_session_want_write(h2->session)) {
+            break;
+        }
         int result = nghttp2_session_send(h2->session);
         if (result < 0 && result != NGHTTP2_ERR_WOULDBLOCK) {
             h2_log("send", result);
             apex_close_connection(worker, connection);
             return;
         }
+        if (result == 0 && h2->output_length == 0) {
+            break;
+        }
     }
     if (connection->fd < 0) {
         return;
     }
-    if (nghttp2_session_want_write(h2->session)) {
-        apex_arm_connection_output(worker, connection);
-    } else {
-        if (connection->epollout_active) {
-            struct epoll_event event_config;
-            event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
-            event_config.data.fd = connection->fd;
-            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
-                perror("apex: epoll_ctl disarm h2 output");
-                apex_close_connection(worker, connection);
-                return;
-            }
-            connection->epollout_active = 0;
-        }
-        if (connection->close_after_write && h2->streams == NULL) {
+    if (connection->epollout_active) {
+        struct epoll_event event_config;
+        event_config.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+        event_config.data.fd = connection->fd;
+        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, connection->fd, &event_config) != 0) {
+            perror("apex: epoll_ctl disarm h2 output");
             apex_close_connection(worker, connection);
             return;
         }
+        connection->epollout_active = 0;
+    }
+    if (connection->close_after_write && h2->streams == NULL) {
+        apex_close_connection(worker, connection);
     }
 }
 
 bool h2_has_pending_output(conn_t *connection) {
-    return connection->h2 != NULL && nghttp2_session_want_write(connection->h2->session);
+    return connection->h2 != NULL &&
+           (connection->h2->output_offset < connection->h2->output_length ||
+            nghttp2_session_want_write(connection->h2->session));
 }
 
 void h2_drain(worker_arg_t *worker, conn_t *connection) {
