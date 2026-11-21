@@ -353,8 +353,31 @@ void apex_static_serve(const apex_server_config_t *server,
         return;
     }
 
+    const char *accept_encoding = NULL;
+    size_t accept_encoding_len = 0;
+    const char *requested_encoding = "id";
+    if (location->precompressed && request != NULL && request_len > 0) {
+        static_find_header(request, request_len, "Accept-Encoding", &accept_encoding, &accept_encoding_len);
+        if (accept_encoding != NULL && accept_encoding_len > 0) {
+            if (memmem(accept_encoding, accept_encoding_len, "br", 2) != NULL) {
+                requested_encoding = "br";
+            } else if (memmem(accept_encoding, accept_encoding_len, "zstd", 4) != NULL) {
+                requested_encoding = "zstd";
+            } else if (memmem(accept_encoding, accept_encoding_len, "gzip", 4) != NULL) {
+                requested_encoding = "gzip";
+            }
+        }
+    }
+
+    char cache_key[APEX_CONFIG_PATH_MAX * 2 + 16];
+    int key_len = snprintf(cache_key, sizeof(cache_key), "%s:%s", file_path, requested_encoding);
+    if (key_len < 0 || (size_t)key_len >= sizeof(cache_key)) {
+        key_len = (int)written;
+        snprintf(cache_key, sizeof(cache_key), "%s", file_path);
+    }
+
     time_t now = time(NULL);
-    uint32_t fast_slot = static_cache_hash(file_path, (size_t)written);
+    uint32_t fast_slot = static_cache_hash(cache_key, (size_t)key_len);
     apex_static_cache_entry_t *cached = &s_thread_cache.entries[fast_slot];
     bool cache_hit = false;
 
@@ -368,7 +391,7 @@ void apex_static_serve(const apex_server_config_t *server,
     size_t total_size = 0;
     char *cached_memory = NULL;
 
-    if (cached->logical_path[0] != '\0' && strcmp(cached->logical_path, file_path) == 0 && now < cached->expires_at) {
+    if (cached->logical_path[0] != '\0' && strcmp(cached->logical_path, cache_key) == 0 && now < cached->expires_at) {
         cache_hit = true;
         total_size = cached->size;
         memcpy(etag_str, cached->etag, sizeof(etag_str));
@@ -516,7 +539,7 @@ void apex_static_serve(const apex_server_config_t *server,
             free(cached->in_memory_data);
             cached->in_memory_data = NULL;
         }
-        snprintf(cached->logical_path, sizeof(cached->logical_path), "%s", file_path);
+        snprintf(cached->logical_path, sizeof(cached->logical_path), "%s", cache_key);
         snprintf(cached->target_path, sizeof(cached->target_path), "%s", target_path);
         cached->expires_at = now + APEX_STATIC_CACHE_TTL;
         cached->mtime = file_stat.st_mtime;
