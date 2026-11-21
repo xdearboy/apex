@@ -1319,7 +1319,8 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         perror("apex: allocate workers");
         goto cleanup;
     }
-    for (size_t index = 0; index < worker_count; index++) {
+    size_t index = 0;
+    for (index = 0; index < worker_count; index++) {
         workers[index].epoll_fd = -1;
         workers[index].listen_fd = -1;
         workers[index].wake_fd = -1;

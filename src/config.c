@@ -4995,7 +4995,7 @@ static bool parse_tokens(parser_t *parser) {
             parser_advance(parser);
             if (token_is_word(val, "auto")) {
                 parser->config->worker_processes = 0;
-            } else if (val->kind == TOKEN_NUMBER) {
+            } else if (val->text != NULL && isdigit((unsigned char)val->text[0])) {
                 char *end = NULL;
                 unsigned long num = strtoul(val->text, &end, 10);
                 if (end == val->text || *end != '\0' || num == 0 || num > 1024) {
