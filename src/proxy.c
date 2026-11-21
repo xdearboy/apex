@@ -795,9 +795,9 @@ static int build_request(buffer_t *wire, const apex_proxy_request_t *request, co
     }
 
     if (!header_block_contains(request->headers, request->headers_len, "Connection")) {
-        const char *connection = (group != NULL && group->keepalive > 0) ? "Connection: keep-alive\r\n"
-                                 : request->keep_alive                   ? "Connection: keep-alive\r\n"
-                                                                         : "Connection: close\r\n";
+        const char *connection = (group != NULL && group->keepalive_capacity > 0) ? "Connection: keep-alive\r\n"
+                                 : request->keep_alive                            ? "Connection: keep-alive\r\n"
+                                                                                  : "Connection: close\r\n";
         if (!buffer_append_string(wire, connection)) {
             return APEX_PROXY_ERR_ALLOC;
         }
