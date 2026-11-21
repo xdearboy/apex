@@ -4986,7 +4986,31 @@ static bool parse_tokens(parser_t *parser) {
             if (!parse_events_block(parser)) {
                 return false;
             }
-        } else if (token_is_word(item, "worker_processes") || token_is_word(item, "pid") ||
+        } else if (token_is_word(item, "worker_processes")) {
+            const token_t *val = parser_peek(parser);
+            if (val->kind == TOKEN_EOF || val->kind == TOKEN_SEMICOLON) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, item, "worker_processes requires a parameter");
+                return false;
+            }
+            parser_advance(parser);
+            if (token_is_word(val, "auto")) {
+                parser->config->worker_processes = 0;
+            } else if (val->kind == TOKEN_NUMBER) {
+                char *end = NULL;
+                unsigned long num = strtoul(val->text, &end, 10);
+                if (end == val->text || *end != '\0' || num == 0 || num > 1024) {
+                    parser_error(parser, APEX_CONFIG_ERR_SYNTAX, val, "invalid worker_processes value (1..1024 or auto)");
+                    return false;
+                }
+                parser->config->worker_processes = (uint32_t)num;
+            } else {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, val, "expected number or 'auto' for worker_processes");
+                return false;
+            }
+            if (!parser_expect_semicolon(parser)) {
+                return false;
+            }
+        } else if (token_is_word(item, "pid") ||
                    token_is_word(item, "error_log") || token_is_word(item, "user") ||
                    token_is_word(item, "worker_rlimit_nofile")) {
             while (parser_peek(parser)->kind != TOKEN_SEMICOLON &&

@@ -1294,10 +1294,25 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         perror("apex: sched_getaffinity");
         goto cleanup;
     }
-    worker_count = (size_t)CPU_COUNT(&cpus);
-    if (worker_count == 0) {
+    size_t available_cpus[CPU_SETSIZE];
+    size_t num_cpus = 0;
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (CPU_ISSET(cpu, &cpus)) {
+            available_cpus[num_cpus++] = (size_t)cpu;
+        }
+    }
+    if (num_cpus == 0) {
         fprintf(stderr, "apex: no available worker CPUs\n");
         goto cleanup;
+    }
+    if (app->generation != NULL && app->generation->config != NULL &&
+        app->generation->config->worker_processes > 0) {
+        worker_count = (size_t)app->generation->config->worker_processes;
+    } else {
+        worker_count = num_cpus;
+    }
+    if (worker_count == 0) {
+        worker_count = 1;
     }
     workers = calloc(worker_count, sizeof(*workers));
     if (workers == NULL) {
@@ -1314,12 +1329,7 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         atomic_init(&workers[index].pending_generation, NULL);
         atomic_init(&workers[index].error, 0);
         atomic_init(&workers[index].finished, false);
-    }
-    size_t index = 0;
-    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
-        if (CPU_ISSET(cpu, &cpus)) {
-            workers[index++].cpu = cpu;
-        }
+        workers[index].cpu = (int)available_cpus[index % num_cpus];
     }
     for (index = 0; index < worker_count; index++) {
         if (prepare_worker(&workers[index], &listener) != 0) {

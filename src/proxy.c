@@ -220,6 +220,9 @@ static void pool_close(int fd) {
 }
 
 static int pool_acquire(const upstream_server_t *server, const upstream_group_t *group) {
+    if (thread_pool.count == 0) {
+        return -1;
+    }
     uint64_t now = monotonic_ms();
     uint64_t idle_limit = group->idle_timeout_ms ? group->idle_timeout_ms : APEX_PROXY_DEFAULT_IDLE_TIMEOUT_MS;
 
@@ -1714,6 +1717,16 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
             pthread_rwlock_unlock(&group->lock);
         }
         return -1;
+    }
+
+    /* Fast path for single-server upstream (avoids loop, candidate arrays, and clock_gettime) */
+    if (__builtin_expect(group->server_count == 1, 1)) {
+        if (!group->servers[0].is_down && (excluded_mask & 1ULL) == 0) {
+            if (locked) {
+                pthread_rwlock_unlock(&group->lock);
+            }
+            return 0;
+        }
     }
 
     size_t primary_candidates[APEX_UPSTREAM_MAX_SERVERS];

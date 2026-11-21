@@ -497,6 +497,7 @@ typedef struct {
 } apex_http_config_t;
 
 typedef struct {
+    uint32_t worker_processes;
     apex_http_config_t http;
     apex_upstream_config_t *upstreams;
     size_t upstream_count;
