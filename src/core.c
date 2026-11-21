@@ -606,25 +606,22 @@ static inline bool request_has_connection_close(const char *headers, size_t len)
     }
     const char *p = headers;
     const char *end = headers + len - 11;
-    while (p < end) {
-        p = memchr(p, 'C', (size_t)(end - p));
-        if (p == NULL) {
-            /* Try lowercase 'c' */
-            p = memchr(headers, 'c', len - 11);
-            if (p == NULL) return false;
-        }
-        if (strncasecmp(p, "connection:", 11) == 0) {
-            size_t offset = (size_t)(p - headers) + 11;
-            const char *val = headers + offset;
-            size_t rem = len - offset;
-            const char *crlf = memchr(val, '\r', rem);
-            size_t line_len = crlf != NULL ? (size_t)(crlf - val) : rem;
-            const char *cl = memchr(val, 'c', line_len);
-            if (cl == NULL) cl = memchr(val, 'C', line_len);
-            if (cl != NULL && (size_t)(line_len - (cl - val)) >= 5 && strncasecmp(cl, "close", 5) == 0) {
-                return true;
+    while (p <= end) {
+        char ch = *p;
+        if (ch == 'C' || ch == 'c') {
+            if (strncasecmp(p, "connection:", 11) == 0) {
+                size_t offset = (size_t)(p - headers) + 11;
+                const char *val = headers + offset;
+                size_t rem = len - offset;
+                const char *crlf = memchr(val, '\r', rem);
+                size_t line_len = crlf != NULL ? (size_t)(crlf - val) : rem;
+                for (size_t i = 0; i + 5 <= line_len; i++) {
+                    if ((val[i] == 'c' || val[i] == 'C') && strncasecmp(val + i, "close", 5) == 0) {
+                        return true;
+                    }
+                }
+                return false;
             }
-            return false;
         }
         p++;
     }
@@ -724,17 +721,15 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
         if (header_length > 18) {
             const char *cl = buffer_cursor;
             const char *cl_end = buffer_cursor + header_length - 15;
-            while (cl < cl_end) {
-                cl = memchr(cl, 'C', (size_t)(cl_end - cl));
-                if (cl == NULL) {
-                    cl = memchr(buffer_cursor, 'c', header_length - 15);
-                    if (cl == NULL) break;
-                }
-                if (strncasecmp(cl, "content-length:", 15) == 0) {
-                    const char *val = cl + 15;
-                    while (*val == ' ' || *val == '\t') val++;
-                    content_length = strtoul(val, NULL, 10);
-                    break;
+            while (cl <= cl_end) {
+                char ch = *cl;
+                if (ch == 'C' || ch == 'c') {
+                    if (strncasecmp(cl, "content-length:", 15) == 0) {
+                        const char *val = cl + 15;
+                        while (*val == ' ' || *val == '\t') val++;
+                        content_length = strtoul(val, NULL, 10);
+                        break;
+                    }
                 }
                 cl++;
             }
