@@ -601,19 +601,34 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
 }
 
 static inline bool request_has_connection_close(const char *headers, size_t len) {
-    const char *conn = memmem(headers, len, "Connection:", 11);
-    if (conn == NULL) {
-        conn = memmem(headers, len, "connection:", 11);
-    }
-    if (conn == NULL) {
+    if (len < 16) {
         return false;
     }
-    size_t offset = (size_t)(conn - headers) + 11;
-    const char *p = headers + offset;
-    size_t rem = len - offset;
-    const char *crlf = memmem(p, rem, "\r\n", 2);
-    size_t line_len = crlf != NULL ? (size_t)(crlf - p) : rem;
-    return memmem(p, line_len, "close", 5) != NULL || memmem(p, line_len, "Close", 5) != NULL;
+    const char *p = headers;
+    const char *end = headers + len - 11;
+    while (p < end) {
+        p = memchr(p, 'C', (size_t)(end - p));
+        if (p == NULL) {
+            /* Try lowercase 'c' */
+            p = memchr(headers, 'c', len - 11);
+            if (p == NULL) return false;
+        }
+        if (strncasecmp(p, "connection:", 11) == 0) {
+            size_t offset = (size_t)(p - headers) + 11;
+            const char *val = headers + offset;
+            size_t rem = len - offset;
+            const char *crlf = memchr(val, '\r', rem);
+            size_t line_len = crlf != NULL ? (size_t)(crlf - val) : rem;
+            const char *cl = memchr(val, 'c', line_len);
+            if (cl == NULL) cl = memchr(val, 'C', line_len);
+            if (cl != NULL && (size_t)(line_len - (cl - val)) >= 5 && strncasecmp(cl, "close", 5) == 0) {
+                return true;
+            }
+            return false;
+        }
+        p++;
+    }
+    return false;
 }
 
 static inline char *find_crlfcrlf(const char *buf, size_t len) {
@@ -656,7 +671,7 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
         ssize_t bytes_received = apex_transport_read(connection);
         if (bytes_received > 0) {
             connection->read_length += (uint32_t)bytes_received;
-            if (memmem(connection->read_buffer, connection->read_length, "\r\n\r\n", 4) != NULL) {
+            if (find_crlfcrlf(connection->read_buffer, connection->read_length) != NULL) {
                 break;
             }
         } else if (bytes_received == 0) {
@@ -705,13 +720,24 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
         size_t header_length = (size_t)((crlf_delimiter + 4) - buffer_cursor);
         size_t content_length = 0;
 
-        char *content_length_header =
-            (char *)memmem(buffer_cursor, header_length, "Content-Length:", 15);
-        if (!content_length_header) {
-            content_length_header = (char *)memmem(buffer_cursor, header_length, "content-length:", 15);
-        }
-        if (content_length_header) {
-            content_length = strtoul(content_length_header + 15, NULL, 10);
+        /* Fast search for Content-Length */
+        if (header_length > 18) {
+            const char *cl = buffer_cursor;
+            const char *cl_end = buffer_cursor + header_length - 15;
+            while (cl < cl_end) {
+                cl = memchr(cl, 'C', (size_t)(cl_end - cl));
+                if (cl == NULL) {
+                    cl = memchr(buffer_cursor, 'c', header_length - 15);
+                    if (cl == NULL) break;
+                }
+                if (strncasecmp(cl, "content-length:", 15) == 0) {
+                    const char *val = cl + 15;
+                    while (*val == ' ' || *val == '\t') val++;
+                    content_length = strtoul(val, NULL, 10);
+                    break;
+                }
+                cl++;
+            }
         }
 
         if (content_length > sizeof(connection->read_buffer) - header_length) {

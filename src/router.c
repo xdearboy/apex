@@ -281,29 +281,40 @@ static void router_generate_hex(char *dst, size_t num_bytes) {
     if (dst == NULL || num_bytes == 0) return;
     uint8_t rand_bytes[32];
     if (num_bytes > sizeof(rand_bytes)) num_bytes = sizeof(rand_bytes);
-    int urandom_fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-    bool got_entropy = false;
-    if (urandom_fd >= 0) {
-        ssize_t n = read(urandom_fd, rand_bytes, num_bytes);
-        close(urandom_fd);
-        if (n == (ssize_t)num_bytes) {
-            got_entropy = true;
+
+    static _Thread_local uint64_t s_rng_state[2];
+    static _Thread_local bool s_rng_inited = false;
+    if (!s_rng_inited) {
+        int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            ssize_t rd = read(fd, s_rng_state, sizeof(s_rng_state));
+            close(fd);
+            if (rd == (ssize_t)sizeof(s_rng_state) && (s_rng_state[0] || s_rng_state[1])) {
+                s_rng_inited = true;
+            }
+        }
+        if (!s_rng_inited) {
+            struct timeval tv;
+            gettimeofday(&tv, NULL);
+            s_rng_state[0] = ((uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec) ^ (uintptr_t)&s_rng_state;
+            s_rng_state[1] = s_rng_state[0] * 6364136223846793005ULL + 1442695040888963407ULL;
+            s_rng_inited = true;
         }
     }
 
-    if (!got_entropy) {
-        static _Thread_local uint64_t seed = 0;
-        static _Thread_local bool seeded = false;
-        if (!seeded) {
-            struct timeval tv;
-            gettimeofday(&tv, NULL);
-            seed = ((uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec) ^ (uintptr_t)&seed;
-            seeded = true;
-        }
-        for (size_t i = 0; i < num_bytes; i++) {
-            seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
-            rand_bytes[i] = (uint8_t)(seed >> 32);
-        }
+    /* Fast xoroshiro128+ PRNG */
+    size_t generated = 0;
+    while (generated < num_bytes) {
+        uint64_t s0 = s_rng_state[0];
+        uint64_t s1 = s_rng_state[1];
+        uint64_t result = s0 + s1;
+        s1 ^= s0;
+        s_rng_state[0] = ((s0 << 55) | (s0 >> 9)) ^ s1 ^ (s1 << 14);
+        s_rng_state[1] = (s1 << 36) | (s1 >> 28);
+
+        size_t chunk = (num_bytes - generated < sizeof(result)) ? (num_bytes - generated) : sizeof(result);
+        memcpy(rand_bytes + generated, &result, chunk);
+        generated += chunk;
     }
 
     static const char hex_chars[] = "0123456789abcdef";
@@ -3787,7 +3798,7 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
         char client_ip[INET6_ADDRSTRLEN];
         snprintf(client_ip, sizeof(client_ip), "%s", peer_ip);
 
-        router_generate_request_id(s_current_request_id, sizeof(s_current_request_id));
+        s_current_request_id[0] = '\0';
 
         apex_pipeline_ctx_t ctx = {
             .method = req_buf,
@@ -3810,7 +3821,6 @@ void apex_dispatch_runtime(apex_app_t *app, const apex_runtime_t *runtime, const
             .request_id = {0},
             .module_data = {0},
         };
-        memcpy(ctx.request_id, s_current_request_id, sizeof(ctx.request_id));
 
         /* Phase 1: PRE_ROUTING */
         apex_action_t action = apex_pipeline_run_phase(&ctx, APEX_PHASE_PRE_ROUTING);

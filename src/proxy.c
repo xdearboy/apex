@@ -76,6 +76,8 @@ typedef struct {
  */
 static _Thread_local thread_pool_t thread_pool;
 static _Thread_local uint64_t random_state;
+static _Thread_local buffer_t tl_wire = {0};
+static _Thread_local reader_t tl_reader = {0};
 
 static uint64_t monotonic_ms(void) {
     struct timespec timestamp;
@@ -159,10 +161,12 @@ static bool buffer_append_string(buffer_t *buffer, const char *text) {
 }
 
 static void buffer_free(buffer_t *buffer) {
-    free(buffer->data);
-    buffer->data = NULL;
+    if (buffer->capacity > 65536u) {
+        free(buffer->data);
+        buffer->data = NULL;
+        buffer->capacity = 0;
+    }
     buffer->len = 0;
-    buffer->capacity = 0;
 }
 
 static bool address_equal(const struct sockaddr_storage *left, socklen_t left_len,
@@ -865,11 +869,16 @@ static void reader_compact(reader_t *reader) {
 }
 
 static void reader_free(reader_t *reader) {
-    free(reader->data);
-    reader->data = NULL;
+    if (reader->capacity > 65536u) {
+        free(reader->data);
+        reader->data = NULL;
+        reader->capacity = 0;
+    }
     reader->len = 0;
-    reader->capacity = 0;
     reader->position = 0;
+    reader->eof = false;
+    reader->fd = -1;
+    reader->ssl = NULL;
 }
 
 static int reader_read_headers(reader_t *reader, size_t max_header, char **headers, size_t *headers_len) {
@@ -1904,10 +1913,12 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         atomic_fetch_add_explicit(&server->active_conns, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&server->total_requests, 1, memory_order_relaxed);
 
-        buffer_t wire = {0};
-        reader_t reader = {0};
+        tl_wire.len = 0;
+        reader_free(&tl_reader);
+        buffer_t *wire = &tl_wire;
+        reader_t *reader = &tl_reader;
         int fd = -1;
-        int result = build_request(&wire, request, server);
+        int result = build_request(wire, request, server);
         if (result != APEX_PROXY_OK) {
             atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
             return result;
@@ -1924,7 +1935,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 apex_upstream_record_failure(group, (size_t)selected);
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
-                buffer_free(&wire);
+                buffer_free(wire);
                 last_error = APEX_PROXY_ERR_CONNECT;
                 if (!next_disabled && (conditions & APEX_NEXT_UPSTREAM_ERROR) && attempt < max_retries) {
                     continue;
@@ -1934,14 +1945,14 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             pthread_once(&g_client_ssl_once, init_client_ssl_ctx);
             if (g_client_ssl_ctx == NULL) {
                 close(fd);
-                buffer_free(&wire);
+                buffer_free(wire);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                 return APEX_PROXY_ERR_CONNECT;
             }
             ssl = SSL_new(g_client_ssl_ctx);
             if (ssl == NULL) {
                 close(fd);
-                buffer_free(&wire);
+                buffer_free(wire);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
                 return APEX_PROXY_ERR_CONNECT;
             }
@@ -1965,7 +1976,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             if (SSL_connect(ssl) <= 0) {
                 SSL_free(ssl);
                 close(fd);
-                buffer_free(&wire);
+                buffer_free(wire);
                 apex_upstream_record_failure(group, (size_t)selected);
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
@@ -1986,7 +1997,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     apex_upstream_record_failure(group, (size_t)selected);
                     atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                     atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
-                    buffer_free(&wire);
+                    buffer_free(wire);
                     last_error = APEX_PROXY_ERR_CONNECT;
                     if (!next_disabled && (conditions & APEX_NEXT_UPSTREAM_ERROR) && attempt < max_retries) {
                         continue;
@@ -1998,7 +2009,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             }
         }
 
-        result = send_all(fd, ssl, wire.data, wire.len);
+        result = send_all(fd, ssl, wire->data, wire->len);
         if (result != APEX_PROXY_OK) {
             if (ssl != NULL) {
                 SSL_shutdown(ssl);
@@ -2016,7 +2027,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     if (fd >= 0) {
                         thread_pool.total_created++;
                         apply_io_timeouts(fd, group);
-                        result = send_all(fd, NULL, wire.data, wire.len);
+                        result = send_all(fd, NULL, wire->data, wire->len);
                     } else {
                         result = APEX_PROXY_ERR_CONNECT;
                     }
@@ -2027,7 +2038,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     pool_close(fd);
                     fd = -1;
                 }
-                buffer_free(&wire);
+                buffer_free(wire);
                 apex_upstream_record_failure(group, (size_t)selected);
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
                 atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
@@ -2042,7 +2053,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 return result;
             }
         }
-        atomic_fetch_add_explicit(&server->bytes_sent, wire.len, memory_order_relaxed);
+        atomic_fetch_add_explicit(&server->bytes_sent, wire->len, memory_order_relaxed);
 
         uint64_t limit64 = (uint64_t)(group->max_header_bytes ? group->max_header_bytes
                                                              : APEX_PROXY_DEFAULT_MAX_HEADER_BYTES) +
@@ -2053,12 +2064,12 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         if (io_timeout > 3600000u) {
             io_timeout = 3600000u;
         }
-        reader.fd = fd;
-        reader.ssl = ssl;
-        reader.limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
-        reader.deadline_ms = monotonic_ms() + io_timeout;
+        reader->fd = fd;
+        reader->ssl = ssl;
+        reader->limit = limit64 > (uint64_t)SIZE_MAX ? SIZE_MAX : (size_t)limit64;
+        reader->deadline_ms = monotonic_ms() + io_timeout;
 
-        result = read_response(&reader, group, request, response);
+        result = read_response(reader, group, request, response);
         if (result != APEX_PROXY_OK) {
             if (ssl != NULL) {
                 SSL_shutdown(ssl);
@@ -2070,8 +2081,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 pool_close(fd);
                 fd = -1;
             }
-            buffer_free(&wire);
-            reader_free(&reader);
+            buffer_free(wire);
+            reader_free(reader);
             apex_proxy_response_free(response);
             apex_upstream_record_failure(group, (size_t)selected);
             atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
@@ -2126,8 +2137,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 pool_close(fd);
                 fd = -1;
             }
-            buffer_free(&wire);
-            reader_free(&reader);
+            buffer_free(wire);
+            reader_free(reader);
             apex_proxy_response_free(response);
             continue;
         }
@@ -2139,18 +2150,18 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         }
         if (response->status == 101) {
             response->upstream_fd = fd;
-            size_t unread = reader.len - reader.position;
+            size_t unread = reader->len - reader->position;
             if (unread > 0) {
                 response->leftover_data = malloc(unread);
                 if (response->leftover_data != NULL) {
-                    memcpy(response->leftover_data, reader.data + reader.position, unread);
+                    memcpy(response->leftover_data, reader->data + reader->position, unread);
                     response->leftover_len = unread;
                 }
             }
             fd = -1;
         }
 
-        bool reusable = !is_ssl && response->keep_alive && request->keep_alive && reader.len == reader.position && !reader.eof;
+        bool reusable = !is_ssl && response->keep_alive && request->keep_alive && reader->len == reader->position && !reader->eof;
         response->keep_alive = reusable;
         response->server_index = (size_t)selected;
         response->elapsed_us = monotonic_us() - started_us;
@@ -2168,8 +2179,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             pool_close(fd);
             fd = -1;
         }
-        buffer_free(&wire);
-        reader_free(&reader);
+        buffer_free(wire);
+        reader_free(reader);
 
         atomic_fetch_add_explicit(&server->bytes_received, response->headers_len + response->body_len,
                                   memory_order_relaxed);
