@@ -834,47 +834,31 @@ static bool build_request_headers(const char *request, size_t request_length,
     }
 
     /* Standard Proxy Headers (if not overridden in location) */
+    char std_hdrs[512];
+    int std_len = 0;
     if (!router_location_has_header(location, "X-Real-IP")) {
-        if (!router_buffer_append_string(buffer, "X-Real-IP: ") ||
-            !router_buffer_append_string(buffer, client_ip) ||
-            !router_buffer_append_string(buffer, "\r\n")) {
-            buffer->length = 0;
-            return false;
-        }
+        std_len += snprintf(std_hdrs + std_len, sizeof(std_hdrs) - (size_t)std_len,
+                            "X-Real-IP: %s\r\n", client_ip);
     }
-
     if (!router_location_has_header(location, "X-Forwarded-For")) {
-        if (!router_buffer_append_string(buffer, "X-Forwarded-For: ")) {
-            buffer->length = 0;
-            return false;
-        }
         if (existing_xff != NULL && existing_xff_len > 0) {
-            if (!router_buffer_append(buffer, existing_xff, existing_xff_len) ||
-                !router_buffer_append_string(buffer, ", ")) {
-                buffer->length = 0;
-                return false;
-            }
-        }
-        if (!router_buffer_append_string(buffer, client_ip) ||
-            !router_buffer_append_string(buffer, "\r\n")) {
-            buffer->length = 0;
-            return false;
+            std_len += snprintf(std_hdrs + std_len, sizeof(std_hdrs) - (size_t)std_len,
+                                "X-Forwarded-For: %.*s, %s\r\n", (int)existing_xff_len, existing_xff, client_ip);
+        } else {
+            std_len += snprintf(std_hdrs + std_len, sizeof(std_hdrs) - (size_t)std_len,
+                                "X-Forwarded-For: %s\r\n", client_ip);
         }
     }
-
     if (!router_location_has_header(location, "X-Forwarded-Proto")) {
-        if (!router_buffer_append_string(buffer, "X-Forwarded-Proto: ") ||
-            !router_buffer_append_string(buffer, scheme) ||
-            !router_buffer_append_string(buffer, "\r\n")) {
-            buffer->length = 0;
-            return false;
-        }
+        std_len += snprintf(std_hdrs + std_len, sizeof(std_hdrs) - (size_t)std_len,
+                            "X-Forwarded-Proto: %s\r\n", scheme);
     }
-
     if (host_val[0] != '\0' && !router_location_has_header(location, "X-Forwarded-Host")) {
-        if (!router_buffer_append_string(buffer, "X-Forwarded-Host: ") ||
-            !router_buffer_append_string(buffer, host_val) ||
-            !router_buffer_append_string(buffer, "\r\n")) {
+        std_len += snprintf(std_hdrs + std_len, sizeof(std_hdrs) - (size_t)std_len,
+                            "X-Forwarded-Host: %s\r\n", host_val);
+    }
+    if (std_len > 0 && (size_t)std_len < sizeof(std_hdrs)) {
+        if (!router_buffer_append(buffer, std_hdrs, (size_t)std_len)) {
             buffer->length = 0;
             return false;
         }
@@ -1917,6 +1901,15 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
     }
     HDR_APPEND("\r\n", 2u);
 
+    bool body_merged = false;
+    if (!hdr_overflow && !head_request && !no_body && body_to_send != NULL && body_len_to_send > 0) {
+        if (resp_hdr_len + body_len_to_send <= sizeof(resp_hdr_buf)) {
+            memcpy(resp_hdr_buf + resp_hdr_len, body_to_send, body_len_to_send);
+            resp_hdr_len += body_len_to_send;
+            body_merged = true;
+        }
+    }
+
     if (!hdr_overflow) {
         apex_conn_write(connection, resp_hdr_buf, resp_hdr_len);
     } else {
@@ -2007,7 +2000,7 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
 #undef HDR_APPEND
 #undef HDR_APPEND_STR
 
-    if (!head_request && !no_body && body_to_send != NULL && body_len_to_send > 0) {
+    if (!body_merged && !head_request && !no_body && body_to_send != NULL && body_len_to_send > 0) {
         apex_conn_write(connection, body_to_send, body_len_to_send);
     }
 

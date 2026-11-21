@@ -736,8 +736,17 @@ static int send_all(int fd, SSL *ssl, const void *data, size_t len) {
 }
 
 static int build_request(buffer_t *wire, const apex_proxy_request_t *request, const upstream_server_t *server) {
-    if (!buffer_append_string(wire, request->method) || !buffer_append_string(wire, " ") ||
-        !buffer_append_string(wire, request->target) || !buffer_append_string(wire, " HTTP/1.1\r\n")) {
+    size_t method_len = strlen(request->method);
+    size_t target_len = strlen(request->target);
+    size_t est_len = method_len + target_len + 12u + request->headers_len + 256u + request->body_len;
+    if (!buffer_reserve(wire, est_len)) {
+        return APEX_PROXY_ERR_ALLOC;
+    }
+
+    if (!buffer_append(wire, request->method, method_len) ||
+        !buffer_append(wire, " ", 1u) ||
+        !buffer_append(wire, request->target, target_len) ||
+        !buffer_append(wire, " HTTP/1.1\r\n", 11u)) {
         return APEX_PROXY_ERR_ALLOC;
     }
 
