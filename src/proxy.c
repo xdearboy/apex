@@ -191,21 +191,6 @@ static bool address_equal(const struct sockaddr_storage *left, socklen_t left_le
     return memcmp(left, right, left_len) == 0;
 }
 
-static bool connection_is_reusable(int fd) {
-    unsigned char probe = 0;
-    ssize_t peeked = recv(fd, &probe, 1, MSG_PEEK | MSG_DONTWAIT);
-    if (peeked == 0) {
-        return false;
-    }
-    if (peeked > 0) {
-        return false;
-    }
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        return true;
-    }
-    return false;
-}
-
 static void pool_close(int fd) {
     close(fd);
     thread_pool.total_closed++;
@@ -215,21 +200,36 @@ static int pool_acquire(const upstream_server_t *server, const upstream_group_t 
     uint64_t now = monotonic_ms();
     uint64_t idle_limit = group->idle_timeout_ms ? group->idle_timeout_ms : APEX_PROXY_DEFAULT_IDLE_TIMEOUT_MS;
 
-    size_t index = 0;
-    while (index < thread_pool.count) {
-        pooled_conn_t *entry = &thread_pool.entries[index];
+    /* Scan backwards (LIFO) for best cache and socket locality */
+    while (thread_pool.count > 0) {
+        size_t last_idx = thread_pool.count - 1u;
+        pooled_conn_t *entry = &thread_pool.entries[last_idx];
         if (!address_equal(&entry->address, entry->address_len, &server->address, server->address_len)) {
-            index++;
-            continue;
+            /* Look deeper in the pool */
+            bool found = false;
+            for (size_t i = last_idx; i > 0; i--) {
+                size_t check_idx = i - 1u;
+                pooled_conn_t *cand = &thread_pool.entries[check_idx];
+                if (address_equal(&cand->address, cand->address_len, &server->address, server->address_len)) {
+                    /* Swap candidate to top and break */
+                    pooled_conn_t tmp = *cand;
+                    *cand = thread_pool.entries[last_idx];
+                    thread_pool.entries[last_idx] = tmp;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                break;
+            }
         }
 
-        bool expired = now > entry->last_used_ms && now - entry->last_used_ms > idle_limit;
+        /* Found matching entry at last_idx */
+        bool expired = now > entry->last_used_ms && (now - entry->last_used_ms) > idle_limit;
         int fd = entry->fd;
-
-        thread_pool.entries[index] = thread_pool.entries[thread_pool.count - 1u];
         thread_pool.count--;
 
-        if (expired || !connection_is_reusable(fd)) {
+        if (expired) {
             pool_close(fd);
             continue;
         }
