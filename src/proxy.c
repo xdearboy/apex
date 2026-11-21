@@ -838,6 +838,8 @@ static bool reader_reserve(reader_t *reader, size_t extra) {
     return true;
 }
 
+static void reader_compact(reader_t *reader);
+
 static int reader_pull(reader_t *reader) {
     if (reader->eof) {
         return 0;
