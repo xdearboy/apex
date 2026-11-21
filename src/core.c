@@ -823,9 +823,7 @@ static void begin_drain(worker_arg_t *worker) {
         perror("apex: epoll_ctl stop listener");
         atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
     }
-    if (close_fd(&worker->listen_fd) != 0) {
-        atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
-    }
+    worker->listen_fd = -1;
     for (int fd = 0; fd <= worker->highest_fd; fd++) {
         conn_t *connection = &worker->connections[fd];
         if (connection->active) {
@@ -1079,7 +1077,45 @@ static int resolve_listener(listen_endpoint_t *endpoint) {
     return 0;
 }
 
-static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoint) {
+static int create_listener_socket(const listen_endpoint_t *endpoint) {
+    int fd = socket(endpoint->address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        perror("apex: socket listener");
+        return -1;
+    }
+    const int enabled = 1;
+    const int idle_seconds = 15;
+    const int interval_seconds = 5;
+    const int probe_count = 3;
+    const unsigned int user_timeout_ms = 15000;
+    if (setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0 ||
+        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) != 0 ||
+        (endpoint->address.ss_family == AF_INET6 &&
+         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0)) {
+        perror("apex: configure listener socket");
+        close(fd);
+        return -1;
+    }
+    if (bind(fd, (const struct sockaddr *)&endpoint->address, endpoint->address_length) != 0) {
+        perror("apex: bind");
+        close(fd);
+        return -1;
+    }
+    if (listen(fd, 65535) != 0) {
+        perror("apex: listen");
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoint, int shared_listen_fd) {
     worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (worker->epoll_fd < 0) {
         perror("apex: epoll_create1");
@@ -1090,39 +1126,8 @@ static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoin
         perror("apex: eventfd worker");
         return -1;
     }
-    worker->listen_fd = socket(endpoint->address.ss_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (worker->listen_fd < 0) {
-        perror("apex: socket listener");
-        return -1;
-    }
-    const int enabled = 1;
-    const int idle_seconds = 15;
-    const int interval_seconds = 5;
-    const int probe_count = 3;
-    const unsigned int user_timeout_ms = 15000;
-    /* TCP options set on the listening socket are inherited by accepted sockets on Linux */
-    if (setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(worker->listen_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
-        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds)) != 0 ||
-        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0 ||
-        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) != 0 ||
-        (endpoint->address.ss_family == AF_INET6 &&
-         setsockopt(worker->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0)) {
-        perror("apex: configure listener socket");
-        return -1;
-    }
-    if (bind(worker->listen_fd, (const struct sockaddr *)&endpoint->address, endpoint->address_length) != 0) {
-        perror("apex: bind");
-        return -1;
-    }
-    if (listen(worker->listen_fd, 65535) != 0) {
-        perror("apex: listen");
-        return -1;
-    }
-    struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.fd = worker->listen_fd};
+    worker->listen_fd = shared_listen_fd;
+    struct epoll_event event = {.events = EPOLLIN | EPOLLEXCLUSIVE, .data.fd = worker->listen_fd};
     if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, worker->listen_fd, &event) != 0) {
         perror("apex: epoll_ctl listener");
         return -1;
@@ -1217,6 +1222,7 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
 
     int result = 1;
     int signal_fd = -1;
+    int shared_listen_fd = -1;
     size_t worker_count = 0;
     size_t started = 0;
     worker_arg_t *workers = NULL;
@@ -1331,9 +1337,14 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         atomic_init(&workers[index].error, 0);
         atomic_init(&workers[index].finished, false);
         workers[index].cpu = (int)available_cpus[index % num_cpus];
+    shared_listen_fd = create_listener_socket(&listener);
+    if (shared_listen_fd < 0) {
+        goto cleanup;
     }
     for (index = 0; index < worker_count; index++) {
-        if (prepare_worker(&workers[index], &listener) != 0) {
+        if (prepare_worker(&workers[index], &listener, shared_listen_fd) != 0) {
+            close(shared_listen_fd);
+            shared_listen_fd = -1;
             goto cleanup;
         }
     }
@@ -1433,6 +1444,15 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
     }
 
 cleanup:
+    if (shared_listen_fd >= 0) {
+        close(shared_listen_fd);
+        shared_listen_fd = -1;
+        if (workers != NULL) {
+            for (size_t i = 0; i < worker_count; i++) {
+                workers[i].listen_fd = -1;
+            }
+        }
+    }
     atomic_store_explicit(&control.shutdown, WORKERS_STOPPING, memory_order_release);
     if (started > 0 && wake_workers(workers, started) != 0) {
         result = 1;

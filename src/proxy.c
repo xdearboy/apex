@@ -83,9 +83,15 @@ static _Thread_local char tl_resp_body[65536];
 
 static uint64_t monotonic_ms(void) {
     struct timespec timestamp;
+#if defined(CLOCK_MONOTONIC_COARSE)
+    if (clock_gettime(CLOCK_MONOTONIC_COARSE, &timestamp) != 0) {
+        return 0;
+    }
+#else
     if (clock_gettime(CLOCK_MONOTONIC, &timestamp) != 0) {
         return 0;
     }
+#endif
     return (uint64_t)timestamp.tv_sec * 1000u + (uint64_t)timestamp.tv_nsec / 1000000u;
 }
 
@@ -629,6 +635,9 @@ static void configure_socket(int fd) {
     int enabled = 1;
     (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
     (void)setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
+#ifdef TCP_QUICKACK
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled));
+#endif
 #ifdef SO_NOSIGPIPE
     (void)setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
 #endif
@@ -844,9 +853,7 @@ static int reader_pull(reader_t *reader) {
     if (reader->eof) {
         return 0;
     }
-    if (reader->deadline_ms != 0 && monotonic_ms() >= reader->deadline_ms) {
-        return APEX_PROXY_ERR_TIMEOUT;
-    }
+    /* Socket SO_RCVTIMEO kernel timeout handles deadline efficiently */
     if (!reader_reserve(reader, 8192u)) {
         return APEX_PROXY_ERR_TOO_LARGE;
     }
