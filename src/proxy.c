@@ -607,7 +607,7 @@ static bool parse_hex_u64(const char *text, size_t text_len, uint64_t *value) {
 }
 
 static void apply_io_timeouts(int fd, const upstream_group_t *group) {
-    uint64_t milliseconds = group->io_timeout_ms ? group->io_timeout_ms : APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
+    uint64_t milliseconds = (group != NULL && group->io_timeout_ms) ? group->io_timeout_ms : APEX_PROXY_DEFAULT_IO_TIMEOUT_MS;
     if (milliseconds > 3600000u) {
         milliseconds = 3600000u;
     }
@@ -2262,7 +2262,7 @@ static size_t prober_group_count = 0;
 
 static void probe_single_server(upstream_group_t *group, upstream_server_t *server) {
     uint64_t timeout_ms = group->health_check_timeout_ms ? group->health_check_timeout_ms : 2000u;
-    int fd = connect_server(server, timeout_ms);
+    int fd = connect_server(server, group, timeout_ms);
     if (fd < 0) {
         atomic_store_explicit(&server->consecutive_successes, 0, memory_order_relaxed);
         uint32_t fails = atomic_fetch_add_explicit(&server->consecutive_failures, 1, memory_order_relaxed) + 1u;
