@@ -34,7 +34,7 @@
 
 #define MAX_FDS 65536
 #define MAX_EVENTS 512
-#define BUF_SIZE 4096
+#define BUF_SIZE 16384
 #define MAX_ROUTES 128
 
 typedef enum { APEX_TRANSPORT_PLAIN, APEX_TRANSPORT_TLS } transport_kind_t;
@@ -60,6 +60,7 @@ typedef struct conn {
     char *aux_buffer;
     size_t aux_length;
     size_t aux_offset;
+    size_t aux_capacity;
     int sendfile_fd;
     off_t sendfile_offset;
     size_t sendfile_remain;

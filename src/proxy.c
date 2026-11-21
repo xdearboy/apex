@@ -1205,6 +1205,7 @@ void apex_upstream_group_init(upstream_group_t *group) {
     snprintf(group->health_check_uri, sizeof(group->health_check_uri), "/");
     atomic_init(&group->round_robin_cursor, 0u);
     pthread_rwlock_init(&group->lock, NULL);
+    atomic_init(&group->write_in_progress, 0u);
 }
 
 #define APEX_DNS_CACHE_MAX_ENTRIES 256
@@ -1538,9 +1539,11 @@ int apex_upstream_add_server_resolver(upstream_group_t *group, const char *host,
         }
     }
 
+    atomic_store_explicit(&group->write_in_progress, 1, memory_order_release);
     pthread_rwlock_wrlock(&group->lock);
     if (group->server_count >= APEX_UPSTREAM_MAX_SERVERS) {
         pthread_rwlock_unlock(&group->lock);
+        atomic_store_explicit(&group->write_in_progress, 0, memory_order_release);
         return -1;
     }
     upstream_server_t *server = &group->servers[group->server_count];
@@ -1569,6 +1572,7 @@ int apex_upstream_add_server_resolver(upstream_group_t *group, const char *host,
     size_t index = group->server_count;
     group->server_count++;
     pthread_rwlock_unlock(&group->lock);
+    atomic_store_explicit(&group->write_in_progress, 0, memory_order_release);
     return (int)index;
 }
 
@@ -1637,9 +1641,15 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         return -1;
     }
 
-    pthread_rwlock_rdlock(&group->lock);
+    bool locked = false;
+    if (__builtin_expect(atomic_load_explicit(&group->write_in_progress, memory_order_acquire) != 0, 0)) {
+        pthread_rwlock_rdlock(&group->lock);
+        locked = true;
+    }
     if (group->server_count == 0) {
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return -1;
     }
 
@@ -1687,12 +1697,16 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
     }
 
     if (candidate_count == 0) {
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return -1;
     }
     if (candidate_count == 1) {
         ssize_t res = (ssize_t)candidates[0];
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return res;
     }
 
@@ -1709,7 +1723,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
                 best = i;
             }
         }
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return (ssize_t)best;
     }
 
@@ -1724,7 +1740,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
             hash = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
         }
         ssize_t res = (ssize_t)candidates[hash % candidate_count];
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return res;
     }
 
@@ -1747,7 +1765,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         } else {
             res = (ssize_t)(thread_random() & 1u ? first : second);
         }
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return res;
     }
 
@@ -1761,7 +1781,9 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
     uint32_t cursor = atomic_fetch_add_explicit(&group->round_robin_cursor, 1u, memory_order_relaxed);
     if (total_weight == 0) {
         ssize_t res = (ssize_t)candidates[cursor % candidate_count];
-        pthread_rwlock_unlock(&group->lock);
+        if (locked) {
+            pthread_rwlock_unlock(&group->lock);
+        }
         return res;
     }
 
@@ -1771,13 +1793,17 @@ ssize_t apex_upstream_select_request(upstream_group_t *group, uint64_t excluded_
         size_t i = candidates[idx];
         accumulated += group->servers[i].weight ? group->servers[i].weight : 1u;
         if (slot < accumulated) {
-            pthread_rwlock_unlock(&group->lock);
+            if (locked) {
+                pthread_rwlock_unlock(&group->lock);
+            }
             return (ssize_t)i;
         }
     }
 
     ssize_t res = (ssize_t)candidates[candidate_count - 1u];
-    pthread_rwlock_unlock(&group->lock);
+    if (locked) {
+        pthread_rwlock_unlock(&group->lock);
+    }
     return res;
 }
 
@@ -1968,9 +1994,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     return last_error;
                 }
                 thread_pool.total_created++;
+                apply_io_timeouts(fd, group);
             }
-
-            apply_io_timeouts(fd, group);
         }
 
         result = send_all(fd, ssl, wire.data, wire.len);

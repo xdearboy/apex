@@ -83,6 +83,7 @@ const char *apex_mime_type(const char *path) {
 #define APEX_STATIC_CACHE_TTL 10 /* seconds */
 
 typedef struct {
+    char logical_path[APEX_CONFIG_PATH_MAX * 2];
     char target_path[APEX_CONFIG_PATH_MAX * 2];
     time_t expires_at;
     time_t mtime;
@@ -93,6 +94,10 @@ typedef struct {
     const char *content_encoding;
     char *in_memory_data;
     size_t in_memory_len;
+    char header_keepalive[512];
+    size_t header_keepalive_len;
+    char header_close[512];
+    size_t header_close_len;
 } apex_static_cache_entry_t;
 
 typedef struct {
@@ -116,8 +121,11 @@ void apex_static_cache_flush(void) {
             free(s_thread_cache.entries[i].in_memory_data);
             s_thread_cache.entries[i].in_memory_data = NULL;
         }
+        s_thread_cache.entries[i].logical_path[0] = '\0';
         s_thread_cache.entries[i].target_path[0] = '\0';
         s_thread_cache.entries[i].expires_at = 0;
+        s_thread_cache.entries[i].header_keepalive_len = 0;
+        s_thread_cache.entries[i].header_close_len = 0;
     }
 }
 
@@ -345,154 +353,161 @@ void apex_static_serve(const apex_server_config_t *server,
         return;
     }
 
+    time_t now = time(NULL);
+    uint32_t fast_slot = static_cache_hash(file_path, (size_t)written);
+    apex_static_cache_entry_t *cached = &s_thread_cache.entries[fast_slot];
+    bool cache_hit = false;
+
     struct stat file_stat;
-    bool found_candidate = false;
-
-    if (stat(file_path, &file_stat) == 0) {
-        found_candidate = true;
-    }
-
-    /* If try_files is configured and primary target not found, probe candidates */
-    if (!found_candidate && location->try_files_count > 0) {
-        for (size_t index = 0; index < location->try_files_count; index++) {
-            const char *pattern = location->try_files[index];
-            char candidate_path[APEX_CONFIG_PATH_MAX * 2];
-
-            if (strcmp(pattern, "$uri") == 0) {
-                snprintf(candidate_path, sizeof(candidate_path), "%s", file_path);
-            } else if (strcmp(pattern, "$uri/") == 0) {
-                snprintf(candidate_path, sizeof(candidate_path), "%s/", file_path);
-            } else if (pattern[0] == '/') {
-                snprintf(candidate_path, sizeof(candidate_path), "%s%s", location->root, pattern);
-            } else {
-                snprintf(candidate_path, sizeof(candidate_path), "%s/%s", location->root, pattern);
-            }
-
-            if (stat(candidate_path, &file_stat) == 0) {
-                snprintf(file_path, sizeof(file_path), "%s", candidate_path);
-                found_candidate = true;
-                break;
-            }
-        }
-    }
-
-    if (!found_candidate) {
-        router_send_error(connection, server, request, request_len, 404, "Not Found", "File Not Found\n");
-        return;
-    }
-
-    /* Handle directory index resolution */
-    if (S_ISDIR(file_stat.st_mode)) {
-        bool resolved_index = false;
-        size_t current_len = strlen(file_path);
-
-        if (location->index_count > 0) {
-            for (size_t i = 0; i < location->index_count; i++) {
-                char candidate_index[APEX_CONFIG_PATH_MAX * 2];
-                if (file_path[current_len - 1] == '/') {
-                    snprintf(candidate_index, sizeof(candidate_index), "%s%s", file_path, location->indices[i]);
-                } else {
-                    snprintf(candidate_index, sizeof(candidate_index), "%s/%s", file_path, location->indices[i]);
-                }
-
-                if (stat(candidate_index, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
-                    snprintf(file_path, sizeof(file_path), "%s", candidate_index);
-                    resolved_index = true;
-                    break;
-                }
-            }
-        } else {
-            char candidate_index[APEX_CONFIG_PATH_MAX * 2];
-            if (file_path[current_len - 1] == '/') {
-                snprintf(candidate_index, sizeof(candidate_index), "%sindex.html", file_path);
-            } else {
-                snprintf(candidate_index, sizeof(candidate_index), "%s/index.html", file_path);
-            }
-            if (stat(candidate_index, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
-                snprintf(file_path, sizeof(file_path), "%s", candidate_index);
-                resolved_index = true;
-            }
-        }
-
-        if (!resolved_index) {
-            router_send_error(connection, server, request, request_len, 404, "Not Found", "Directory index not found\n");
-            return;
-        }
-    }
-
-    if (!S_ISREG(file_stat.st_mode)) {
-        router_send_error(connection, server, request, request_len, 403, "Forbidden", "Not a regular file\n");
-        return;
-    }
-
-    /* Content-Type detection based on logical file path (not compressed twin extension) */
-    const char *content_type = apex_mime_type(file_path);
-
-    /* Pre-compressed twin selection (.br, .zst, .gz) */
+    struct stat target_stat;
+    const char *content_type = NULL;
     const char *content_encoding = NULL;
     char target_path[APEX_CONFIG_PATH_MAX * 2];
-    snprintf(target_path, sizeof(target_path), "%s", file_path);
-    struct stat target_stat = file_stat;
-
-    const char *accept_encoding = NULL;
-    size_t accept_encoding_len = 0;
-    if (request != NULL && request_len > 0) {
-        static_find_header(request, request_len, "Accept-Encoding", &accept_encoding, &accept_encoding_len);
-    }
-
-    if (location->precompressed && accept_encoding != NULL && accept_encoding_len > 0) {
-        char twin_path[APEX_CONFIG_PATH_MAX * 2];
-        struct stat twin_stat;
-
-        if (memmem(accept_encoding, accept_encoding_len, "br", 2) != NULL) {
-            snprintf(twin_path, sizeof(twin_path), "%s.br", file_path);
-            if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
-                twin_stat.st_mtime >= file_stat.st_mtime) {
-                snprintf(target_path, sizeof(target_path), "%s", twin_path);
-                target_stat = twin_stat;
-                content_encoding = "br";
-            }
-        }
-        if (content_encoding == NULL && memmem(accept_encoding, accept_encoding_len, "zstd", 4) != NULL) {
-            snprintf(twin_path, sizeof(twin_path), "%s.zst", file_path);
-            if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
-                twin_stat.st_mtime >= file_stat.st_mtime) {
-                snprintf(target_path, sizeof(target_path), "%s", twin_path);
-                target_stat = twin_stat;
-                content_encoding = "zstd";
-            }
-        }
-        if (content_encoding == NULL && memmem(accept_encoding, accept_encoding_len, "gzip", 4) != NULL) {
-            snprintf(twin_path, sizeof(twin_path), "%s.gz", file_path);
-            if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
-                twin_stat.st_mtime >= file_stat.st_mtime) {
-                snprintf(target_path, sizeof(target_path), "%s", twin_path);
-                target_stat = twin_stat;
-                content_encoding = "gzip";
-            }
-        }
-    }
-
-    /* Cache Validation: ETag and Last-Modified (using thread-local in-memory cache) */
-    time_t now = time(NULL);
-    size_t tpath_len = strlen(target_path);
-    uint32_t slot = static_cache_hash(target_path, tpath_len);
-    apex_static_cache_entry_t *cached = &s_thread_cache.entries[slot];
-
     char etag_str[64] = {0};
     char last_mod_str[64] = {0};
     size_t total_size = 0;
     char *cached_memory = NULL;
 
-    if (cached->target_path[0] != '\0' && strcmp(cached->target_path, target_path) == 0 &&
-        now < cached->expires_at) {
+    if (cached->logical_path[0] != '\0' && strcmp(cached->logical_path, file_path) == 0 && now < cached->expires_at) {
+        cache_hit = true;
         total_size = cached->size;
         memcpy(etag_str, cached->etag, sizeof(etag_str));
         memcpy(last_mod_str, cached->last_modified, sizeof(last_mod_str));
         content_type = cached->content_type;
         content_encoding = cached->content_encoding;
         cached_memory = cached->in_memory_data;
-    } else {
+        file_stat.st_mtime = cached->mtime;
+        file_stat.st_size = (off_t)cached->size;
+        target_stat = file_stat;
+        snprintf(target_path, sizeof(target_path), "%s", cached->target_path);
+    }
+
+    if (!cache_hit) {
+        bool found_candidate = false;
+
+        if (stat(file_path, &file_stat) == 0) {
+            found_candidate = true;
+        }
+
+        /* If try_files is configured and primary target not found, probe candidates */
+        if (!found_candidate && location->try_files_count > 0) {
+            for (size_t index = 0; index < location->try_files_count; index++) {
+                const char *pattern = location->try_files[index];
+                char candidate_path[APEX_CONFIG_PATH_MAX * 2];
+
+                if (strcmp(pattern, "$uri") == 0) {
+                    snprintf(candidate_path, sizeof(candidate_path), "%s", file_path);
+                } else if (strcmp(pattern, "$uri/") == 0) {
+                    snprintf(candidate_path, sizeof(candidate_path), "%s/", file_path);
+                } else if (pattern[0] == '/') {
+                    snprintf(candidate_path, sizeof(candidate_path), "%s%s", location->root, pattern);
+                } else {
+                    snprintf(candidate_path, sizeof(candidate_path), "%s/%s", location->root, pattern);
+                }
+
+                if (stat(candidate_path, &file_stat) == 0) {
+                    snprintf(file_path, sizeof(file_path), "%s", candidate_path);
+                    found_candidate = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found_candidate) {
+            router_send_error(connection, server, request, request_len, 404, "Not Found", "File Not Found\n");
+            return;
+        }
+
+        /* Handle directory index resolution */
+        if (S_ISDIR(file_stat.st_mode)) {
+            bool resolved_index = false;
+            size_t current_len = strlen(file_path);
+
+            if (location->index_count > 0) {
+                for (size_t i = 0; i < location->index_count; i++) {
+                    char candidate_index[APEX_CONFIG_PATH_MAX * 2];
+                    if (file_path[current_len - 1] == '/') {
+                        snprintf(candidate_index, sizeof(candidate_index), "%s%s", file_path, location->indices[i]);
+                    } else {
+                        snprintf(candidate_index, sizeof(candidate_index), "%s/%s", file_path, location->indices[i]);
+                    }
+
+                    if (stat(candidate_index, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+                        snprintf(file_path, sizeof(file_path), "%s", candidate_index);
+                        resolved_index = true;
+                        break;
+                    }
+                }
+            } else {
+                char candidate_index[APEX_CONFIG_PATH_MAX * 2];
+                if (file_path[current_len - 1] == '/') {
+                    snprintf(candidate_index, sizeof(candidate_index), "%sindex.html", file_path);
+                } else {
+                    snprintf(candidate_index, sizeof(candidate_index), "%s/index.html", file_path);
+                }
+                if (stat(candidate_index, &file_stat) == 0 && S_ISREG(file_stat.st_mode)) {
+                    snprintf(file_path, sizeof(file_path), "%s", candidate_index);
+                    resolved_index = true;
+                }
+            }
+
+            if (!resolved_index) {
+                router_send_error(connection, server, request, request_len, 404, "Not Found", "Directory index not found\n");
+                return;
+            }
+        }
+
+        if (!S_ISREG(file_stat.st_mode)) {
+            router_send_error(connection, server, request, request_len, 403, "Forbidden", "Not a regular file\n");
+            return;
+        }
+
+        /* Content-Type detection based on logical file path (not compressed twin extension) */
+        content_type = apex_mime_type(file_path);
+
+        /* Pre-compressed twin selection (.br, .zst, .gz) */
+        snprintf(target_path, sizeof(target_path), "%s", file_path);
+        target_stat = file_stat;
+
+        const char *accept_encoding = NULL;
+        size_t accept_encoding_len = 0;
+        if (request != NULL && request_len > 0) {
+            static_find_header(request, request_len, "Accept-Encoding", &accept_encoding, &accept_encoding_len);
+        }
+
+        if (location->precompressed && accept_encoding != NULL && accept_encoding_len > 0) {
+            char twin_path[APEX_CONFIG_PATH_MAX * 2];
+            struct stat twin_stat;
+
+            if (memmem(accept_encoding, accept_encoding_len, "br", 2) != NULL) {
+                snprintf(twin_path, sizeof(twin_path), "%s.br", file_path);
+                if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
+                    twin_stat.st_mtime >= file_stat.st_mtime) {
+                    snprintf(target_path, sizeof(target_path), "%s", twin_path);
+                    target_stat = twin_stat;
+                    content_encoding = "br";
+                }
+            }
+            if (content_encoding == NULL && memmem(accept_encoding, accept_encoding_len, "zstd", 4) != NULL) {
+                snprintf(twin_path, sizeof(twin_path), "%s.zst", file_path);
+                if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
+                    twin_stat.st_mtime >= file_stat.st_mtime) {
+                    snprintf(target_path, sizeof(target_path), "%s", twin_path);
+                    target_stat = twin_stat;
+                    content_encoding = "zstd";
+                }
+            }
+            if (content_encoding == NULL && memmem(accept_encoding, accept_encoding_len, "gzip", 4) != NULL) {
+                snprintf(twin_path, sizeof(twin_path), "%s.gz", file_path);
+                if (stat(twin_path, &twin_stat) == 0 && S_ISREG(twin_stat.st_mode) &&
+                    twin_stat.st_mtime >= file_stat.st_mtime) {
+                    snprintf(target_path, sizeof(target_path), "%s", twin_path);
+                    target_stat = twin_stat;
+                    content_encoding = "gzip";
+                }
+            }
+        }
+
         apex_static_format_etag(file_stat.st_mtime, file_stat.st_size, etag_str, sizeof(etag_str));
         apex_static_format_http_date(file_stat.st_mtime, last_mod_str, sizeof(last_mod_str));
         total_size = (size_t)target_stat.st_size;
@@ -501,6 +516,7 @@ void apex_static_serve(const apex_server_config_t *server,
             free(cached->in_memory_data);
             cached->in_memory_data = NULL;
         }
+        snprintf(cached->logical_path, sizeof(cached->logical_path), "%s", file_path);
         snprintf(cached->target_path, sizeof(cached->target_path), "%s", target_path);
         cached->expires_at = now + APEX_STATIC_CACHE_TTL;
         cached->mtime = file_stat.st_mtime;
@@ -528,6 +544,47 @@ void apex_static_serve(const apex_server_config_t *server,
                 close(pre_fd);
             }
         }
+
+        /* Pre-format standard response headers for keepalive and close */
+        int kh_len = snprintf(cached->header_keepalive, sizeof(cached->header_keepalive),
+                              "HTTP/1.1 200 OK\r\n"
+                              "%s"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Accept-Ranges: bytes\r\n"
+                              "ETag: %s\r\n"
+                              "Last-Modified: %s\r\n"
+                              "%s%s%s"
+                              "%s"
+                              "Connection: keep-alive\r\n"
+                              "\r\n",
+                              server_hdr, content_type, total_size,
+                              etag_str, last_mod_str,
+                              content_encoding ? "Content-Encoding: " : "",
+                              content_encoding ? content_encoding : "",
+                              content_encoding ? "\r\n" : "",
+                              content_encoding ? "Vary: Accept-Encoding\r\n" : "");
+        cached->header_keepalive_len = kh_len > 0 && (size_t)kh_len < sizeof(cached->header_keepalive) ? (size_t)kh_len : 0;
+
+        int cl_len = snprintf(cached->header_close, sizeof(cached->header_close),
+                              "HTTP/1.1 200 OK\r\n"
+                              "%s"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Accept-Ranges: bytes\r\n"
+                              "ETag: %s\r\n"
+                              "Last-Modified: %s\r\n"
+                              "%s%s%s"
+                              "%s"
+                              "Connection: close\r\n"
+                              "\r\n",
+                              server_hdr, content_type, total_size,
+                              etag_str, last_mod_str,
+                              content_encoding ? "Content-Encoding: " : "",
+                              content_encoding ? content_encoding : "",
+                              content_encoding ? "\r\n" : "",
+                              content_encoding ? "Vary: Accept-Encoding\r\n" : "");
+        cached->header_close_len = cl_len > 0 && (size_t)cl_len < sizeof(cached->header_close) ? (size_t)cl_len : 0;
     }
 
     if (location->etag && request != NULL && request_len > 0) {
@@ -663,6 +720,37 @@ void apex_static_serve(const apex_server_config_t *server,
                     return;
                 }
             }
+        }
+    }
+
+    /* Fast path for standard 200 OK responses with pre-formatted cached headers */
+    if (!is_range && extra_headers_len == 0 && cached != NULL &&
+        cached->header_keepalive_len > 0) {
+        const char *hdr = connection->close_after_write ? cached->header_close : cached->header_keepalive;
+        size_t hlen = connection->close_after_write ? cached->header_close_len : cached->header_keepalive_len;
+
+        apex_record_status(200);
+        if (res != NULL) {
+            res->last_status = 200;
+            res->last_body_bytes = head_request ? 0 : send_length;
+        }
+
+        if (head_request || send_length == 0) {
+            apex_conn_write(connection, hdr, hlen);
+            return;
+        }
+
+        if (cached_memory != NULL) {
+            if (hlen + send_length <= sizeof(connection->write_buffer) - connection->write_length &&
+                connection->aux_length == connection->aux_offset) {
+                memcpy(connection->write_buffer + connection->write_length, hdr, hlen);
+                memcpy(connection->write_buffer + connection->write_length + hlen, cached_memory, send_length);
+                connection->write_length += (uint32_t)(hlen + send_length);
+                return;
+            }
+            apex_conn_write(connection, hdr, hlen);
+            apex_conn_write(connection, cached_memory, send_length);
+            return;
         }
     }
 

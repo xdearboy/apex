@@ -114,6 +114,7 @@ typedef struct {
     char ssl_server_name[128];
     _Atomic uint32_t round_robin_cursor;
     pthread_rwlock_t lock;
+    _Atomic uint32_t write_in_progress;
 } upstream_group_t;
 
 /* headers is an optional CRLF-delimited block without the request line.

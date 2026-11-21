@@ -6,6 +6,7 @@
 #include <poll.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
+#include <sys/uio.h>
 
 typedef struct {
     char host[APEX_CONFIG_HOST_MAX];
@@ -90,6 +91,7 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
     connection->aux_buffer = NULL;
     connection->aux_length = 0;
     connection->aux_offset = 0;
+    connection->aux_capacity = 0;
 
     if (connection->sendfile_remain > 0 && connection->sendfile_fd >= 0) {
         close(connection->sendfile_fd);
@@ -338,12 +340,24 @@ void apex_conn_write(conn_t *connection, const void *data, size_t length) {
         return;
     }
 
-    char *grown = realloc(connection->aux_buffer, connection->aux_length + length);
-    if (grown == NULL) {
-        connection->close_after_write = 1;
-        return;
+    size_t needed = connection->aux_length + length;
+    if (needed > connection->aux_capacity) {
+        size_t new_cap = connection->aux_capacity == 0 ? 16384 : connection->aux_capacity * 2;
+        while (new_cap < needed) {
+            if (new_cap > SIZE_MAX / 2) {
+                new_cap = needed;
+                break;
+            }
+            new_cap *= 2;
+        }
+        char *grown = realloc(connection->aux_buffer, new_cap);
+        if (grown == NULL) {
+            connection->close_after_write = 1;
+            return;
+        }
+        connection->aux_buffer = grown;
+        connection->aux_capacity = new_cap;
     }
-    connection->aux_buffer = grown;
     memcpy(connection->aux_buffer + connection->aux_length, data, length);
     connection->aux_length += length;
 }
@@ -420,6 +434,44 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
     while (connection->fd >= 0) {
         int bytes_sent = 0;
 
+#if defined(__linux__) || defined(__unix__)
+        if (connection->transport == APEX_TRANSPORT_PLAIN &&
+            connection->write_length > connection->write_offset &&
+            connection->aux_length > connection->aux_offset) {
+            struct iovec iov[2];
+            size_t w0 = connection->write_length - connection->write_offset;
+            size_t w1 = connection->aux_length - connection->aux_offset;
+            iov[0].iov_base = connection->write_buffer + connection->write_offset;
+            iov[0].iov_len = w0;
+            iov[1].iov_base = connection->aux_buffer + connection->aux_offset;
+            iov[1].iov_len = w1;
+            ssize_t written = writev(connection->fd, iov, 2);
+            if (written > 0) {
+                if ((size_t)written <= w0) {
+                    connection->write_offset += (uint32_t)written;
+                    if (connection->write_offset == connection->write_length) {
+                        connection->write_offset = 0;
+                        connection->write_length = 0;
+                    }
+                } else {
+                    connection->write_offset = 0;
+                    connection->write_length = 0;
+                    size_t rem = (size_t)written - w0;
+                    connection->aux_offset += rem;
+                    if (connection->aux_offset == connection->aux_length) {
+                        connection->aux_offset = 0;
+                        connection->aux_length = 0;
+                    }
+                }
+                continue;
+            }
+            if (written < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
+                bytes_sent = -1;
+            } else {
+                bytes_sent = -2;
+            }
+        } else
+#endif
         if (connection->write_length > connection->write_offset) {
             size_t bytes_to_send = connection->write_length - connection->write_offset;
             bytes_sent = apex_transport_write(connection, connection->write_buffer + connection->write_offset,
@@ -438,8 +490,6 @@ static inline void flush_write(worker_arg_t *worker, conn_t *connection) {
             if (bytes_sent > 0) {
                 connection->aux_offset += (size_t)bytes_sent;
                 if (connection->aux_offset == connection->aux_length) {
-                    free(connection->aux_buffer);
-                    connection->aux_buffer = NULL;
                     connection->aux_length = 0;
                     connection->aux_offset = 0;
                 }
@@ -566,6 +616,27 @@ static inline bool request_has_connection_close(const char *headers, size_t len)
     return memmem(p, line_len, "close", 5) != NULL || memmem(p, line_len, "Close", 5) != NULL;
 }
 
+static inline char *find_crlfcrlf(const char *buf, size_t len) {
+    if (len < 4) {
+        return NULL;
+    }
+    const char *p = buf;
+    const char *end = buf + len - 3;
+    while (p < end) {
+        p = memchr(p, '\r', (size_t)(end - p));
+        if (p == NULL) {
+            return NULL;
+        }
+        uint32_t val;
+        memcpy(&val, p, 4);
+        if (val == 0x0a0d0a0du) {
+            return (char *)p;
+        }
+        p++;
+    }
+    return NULL;
+}
+
 /* Reads available transport bytes, runs the pipelined h1 parser over them
  * and flushes any generated output. The EPOLLIN and EPOLLOUT handlers both
  * funnel here so a TLS read that wants a write resumes without a peer kick. */
@@ -626,7 +697,7 @@ static void process_read_event(worker_arg_t *worker, conn_t *connection) {
     size_t remaining_bytes = connection->read_length;
 
     while (remaining_bytes >= 4) {
-        char *crlf_delimiter = (char *)memmem(buffer_cursor, remaining_bytes, "\r\n\r\n", 4);
+        char *crlf_delimiter = find_crlfcrlf(buffer_cursor, remaining_bytes);
         if (!crlf_delimiter) {
             break;
         }
@@ -747,22 +818,13 @@ static void begin_drain(worker_arg_t *worker) {
     }
 }
 
-static bool configure_client(int fd) {
+static inline bool configure_client(int fd) {
+#if !defined(__linux__)
     const int enabled = 1;
-    const int idle_seconds = 15;
-    const int interval_seconds = 5;
-    const int probe_count = 3;
-    const unsigned int user_timeout_ms = 15000;
-    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds)) != 0 ||
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0 ||
-        setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) != 0) {
-        perror("apex: configure client socket");
-        return false;
-    }
+    (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+#else
+    (void)fd;
+#endif
     return true;
 }
 
@@ -1013,11 +1075,19 @@ static int prepare_worker(worker_arg_t *worker, const listen_endpoint_t *endpoin
         return -1;
     }
     const int enabled = 1;
-    /* No TCP_DEFER_ACCEPT: it RSTs accepted-but-never-accepted queued idle
-     * connections when the drain closes the listener; graceful shutdown wins. */
+    const int idle_seconds = 15;
+    const int interval_seconds = 5;
+    const int probe_count = 3;
+    const unsigned int user_timeout_ms = 15000;
+    /* TCP options set on the listening socket are inherited by accepted sockets on Linux */
     if (setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) != 0 ||
         setsockopt(worker->listen_fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) != 0 ||
         setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(worker->listen_fd, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) != 0 ||
+        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_seconds, sizeof(idle_seconds)) != 0 ||
+        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_seconds, sizeof(interval_seconds)) != 0 ||
+        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_KEEPCNT, &probe_count, sizeof(probe_count)) != 0 ||
+        setsockopt(worker->listen_fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &user_timeout_ms, sizeof(user_timeout_ms)) != 0 ||
         (endpoint->address.ss_family == AF_INET6 &&
          setsockopt(worker->listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0)) {
         perror("apex: configure listener socket");
