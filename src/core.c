@@ -1337,6 +1337,7 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         atomic_init(&workers[index].error, 0);
         atomic_init(&workers[index].finished, false);
         workers[index].cpu = (int)available_cpus[index % num_cpus];
+    }
     shared_listen_fd = create_listener_socket(&listener);
     if (shared_listen_fd < 0) {
         goto cleanup;
