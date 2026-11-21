@@ -14,6 +14,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sys/resource.h>
+
+static void raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        rl.rlim_cur = rl.rlim_max > 65535 ? 65535 : rl.rlim_max;
+        setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
 
 #ifndef APEX_VERSION
 #define APEX_VERSION "1.3.2"
@@ -54,6 +63,7 @@ static void print_config_error(const apex_config_error_t *error) {
 }
 
 int main(int argc, char **argv) {
+    raise_fd_limit();
     const char *config_path = APEX_DEFAULT_CONFIG;
     bool test_config = false;
     bool show_version = false;
