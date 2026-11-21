@@ -115,6 +115,27 @@ static const char *find_bytes(const char *haystack, size_t haystack_len, const c
     return NULL;
 }
 
+static inline const char *find_crlfcrlf(const char *buf, size_t len) {
+    if (len < 4) {
+        return NULL;
+    }
+    const char *p = buf;
+    const char *end = buf + len - 3;
+    while (p < end) {
+        p = memchr(p, '\r', (size_t)(end - p));
+        if (p == NULL) {
+            return NULL;
+        }
+        uint32_t val;
+        memcpy(&val, p, 4);
+        if (val == 0x0a0d0a0du) {
+            return p;
+        }
+        p++;
+    }
+    return NULL;
+}
+
 static bool buffer_reserve(buffer_t *buffer, size_t extra) {
     if (extra > SIZE_MAX - buffer->len) {
         return false;
@@ -608,7 +629,7 @@ static void configure_socket(int fd) {
 #endif
 }
 
-static int connect_server(const upstream_server_t *server, uint64_t timeout_ms) {
+static int connect_server(const upstream_server_t *server, const upstream_group_t *group, uint64_t timeout_ms) {
     int fd = socket(server->address.ss_family, SOCK_STREAM, 0);
     if (fd < 0) {
         return -1;
@@ -662,6 +683,7 @@ static int connect_server(const upstream_server_t *server, uint64_t timeout_ms) 
     }
 
     configure_socket(fd);
+    apply_io_timeouts(fd, group);
     return fd;
 }
 
@@ -886,7 +908,7 @@ static int reader_read_headers(reader_t *reader, size_t max_header, char **heade
     for (;;) {
         const char *delimiter = NULL;
         if (reader->len - search_from >= 4u) {
-            delimiter = find_bytes(reader->data + search_from, reader->len - search_from, "\r\n\r\n", 4u);
+            delimiter = find_crlfcrlf(reader->data + search_from, reader->len - search_from);
         }
         if (delimiter != NULL) {
             size_t end = (size_t)(delimiter - reader->data) + 4u;
@@ -1929,8 +1951,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         bool from_pool = false;
 
         if (is_ssl) {
-            fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
-                                                                 : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+            fd = connect_server(server, group, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                         : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
             if (fd < 0) {
                 apex_upstream_record_failure(group, (size_t)selected);
                 atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
@@ -1972,7 +1994,6 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 SSL_set_tlsext_host_name(ssl, sni);
             }
 
-            apply_io_timeouts(fd, group);
             if (SSL_connect(ssl) <= 0) {
                 SSL_free(ssl);
                 close(fd);
@@ -1991,8 +2012,8 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             fd = pool_acquire(server, group);
             from_pool = (fd >= 0);
             if (fd < 0) {
-                fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
-                                                                     : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+                fd = connect_server(server, group, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                             : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
                 if (fd < 0) {
                     apex_upstream_record_failure(group, (size_t)selected);
                     atomic_fetch_add_explicit(&server->failed_requests, 1, memory_order_relaxed);
@@ -2005,7 +2026,6 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                     return last_error;
                 }
                 thread_pool.total_created++;
-                apply_io_timeouts(fd, group);
             }
         }
 
@@ -2022,11 +2042,10 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
                 fd = -1;
                 if (from_pool) {
                     /* Connection was stale in pool, try fresh connection to the same server */
-                    fd = connect_server(server, group->connect_timeout_ms ? group->connect_timeout_ms
-                                                                         : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
+                    fd = connect_server(server, group, group->connect_timeout_ms ? group->connect_timeout_ms
+                                                                                 : APEX_PROXY_DEFAULT_CONNECT_TIMEOUT_MS);
                     if (fd >= 0) {
                         thread_pool.total_created++;
-                        apply_io_timeouts(fd, group);
                         result = send_all(fd, NULL, wire->data, wire->len);
                     } else {
                         result = APEX_PROXY_ERR_CONNECT;
