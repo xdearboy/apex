@@ -267,6 +267,10 @@ static int pool_acquire(const upstream_server_t *server, const upstream_group_t 
         }
 
         thread_pool.total_reused++;
+#ifdef TCP_QUICKACK
+        int quickack = 1;
+        (void)setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &quickack, sizeof(quickack));
+#endif
         return fd;
     }
 

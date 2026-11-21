@@ -1315,7 +1315,18 @@ static int run_app(apex_app_t *app, int port, const char *config_path) {
         app->generation->config->worker_processes > 0) {
         worker_count = (size_t)app->generation->config->worker_processes;
     } else {
-        worker_count = num_cpus;
+        /* When worker_processes is not explicitly set, scale thread count to provide
+         * concurrency headroom for proxying and network I/O operations without stalling. */
+        if (num_cpus >= 8) {
+            worker_count = num_cpus * 3u;
+            if (worker_count > 48u) {
+                worker_count = 48u;
+            }
+        } else if (num_cpus >= 4) {
+            worker_count = num_cpus * 2u;
+        } else {
+            worker_count = num_cpus;
+        }
     }
     if (worker_count == 0) {
         worker_count = 1;
