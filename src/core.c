@@ -100,9 +100,6 @@ static inline void close_conn(worker_arg_t *worker, conn_t *connection) {
     }
 
     if (connection->active) {
-        if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_DEL, connection->fd, NULL) != 0 && errno != ENOENT) {
-            perror("apex: epoll_ctl remove connection");
-        }
         if (close_fd(&connection->fd) != 0) {
             atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
         }
@@ -285,10 +282,29 @@ static void register_connection(worker_arg_t *worker, int fd) {
         return;
     }
     conn_t *connection = &worker->connections[fd];
-    memset(connection, 0, sizeof(*connection));
     connection->fd = fd;
     connection->active = 1;
     connection->conn_state = 0; /* READING */
+    connection->read_length = 0;
+    connection->write_length = 0;
+    connection->write_offset = 0;
+    connection->close_after_write = 0;
+    connection->epollout_active = 0;
+    connection->transport = APEX_TRANSPORT_PLAIN;
+    connection->ssl = NULL;
+    connection->tls_phase = APEX_TLS_HANDSHAKE;
+    connection->tls_want_write = 0;
+    connection->alpn_h2 = 0;
+    connection->h2 = NULL;
+    connection->aux_buffer = NULL;
+    connection->aux_length = 0;
+    connection->aux_offset = 0;
+    connection->aux_capacity = 0;
+    connection->sendfile_fd = -1;
+    connection->sendfile_offset = 0;
+    connection->sendfile_remain = 0;
+    connection->corked = 0;
+    connection->is_virtual = 0;
     worker->connection_count++;
     atomic_fetch_add_explicit(&g_apex_stats.accepts, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_apex_stats.handled, 1, memory_order_relaxed);

@@ -10,11 +10,23 @@
 
 #include <openssl/err.h>
 #include <openssl/pem.h>
+#include <openssl/rand.h>
 #include <openssl/x509.h>
 
+#include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+
+static unsigned char g_session_ticket_key[48];
+static pthread_once_t g_ticket_key_once = PTHREAD_ONCE_INIT;
+static bool g_ticket_key_valid = false;
+
+static void init_ticket_key(void) {
+    if (RAND_bytes(g_session_ticket_key, sizeof(g_session_ticket_key)) == 1) {
+        g_ticket_key_valid = true;
+    }
+}
 
 static void tls_error(apex_config_error_t *error, const apex_config_t *config, const apex_server_config_t *server,
                       apex_config_status_t code, const char *format, ...) {
@@ -70,6 +82,16 @@ SSL_CTX *apex_tls_context_create(const apex_config_t *config, const apex_server_
         return NULL;
     }
     SSL_CTX_set_options(context, SSL_OP_NO_COMPRESSION);
+    SSL_CTX_set_session_cache_mode(context, SSL_SESS_CACHE_SERVER);
+    static const unsigned char APEX_SID_CTX[] = "apex_v1";
+    SSL_CTX_set_session_id_context(context, APEX_SID_CTX, sizeof(APEX_SID_CTX) - 1);
+    SSL_CTX_set_timeout(context, 300);
+
+    pthread_once(&g_ticket_key_once, init_ticket_key);
+    if (g_ticket_key_valid) {
+        SSL_CTX_set_tlsext_ticket_keys(context, g_session_ticket_key, sizeof(g_session_ticket_key));
+    }
+
     /* The HTTP/2 send callback may complete an SSL_write across calls with
      * different buffers (nghttp2 retries pending data from its own internal
      * buffer), so partial writes and moving write buffers must be allowed.

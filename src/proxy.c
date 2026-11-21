@@ -748,7 +748,8 @@ static int send_all(int fd, SSL *ssl, const void *data, size_t len) {
     return APEX_PROXY_OK;
 }
 
-static int build_request(buffer_t *wire, const apex_proxy_request_t *request, const upstream_server_t *server) {
+static int build_request(buffer_t *wire, const apex_proxy_request_t *request, const upstream_server_t *server,
+                         const upstream_group_t *group) {
     size_t method_len = strlen(request->method);
     size_t target_len = strlen(request->target);
     size_t est_len = method_len + target_len + 12u + request->headers_len + 256u + request->body_len;
@@ -794,7 +795,9 @@ static int build_request(buffer_t *wire, const apex_proxy_request_t *request, co
     }
 
     if (!header_block_contains(request->headers, request->headers_len, "Connection")) {
-        const char *connection = request->keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        const char *connection = (group != NULL && group->keepalive > 0) ? "Connection: keep-alive\r\n"
+                                 : request->keep_alive                   ? "Connection: keep-alive\r\n"
+                                                                         : "Connection: close\r\n";
         if (!buffer_append_string(wire, connection)) {
             return APEX_PROXY_ERR_ALLOC;
         }
@@ -2013,7 +2016,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
         buffer_t *wire = &tl_wire;
         reader_t *reader = &tl_reader;
         int fd = -1;
-        int result = build_request(wire, request, server);
+        int result = build_request(wire, request, server, group);
         if (result != APEX_PROXY_OK) {
             atomic_fetch_sub_explicit(&server->active_conns, 1, memory_order_relaxed);
             return result;
@@ -2253,7 +2256,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
             fd = -1;
         }
 
-        bool reusable = !is_ssl && response->keep_alive && request->keep_alive && reader->len == reader->position && !reader->eof;
+        bool reusable = !is_ssl && response->keep_alive && reader->len == reader->position && !reader->eof;
         response->keep_alive = reusable;
         response->server_index = (size_t)selected;
         response->elapsed_us = monotonic_us() - started_us;

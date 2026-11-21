@@ -24,7 +24,7 @@
 #define H2_MAX_STREAMS 128u
 #define H2_MAX_HEADERS 64u
 #define H2_METHOD_MAX 16u
-#define H2_MAX_BODY_BYTES (8u * 1024u * 1024u)
+#define H2_MAX_BODY_BYTES (64u * 1024u * 1024u)
 #define H2_MAX_REQUEST_HEADER_BYTES (32u * 1024u)
 #define H2_MAX_RESPONSE_BYTES (16u * 1024u * 1024u)
 #define H2_INITIAL_WINDOW_SIZE (4u * 1024u * 1024u)
@@ -386,17 +386,24 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame, co
     return 0;
 }
 
+static void h2_send_status(h2_conn_t *h2, h2_stream_t *stream, const char *status, const char *body_text);
+
 static int h2_on_data_chunk(nghttp2_session *session, uint8_t frame_type, int32_t stream_id, const uint8_t *data,
                             size_t length, void *user_data) {
     (void)session;
     (void)frame_type;
     h2_conn_t *h2 = user_data;
     h2_stream_t *stream = h2_find_stream(h2, stream_id);
-    if (stream == NULL || stream->request_dispatched) {
+    if (stream == NULL) {
+        return 0;
+    }
+    if (stream->request_dispatched) {
+        nghttp2_submit_window_update(h2->session, NGHTTP2_FLAG_NONE, 0, (int32_t)length);
         return 0;
     }
     if (stream->body_length > H2_MAX_BODY_BYTES || length > H2_MAX_BODY_BYTES - stream->body_length) {
-        h2_stream_reset(h2, stream_id, NGHTTP2_REFUSED_STREAM);
+        h2_send_status(h2, stream, "413", "Payload Too Large\n");
+        nghttp2_submit_window_update(h2->session, NGHTTP2_FLAG_NONE, 0, (int32_t)length);
         return 0;
     }
     if (!h2_append(&stream->body, &stream->body_length, &stream->body_capacity, (const char *)data, length)) {
@@ -454,6 +461,26 @@ static void h2_submit_frames(h2_conn_t *h2, h2_stream_t *stream, const nghttp2_n
         h2_stream_reset(h2, stream->stream_id, NGHTTP2_INTERNAL_ERROR);
         return;
     }
+}
+
+static void h2_send_status(h2_conn_t *h2, h2_stream_t *stream, const char *status, const char *body_text) {
+    stream->request_dispatched = 1;
+    static const char type_text[] = "text/plain";
+    char length_text[32];
+    size_t body_len = strlen(body_text);
+    int length_written = snprintf(length_text, sizeof(length_text), "%zu", body_len);
+    nghttp2_nv nv[] = {
+        {.name = (uint8_t *)":status", .value = (uint8_t *)status, .namelen = 7u, .valuelen = (uint32_t)strlen(status),
+         .flags = NGHTTP2_NV_FLAG_NONE},
+        {.name = (uint8_t *)"content-type", .value = (uint8_t *)type_text, .namelen = 12u,
+         .valuelen = sizeof(type_text) - 1u, .flags = NGHTTP2_NV_FLAG_NONE},
+        {.name = (uint8_t *)"content-length", .value = (uint8_t *)length_text, .namelen = 14u,
+         .valuelen = length_written > 0 ? (size_t)length_written : 0u, .flags = NGHTTP2_NV_FLAG_NONE},
+    };
+    stream->response_body = body_text;
+    stream->response_body_length = body_len;
+    stream->response_offset = 0;
+    h2_submit_frames(h2, stream, nv, 3u);
 }
 
 /* Resolves the materialized h1 response into one contiguous byte range.
@@ -606,22 +633,7 @@ malformed:
         free(owned);
         free(separate_body_owned);
         stream->response_owned = NULL;
-        static const char body_text[] = "upstream produced an invalid response\n";
-        static const char type_text[] = "text/plain";
-        char length_text[32];
-        int length_written = snprintf(length_text, sizeof(length_text), "%zu", sizeof(body_text) - 1u);
-        nghttp2_nv fallback[] = {
-            {.name = (uint8_t *)":status", .value = (uint8_t *)"500", .namelen = 7u, .valuelen = 3u,
-             .flags = NGHTTP2_NV_FLAG_NONE},
-            {.name = (uint8_t *)"content-type", .value = (uint8_t *)type_text, .namelen = 12u,
-             .valuelen = sizeof(type_text) - 1u, .flags = NGHTTP2_NV_FLAG_NONE},
-            {.name = (uint8_t *)"content-length", .value = (uint8_t *)length_text, .namelen = 14u,
-             .valuelen = length_written > 0 ? (size_t)length_written : 0u, .flags = NGHTTP2_NV_FLAG_NONE},
-        };
-        stream->response_body = body_text;
-        stream->response_body_length = sizeof(body_text) - 1u;
-        stream->response_offset = 0;
-        h2_submit_frames(h2, stream, fallback, 3u);
+        h2_send_status(h2, stream, "500", "upstream produced an invalid response\n");
     }
 }
 
