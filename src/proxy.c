@@ -78,6 +78,8 @@ static _Thread_local thread_pool_t thread_pool;
 static _Thread_local uint64_t random_state;
 static _Thread_local buffer_t tl_wire = {0};
 static _Thread_local reader_t tl_reader = {0};
+static _Thread_local char tl_resp_headers[16384];
+static _Thread_local char tl_resp_body[65536];
 
 static uint64_t monotonic_ms(void) {
     struct timespec timestamp;
@@ -903,7 +905,7 @@ static void reader_free(reader_t *reader) {
     reader->ssl = NULL;
 }
 
-static int reader_read_headers(reader_t *reader, size_t max_header, char **headers, size_t *headers_len) {
+static int reader_read_headers(reader_t *reader, size_t max_header, char **headers, size_t *headers_len, bool *headers_dynamic) {
     size_t search_from = reader->position;
     for (;;) {
         const char *delimiter = NULL;
@@ -917,6 +919,15 @@ static int reader_read_headers(reader_t *reader, size_t max_header, char **heade
                 return APEX_PROXY_ERR_TOO_LARGE;
             }
 
+            if (length <= sizeof(tl_resp_headers)) {
+                memcpy(tl_resp_headers, reader->data + reader->position, length);
+                reader->position = end;
+                *headers = tl_resp_headers;
+                *headers_len = length;
+                *headers_dynamic = false;
+                return APEX_PROXY_OK;
+            }
+
             char *copy = malloc(length ? length : 1u);
             if (copy == NULL) {
                 return APEX_PROXY_ERR_ALLOC;
@@ -925,6 +936,7 @@ static int reader_read_headers(reader_t *reader, size_t max_header, char **heade
             reader->position = end;
             *headers = copy;
             *headers_len = length;
+            *headers_dynamic = true;
             return APEX_PROXY_OK;
         }
 
@@ -964,13 +976,21 @@ static int read_exact_body(reader_t *reader, size_t max_body, uint64_t content_l
     }
 
     if (length > 0) {
-        void *body = malloc(length);
-        if (body == NULL) {
-            return APEX_PROXY_ERR_ALLOC;
+        if (length <= sizeof(tl_resp_body)) {
+            memcpy(tl_resp_body, reader->data + reader->position, length);
+            response->body = tl_resp_body;
+            response->body_len = length;
+            response->body_dynamic = false;
+        } else {
+            void *body = malloc(length);
+            if (body == NULL) {
+                return APEX_PROXY_ERR_ALLOC;
+            }
+            memcpy(body, reader->data + reader->position, length);
+            response->body = body;
+            response->body_len = length;
+            response->body_dynamic = true;
         }
-        memcpy(body, reader->data + reader->position, length);
-        response->body = body;
-        response->body_len = length;
     }
 
     reader->position += length;
@@ -1083,6 +1103,7 @@ static int read_chunked_body(reader_t *reader, size_t max_body, apex_proxy_respo
     reader_compact(reader);
     response->body = body.data;
     response->body_len = body.len;
+    response->body_dynamic = true;
     response->chunked = true;
     return APEX_PROXY_OK;
 }
@@ -1121,6 +1142,7 @@ static int read_close_delimited_body(reader_t *reader, size_t max_body, apex_pro
 
     response->body = body.data;
     response->body_len = body.len;
+    response->body_dynamic = true;
     return APEX_PROXY_OK;
 }
 
@@ -1132,17 +1154,20 @@ static int read_response(reader_t *reader, const upstream_group_t *group, const 
 
     char *headers = NULL;
     size_t headers_len = 0;
+    bool headers_dynamic = false;
     int status = 0;
     bool have_response = false;
 
     for (int round = 0; round < 8; round++) {
-        int result = reader_read_headers(reader, max_header, &headers, &headers_len);
+        int result = reader_read_headers(reader, max_header, &headers, &headers_len, &headers_dynamic);
         if (result != APEX_PROXY_OK) {
             return result;
         }
 
         if (!parse_status_code(headers, headers_len, &status)) {
-            free(headers);
+            if (headers_dynamic) {
+                free(headers);
+            }
             return APEX_PROXY_ERR_PROTOCOL;
         }
 
@@ -1151,9 +1176,12 @@ static int read_response(reader_t *reader, const upstream_group_t *group, const 
             break;
         }
         if (status >= 100 && status < 200) {
-            free(headers);
+            if (headers_dynamic) {
+                free(headers);
+            }
             headers = NULL;
             headers_len = 0;
+            headers_dynamic = false;
             continue;
         }
 
@@ -1162,13 +1190,16 @@ static int read_response(reader_t *reader, const upstream_group_t *group, const 
     }
 
     if (!have_response || headers == NULL) {
-        free(headers);
+        if (headers_dynamic) {
+            free(headers);
+        }
         return APEX_PROXY_ERR_PROTOCOL;
     }
 
     response->status = status;
     response->headers = headers;
     response->headers_len = headers_len;
+    response->headers_dynamic = headers_dynamic;
 
     reader_compact(reader);
 
@@ -1196,6 +1227,7 @@ static int read_response(reader_t *reader, const upstream_group_t *group, const 
     if (no_body) {
         response->body = NULL;
         response->body_len = 0;
+        response->body_dynamic = false;
     } else if (chunked) {
         result = read_chunked_body(reader, max_body, response);
     } else if (has_content_length) {
@@ -1858,8 +1890,12 @@ void apex_proxy_response_free(apex_proxy_response_t *response) {
     if (response == NULL) {
         return;
     }
-    free(response->headers);
-    free(response->body);
+    if (response->headers_dynamic) {
+        free(response->headers);
+    }
+    if (response->body_dynamic) {
+        free(response->body);
+    }
     free(response->leftover_data);
     if (response->upstream_fd >= 0) {
         close(response->upstream_fd);

@@ -730,6 +730,8 @@ static bool router_location_has_header(const apex_location_config_t *location, c
     return false;
 }
 
+static _Thread_local router_buffer_t tl_proxy_req_buf = {0};
+
 static bool build_request_headers(const char *request, size_t request_length,
                                   const apex_location_config_t *location,
                                   conn_t *connection, const char *host,
@@ -770,7 +772,20 @@ static bool build_request_headers(const char *request, size_t request_length,
 
     bool is_ws = has_upgrade && (upgrade_val_len == 9 && strncasecmp(upgrade_val, "websocket", 9) == 0);
 
-    router_buffer_t buffer = {0};
+    router_buffer_t *buffer = &tl_proxy_req_buf;
+    buffer->length = 0;
+    if (buffer->capacity == 0) {
+        if (!router_buffer_append(buffer, "", 0)) {
+            return false;
+        }
+        if (buffer->capacity < 16384u) {
+            char *grown = realloc(buffer->data, 16384u);
+            if (grown != NULL) {
+                buffer->data = grown;
+                buffer->capacity = 16384u;
+            }
+        }
+    }
     const char *first_end = router_find_crlf(request, request_length);
     if (first_end != NULL) {
         size_t position = (size_t)(first_end - request) + 2u;
@@ -808,9 +823,9 @@ static bool build_request_headers(const char *request, size_t request_length,
             }
 
             if (!skip_header && !router_header_is_overridden(line, line_length, location)) {
-                if (!router_buffer_append(&buffer, line, line_length) ||
-                    !router_buffer_append_string(&buffer, "\r\n")) {
-                    router_buffer_free(&buffer);
+                if (!router_buffer_append(buffer, line, line_length) ||
+                    !router_buffer_append_string(buffer, "\r\n")) {
+                    buffer->length = 0;
                     return false;
                 }
             }
@@ -820,47 +835,47 @@ static bool build_request_headers(const char *request, size_t request_length,
 
     /* Standard Proxy Headers (if not overridden in location) */
     if (!router_location_has_header(location, "X-Real-IP")) {
-        if (!router_buffer_append_string(&buffer, "X-Real-IP: ") ||
-            !router_buffer_append_string(&buffer, client_ip) ||
-            !router_buffer_append_string(&buffer, "\r\n")) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, "X-Real-IP: ") ||
+            !router_buffer_append_string(buffer, client_ip) ||
+            !router_buffer_append_string(buffer, "\r\n")) {
+            buffer->length = 0;
             return false;
         }
     }
 
     if (!router_location_has_header(location, "X-Forwarded-For")) {
-        if (!router_buffer_append_string(&buffer, "X-Forwarded-For: ")) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, "X-Forwarded-For: ")) {
+            buffer->length = 0;
             return false;
         }
         if (existing_xff != NULL && existing_xff_len > 0) {
-            if (!router_buffer_append(&buffer, existing_xff, existing_xff_len) ||
-                !router_buffer_append_string(&buffer, ", ")) {
-                router_buffer_free(&buffer);
+            if (!router_buffer_append(buffer, existing_xff, existing_xff_len) ||
+                !router_buffer_append_string(buffer, ", ")) {
+                buffer->length = 0;
                 return false;
             }
         }
-        if (!router_buffer_append_string(&buffer, client_ip) ||
-            !router_buffer_append_string(&buffer, "\r\n")) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, client_ip) ||
+            !router_buffer_append_string(buffer, "\r\n")) {
+            buffer->length = 0;
             return false;
         }
     }
 
     if (!router_location_has_header(location, "X-Forwarded-Proto")) {
-        if (!router_buffer_append_string(&buffer, "X-Forwarded-Proto: ") ||
-            !router_buffer_append_string(&buffer, scheme) ||
-            !router_buffer_append_string(&buffer, "\r\n")) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, "X-Forwarded-Proto: ") ||
+            !router_buffer_append_string(buffer, scheme) ||
+            !router_buffer_append_string(buffer, "\r\n")) {
+            buffer->length = 0;
             return false;
         }
     }
 
     if (host_val[0] != '\0' && !router_location_has_header(location, "X-Forwarded-Host")) {
-        if (!router_buffer_append_string(&buffer, "X-Forwarded-Host: ") ||
-            !router_buffer_append_string(&buffer, host_val) ||
-            !router_buffer_append_string(&buffer, "\r\n")) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, "X-Forwarded-Host: ") ||
+            !router_buffer_append_string(buffer, host_val) ||
+            !router_buffer_append_string(buffer, "\r\n")) {
+            buffer->length = 0;
             return false;
         }
     }
@@ -869,15 +884,15 @@ static bool build_request_headers(const char *request, size_t request_length,
         char tp_buf[128];
         snprintf(tp_buf, sizeof(tp_buf), "traceparent: 00-%s-%s-%s\r\n",
                  s_current_otel_trace_id, s_current_otel_span_id, s_current_otel_flags);
-        if (!router_buffer_append_string(&buffer, tp_buf)) {
-            router_buffer_free(&buffer);
+        if (!router_buffer_append_string(buffer, tp_buf)) {
+            buffer->length = 0;
             return false;
         }
         if (s_current_otel_tracestate[0] != '\0') {
-            if (!router_buffer_append_string(&buffer, "tracestate: ") ||
-                !router_buffer_append_string(&buffer, s_current_otel_tracestate) ||
-                !router_buffer_append_string(&buffer, "\r\n")) {
-                router_buffer_free(&buffer);
+            if (!router_buffer_append_string(buffer, "tracestate: ") ||
+                !router_buffer_append_string(buffer, s_current_otel_tracestate) ||
+                !router_buffer_append_string(buffer, "\r\n")) {
+                buffer->length = 0;
                 return false;
             }
         }
@@ -896,11 +911,11 @@ static bool build_request_headers(const char *request, size_t request_length,
                                  existing_xff, existing_xff_len,
                                  upgrade_val, upgrade_val_len,
                                  conn_val, conn_val_len);
-            if (!router_buffer_append_string(&buffer, header->name) ||
-                !router_buffer_append_string(&buffer, ": ") ||
-                !router_buffer_append_string(&buffer, expanded_val) ||
-                !router_buffer_append_string(&buffer, "\r\n")) {
-                router_buffer_free(&buffer);
+            if (!router_buffer_append_string(buffer, header->name) ||
+                !router_buffer_append_string(buffer, ": ") ||
+                !router_buffer_append_string(buffer, expanded_val) ||
+                !router_buffer_append_string(buffer, "\r\n")) {
+                buffer->length = 0;
                 return false;
             }
         }
@@ -909,25 +924,21 @@ static bool build_request_headers(const char *request, size_t request_length,
     /* For WebSocket, ensure Upgrade and Connection headers reach upstream if not already present */
     if (is_ws) {
         if (!router_location_has_header(location, "Upgrade")) {
-            if (!router_buffer_append_string(&buffer, "Upgrade: websocket\r\n")) {
-                router_buffer_free(&buffer);
+            if (!router_buffer_append_string(buffer, "Upgrade: websocket\r\n")) {
+                buffer->length = 0;
                 return false;
             }
         }
         if (!router_location_has_header(location, "Connection")) {
-            if (!router_buffer_append_string(&buffer, "Connection: Upgrade\r\n")) {
-                router_buffer_free(&buffer);
+            if (!router_buffer_append_string(buffer, "Connection: Upgrade\r\n")) {
+                buffer->length = 0;
                 return false;
             }
         }
     }
 
-    if (buffer.length > 0) {
-        *headers = buffer.data;
-        *headers_length = buffer.length;
-    } else {
-        router_buffer_free(&buffer);
-    }
+    *headers = buffer->data ? buffer->data : "";
+    *headers_length = buffer->length;
     return true;
 }
 
@@ -1763,8 +1774,31 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
     const void *body_to_send = is_compressed ? compressed_body : active_body;
     size_t body_len_to_send = is_compressed ? compressed_body_len : active_body_len;
 
-    apex_conn_write(connection, headers, (size_t)(status_end - headers));
-    apex_conn_write(connection, "\r\n", 2u);
+    char resp_hdr_buf[4096];
+    size_t resp_hdr_len = 0;
+    bool hdr_overflow = false;
+
+#define HDR_APPEND(src, len) do { \
+        size_t _alen = (size_t)(len); \
+        if (_alen > 0) { \
+            if (resp_hdr_len + _alen <= sizeof(resp_hdr_buf)) { \
+                memcpy(resp_hdr_buf + resp_hdr_len, (src), _alen); \
+                resp_hdr_len += _alen; \
+            } else { \
+                hdr_overflow = true; \
+            } \
+        } \
+    } while (0)
+
+#define HDR_APPEND_STR(str) do { \
+        const char *_s = (str); \
+        if (_s != NULL && _s[0] != '\0') { \
+            HDR_APPEND(_s, strlen(_s)); \
+        } \
+    } while (0)
+
+    HDR_APPEND(headers, (size_t)(status_end - headers));
+    HDR_APPEND("\r\n", 2u);
 
     bool no_content_length = true;
     bool seen_vary = false;
@@ -1834,24 +1868,24 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
 
         if (!skip) {
             if (cookie_rewritten) {
-                apex_conn_write(connection, rewritten_cookie, rewritten_cookie_len);
+                HDR_APPEND(rewritten_cookie, rewritten_cookie_len);
             } else {
-                apex_conn_write(connection, line, line_length);
+                HDR_APPEND(line, line_length);
             }
-            apex_conn_write(connection, "\r\n", 2u);
+            HDR_APPEND("\r\n", 2u);
         }
         position += line_length + 2u;
     }
 
-    char length_header[64];
     if (!head_request && !no_body) {
+        char length_header[64];
         int written = snprintf(length_header, sizeof(length_header), "Content-Length: %zu\r\n",
                                body_len_to_send);
         if (written > 0 && (size_t)written < sizeof(length_header)) {
-            apex_conn_write(connection, length_header, (size_t)written);
+            HDR_APPEND(length_header, (size_t)written);
         }
     } else if (head_request && no_content_length && !no_body) {
-        apex_conn_write(connection, "Content-Length: 0\r\n", 19u);
+        HDR_APPEND("Content-Length: 0\r\n", 19u);
     }
 
     if (is_compressed) {
@@ -1859,10 +1893,10 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
         char ce_hdr[64];
         int ce_written = snprintf(ce_hdr, sizeof(ce_hdr), "Content-Encoding: %s\r\n", algo_name);
         if (ce_written > 0) {
-            apex_conn_write(connection, ce_hdr, (size_t)ce_written);
+            HDR_APPEND(ce_hdr, (size_t)ce_written);
         }
         if (!seen_vary) {
-            apex_conn_write(connection, "Vary: Accept-Encoding\r\n", 23);
+            HDR_APPEND("Vary: Accept-Encoding\r\n", 23u);
         }
     }
 
@@ -1870,18 +1904,108 @@ static void router_write_proxy_response(conn_t *connection, const apex_runtime_t
     char server_hdr[160];
     size_t s_len = router_format_server_header(tokens, server_hdr, sizeof(server_hdr));
     if (s_len > 0) {
-        apex_conn_write(connection, server_hdr, s_len);
+        HDR_APPEND(server_hdr, s_len);
     }
 
     if (status != 101) {
         const char *connection_header = connection->close_after_write ? "Connection: close\r\n"
                                                                       : "Connection: keep-alive\r\n";
-        apex_conn_write(connection, connection_header, strlen(connection_header));
+        HDR_APPEND_STR(connection_header);
     }
     if (extra_headers != NULL && extra_headers_len > 0) {
-        apex_conn_write(connection, extra_headers, extra_headers_len);
+        HDR_APPEND(extra_headers, extra_headers_len);
     }
-    apex_conn_write(connection, "\r\n", 2u);
+    HDR_APPEND("\r\n", 2u);
+
+    if (!hdr_overflow) {
+        apex_conn_write(connection, resp_hdr_buf, resp_hdr_len);
+    } else {
+        size_t big_cap = headers_length + extra_headers_len + 4096u;
+        char *big_buf = malloc(big_cap);
+        if (big_buf != NULL) {
+            size_t big_len = 0;
+#define BIG_APPEND(s, l) do { \
+                size_t _bl = (size_t)(l); \
+                if (_bl > 0 && big_len + _bl <= big_cap) { \
+                    memcpy(big_buf + big_len, (s), _bl); \
+                    big_len += _bl; \
+                } \
+            } while (0)
+#define BIG_APPEND_STR(s) do { \
+                const char *_bs = (s); \
+                if (_bs != NULL && _bs[0] != '\0') BIG_APPEND(_bs, strlen(_bs)); \
+            } while (0)
+
+            BIG_APPEND(headers, (size_t)(status_end - headers));
+            BIG_APPEND("\r\n", 2u);
+            size_t pos2 = (size_t)(status_end - headers) + 2u;
+            while (pos2 < headers_length) {
+                const char *ln = headers + pos2;
+                const char *ln_end = router_find_crlf(ln, headers_length - pos2);
+                if (ln_end == NULL) break;
+                size_t ln_len = (size_t)(ln_end - ln);
+                if (ln_len == 0) break;
+                const char *col = memchr(ln, ':', ln_len);
+                bool sk = false;
+                char rew_c[APEX_CONFIG_HOST_MAX * 4];
+                size_t rew_c_len = 0;
+                bool c_rew = false;
+                if (col != NULL) {
+                    size_t nl = (size_t)(col - ln);
+                    while (nl > 0 && (ln[nl - 1u] == ' ' || ln[nl - 1u] == '\t')) nl--;
+                    if (router_header_name_equal(ln, nl, "Set-Cookie") && (cookie_domain_count > 0 || cookie_path_count > 0)) {
+                        if (router_rewrite_cookie_line(ln, ln_len, cookie_domains, cookie_domain_count, cookie_paths, cookie_path_count, rew_c, sizeof(rew_c), &rew_c_len)) {
+                            c_rew = true;
+                        }
+                    } else if (router_header_name_equal(ln, nl, "Server")) {
+                        sk = true;
+                    } else if (status != 101 && (router_header_name_equal(ln, nl, "Transfer-Encoding") || router_header_name_equal(ln, nl, "Connection") || router_header_name_equal(ln, nl, "Keep-Alive") || router_header_name_equal(ln, nl, "Proxy-Connection"))) {
+                        sk = true;
+                    } else if (status == 101 && (router_header_name_equal(ln, nl, "Transfer-Encoding") || router_header_name_equal(ln, nl, "Keep-Alive") || router_header_name_equal(ln, nl, "Proxy-Connection"))) {
+                        sk = true;
+                    } else if (router_header_name_equal(ln, nl, "Content-Length")) {
+                        if (!head_request || no_body || is_compressed || is_filtered) sk = true;
+                    } else if (is_compressed && router_header_name_equal(ln, nl, "Content-Encoding")) {
+                        sk = true;
+                    }
+                }
+                if (!sk) {
+                    if (c_rew) BIG_APPEND(rew_c, rew_c_len);
+                    else BIG_APPEND(ln, ln_len);
+                    BIG_APPEND("\r\n", 2u);
+                }
+                pos2 += ln_len + 2u;
+            }
+            if (!head_request && !no_body) {
+                char lh[64];
+                int w = snprintf(lh, sizeof(lh), "Content-Length: %zu\r\n", body_len_to_send);
+                if (w > 0) BIG_APPEND(lh, (size_t)w);
+            } else if (head_request && no_content_length && !no_body) {
+                BIG_APPEND("Content-Length: 0\r\n", 19u);
+            }
+            if (is_compressed) {
+                char ch[64];
+                int cw = snprintf(ch, sizeof(ch), "Content-Encoding: %s\r\n", apex_compress_algo_name(comp_algo));
+                if (cw > 0) BIG_APPEND(ch, (size_t)cw);
+                if (!seen_vary) BIG_APPEND("Vary: Accept-Encoding\r\n", 23u);
+            }
+            if (s_len > 0) BIG_APPEND(server_hdr, s_len);
+            if (status != 101) {
+                const char *ch = connection->close_after_write ? "Connection: close\r\n" : "Connection: keep-alive\r\n";
+                BIG_APPEND_STR(ch);
+            }
+            if (extra_headers != NULL && extra_headers_len > 0) BIG_APPEND(extra_headers, extra_headers_len);
+            BIG_APPEND("\r\n", 2u);
+
+            apex_conn_write(connection, big_buf, big_len);
+            free(big_buf);
+#undef BIG_APPEND
+#undef BIG_APPEND_STR
+        }
+    }
+
+#undef HDR_APPEND
+#undef HDR_APPEND_STR
 
     if (!head_request && !no_body && body_to_send != NULL && body_len_to_send > 0) {
         apex_conn_write(connection, body_to_send, body_len_to_send);
@@ -2061,10 +2185,16 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         return;
     }
 
-    char *target_text = malloc(target_length + 1u);
-    if (target_text == NULL) {
-        router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
-        return;
+    char stack_target[2048];
+    char *target_text = NULL;
+    if (target_length + 1u <= sizeof(stack_target)) {
+        target_text = stack_target;
+    } else {
+        target_text = malloc(target_length + 1u);
+        if (target_text == NULL) {
+            router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
+            return;
+        }
     }
     memcpy(target_text, target, target_length);
     target_text[target_length] = '\0';
@@ -2075,7 +2205,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
     size_t host_length = 0;
     if (router_find_header(request, request_length, "Host", &host_value, &host_length)) {
         if (host_length >= sizeof(host)) {
-            free(target_text);
+            if (target_text != stack_target) {
+                free(target_text);
+            }
             router_send_error(connection, server, request, request_length, 400, "Bad Request", "host header is too long\n");
             return;
         }
@@ -2095,7 +2227,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                                     NULL, 0, NULL, 0, NULL, 0,
                                     0, 0);
             if (raw_target[0] == '\0') {
-                free(target_text);
+                if (target_text != stack_target) {
+                    free(target_text);
+                }
                 router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "empty dynamic upstream target\n");
                 return;
             }
@@ -2122,7 +2256,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                 dyn_port = (uint16_t)atoi(target_ptr);
             }
             if (dyn_host[0] == '\0') {
-                free(target_text);
+                if (target_text != stack_target) {
+                    free(target_text);
+                }
                 router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "invalid dynamic upstream host\n");
                 return;
             }
@@ -2162,7 +2298,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                     ? &route->location->resolver
                     : (server != NULL && server->resolver.is_set ? &server->resolver : (runtime && runtime->config ? &runtime->config->http.resolver : NULL));
                 if (apex_upstream_add_server_resolver(&dynamic_group, dyn_host, dyn_port, 1, false, false, res_cfg) != 0) {
-                    free(target_text);
+                    if (target_text != stack_target) {
+                        free(target_text);
+                    }
                     router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "failed to resolve dynamic upstream host\n");
                     return;
                 }
@@ -2174,7 +2312,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                 route->group = &dynamic_group;
             }
         } else {
-            free(target_text);
+            if (target_text != stack_target) {
+                free(target_text);
+            }
             router_send_error(connection, server, request, request_length, 502, "Bad Gateway", "no upstream group for location\n");
             return;
         }
@@ -2266,7 +2406,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                                             request, request_length, &cached_proxy_resp,
                                             is_head, hit_extra, strlen(hit_extra), res);
                 apex_cached_response_free(&cached);
-                free(target_text);
+                if (target_text != stack_target) {
+                    free(target_text);
+                }
                 return;
             } else {
                 atomic_fetch_add_explicit(&g_apex_stats.cache_misses, 1, memory_order_relaxed);
@@ -2280,7 +2422,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
     size_t headers_length = 0;
     if (!build_request_headers(request, request_length, route->location, connection, host,
                                target_text, target_length, client_ip, &headers, &headers_length)) {
-        free(target_text);
+        if (target_text != stack_target) {
+            free(target_text);
+        }
         router_send_error(connection, server, request, request_length, 500, "Internal Server Error", "out of memory\n");
         return;
     }
@@ -2362,7 +2506,11 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
     apex_proxy_response_t proxy_response;
     int result = apex_proxy_forward((upstream_group_t *)(uintptr_t)route->group, &proxy_request, &proxy_response);
 
-    free(headers);
+    if (tl_proxy_req_buf.capacity > 65536u) {
+        router_buffer_free(&tl_proxy_req_buf);
+    } else {
+        tl_proxy_req_buf.length = 0;
+    }
 
     if (result != APEX_PROXY_OK) {
         int status = result == APEX_PROXY_ERR_TIMEOUT ? 504 : 502;
@@ -2372,7 +2520,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         if (!router_send_custom_error_page(connection, server, route->location, status, reason, NULL, 0)) {
             router_send_error(connection, server, request, request_length, status, reason, message);
         }
-        free(target_text);
+        if (target_text != stack_target) {
+            free(target_text);
+        }
         return;
     }
 
@@ -2396,7 +2546,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
                 }
             }
             apex_proxy_response_free(&proxy_response);
-            free(target_text);
+            if (target_text != stack_target) {
+                free(target_text);
+            }
             return;
         }
     }
@@ -2516,7 +2668,9 @@ static void router_forward_request(const apex_runtime_t *runtime, apex_config_ro
         proxy_response.upstream_fd = -1;
     }
 
-    free(target_text);
+    if (target_text != stack_target) {
+        free(target_text);
+    }
     apex_proxy_response_free(&proxy_response);
 }
 

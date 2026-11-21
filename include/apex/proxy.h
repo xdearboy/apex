@@ -146,6 +146,8 @@ typedef struct {
     size_t body_len;
     bool chunked;
     bool keep_alive;
+    bool headers_dynamic;
+    bool body_dynamic;
     size_t server_index;
     uint64_t elapsed_us;
     int upstream_fd;
