@@ -214,6 +214,28 @@ typedef struct {
 } apex_auth_basic_config_t;
 
 typedef struct {
+    bool enabled;
+    uint32_t max_entries;
+    uint32_t inactive_sec;
+    uint32_t valid_sec;
+    uint32_t min_uses;
+    bool errors;
+    bool is_set;
+} apex_open_file_cache_config_t;
+
+typedef struct {
+    bool enabled;
+    char email[128];
+    char domains[8][APEX_CONFIG_HOST_MAX];
+    size_t domain_count;
+    bool staging;
+    char directory_url[256];
+    char cert_path[APEX_CONFIG_PATH_MAX];
+    char key_path[APEX_CONFIG_PATH_MAX];
+    bool is_set;
+} apex_acme_config_t;
+
+typedef struct {
     int status_code;
     char *path;
     int line;
@@ -332,6 +354,13 @@ typedef struct {
     apex_otel_config_t otel;
     apex_api_config_t api;
     apex_auth_basic_config_t auth_basic;
+    size_t client_max_body_size;
+    bool has_client_max_body_size;
+    apex_open_file_cache_config_t open_file_cache;
+    char *access_by_lua;
+    char *content_by_lua;
+    char *header_filter_by_lua;
+    char wasm_filter_path[APEX_CONFIG_PATH_MAX];
 } apex_location_config_t;
 
 typedef struct {
@@ -445,6 +474,15 @@ typedef struct {
     apex_otel_config_t otel;
     apex_api_config_t api;
     apex_auth_basic_config_t auth_basic;
+    uint32_t keepalive_requests;
+    bool has_keepalive_requests;
+    size_t client_max_body_size;
+    bool has_client_max_body_size;
+    apex_open_file_cache_config_t open_file_cache;
+    apex_acme_config_t acme;
+    char *access_by_lua;
+    char *header_filter_by_lua;
+    char wasm_filter_path[APEX_CONFIG_PATH_MAX];
     int line;
 } apex_server_config_t;
 
@@ -453,6 +491,9 @@ typedef struct {
     uint64_t keepalive_timeout_ms;
     uint64_t client_header_timeout_ms;
     uint64_t client_body_timeout_ms;
+    uint32_t keepalive_requests;
+    size_t client_max_body_size;
+    bool has_client_max_body_size;
     apex_server_tokens_config_t server_tokens;
     apex_rate_limit_zone_t rate_zones[APEX_CONFIG_MAX_RATE_ZONES];
     size_t rate_zone_count;
@@ -494,6 +535,8 @@ typedef struct {
     apex_resolver_config_t resolver;
     apex_otel_config_t otel;
     apex_auth_basic_config_t auth_basic;
+    apex_open_file_cache_config_t open_file_cache;
+    apex_acme_config_t acme;
 } apex_http_config_t;
 
 typedef struct {
@@ -528,6 +571,10 @@ typedef struct {
     void *rate_limiter;
     void *cache_manager;
     void *log_manager;
+    void *file_cache;
+    void *acme_manager;
+    void *tls_context;
+    void *active_generation;
 } apex_runtime_t;
 
 typedef struct {
@@ -551,6 +598,9 @@ void apex_runtime_destroy(apex_runtime_t *runtime);
 const upstream_group_t *apex_runtime_upstream(const apex_runtime_t *runtime, size_t index);
 const upstream_group_t *apex_runtime_endpoint_group(const apex_runtime_t *runtime,
                                                     const apex_location_config_t *location);
+bool apex_runtime_match_ex(const apex_runtime_t *runtime, uint16_t port, bool is_tls,
+                           const char *host, size_t host_length, const char *path,
+                           size_t path_length, apex_config_route_t *route);
 bool apex_runtime_match(const apex_runtime_t *runtime, const char *host, size_t host_length, const char *path,
                         size_t path_length, apex_config_route_t *route);
 

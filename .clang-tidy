@@ -1,0 +1,27 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-branch-clone,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-implicit-widening-of-multiplication-result,
+  cert-*,
+  -cert-dcl03-c,
+  -cert-dcl16-c,
+  -cert-err33-c,
+  performance-*,
+  readability-*,
+  -readability-magic-numbers,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length,
+  -readability-isolate-declaration,
+  -readability-else-after-return,
+  -readability-redundant-declaration,
+  -readability-math-missing-parentheses,
+  -readability-uppercase-literal-suffix,
+  -readability-implicit-bool-conversion
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'include/.*|src/.*'
+FormatStyle: file

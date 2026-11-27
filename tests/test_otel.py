@@ -64,7 +64,7 @@ class TestOpenTelemetry(unittest.TestCase):
         cls.backend_port = free_port()
         cls.apex_port = free_port()
 
-        cls.httpd = http.server.HTTPServer(("127.0.0.1", cls.backend_port), OtelBackendHandler)
+        cls.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", cls.backend_port), OtelBackendHandler)
         cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
 

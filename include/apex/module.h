@@ -2,6 +2,7 @@
 #define APEX_MODULE_H
 
 #include "apex/config.h"
+#include "apex/pool.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -50,6 +51,7 @@ struct apex_pipeline_ctx {
 
     conn_t *conn;
     apex_res_t *res;
+    apex_pool_t *pool;
     const apex_server_config_t *server;
     const apex_location_config_t *location;
     const apex_runtime_t *runtime;

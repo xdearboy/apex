@@ -1,0 +1,824 @@
+openapi: 3.2.0
+info:
+  title: Halloween LMS
+  version: 1.0.0
+  summary: Учебная платформа — контракт сервиса участника конкурса.
+  description: |
+    Курсы из уроков, задания с дедлайнами и файлами, посылки студентов, проверка ассистентами,
+    чат под заданием, администрирование. `test/test.sh` проверяет всё, что описано здесь; если контракт и тесты
+    расходятся, правы тесты.
+
+    ## Авторизация
+
+    Каждый запрос, кроме `GET /health`, несёт `Authorization: Bearer <JWT>`. Токен — HS256,
+    подпись секретом из окружения. Проверять подпись и `exp`, принимать только `HS256`.
+    Кто это и какая у него роль — из клеймов (`JwtClaims`). **Доступ к курсам — только из базы**:
+    таблицы `student_courses`, `assistant_courses`, `teacher_courses` (многие-ко-многим).
+    «Свои курсы» ниже — курсы из таблицы для роли пользователя.
+
+    | Роль | Что может |
+    |---|---|
+    | `student` | свои курсы: уроки, задания, файлы заданий, черновик, отправка, свои посылки и оценки, свой чат по заданию |
+    | `assistant` | свои курсы: уроки, задания, файлы, последние посылки студентов и их файлы, оценивание, чаты студентов |
+    | `teacher` | свои курсы: всё чтение, что у ассистента, чаты студентов; **создание уроков, заданий и файлов заданий** |
+    | `admin` | чтение курсов, уроков, заданий и посылок всех курсов; создание пользователей и курсов, запись на курсы |
+
+    Порядок проверок: токен (`401`) → роль (`403`) → формат id в пути (`400`) → существование и
+    видимость ресурса (`404`) → тело запроса (`400`, `413`) → состояние (`409`).
+    Ресурс чужого курса для студента и ассистента не существует: `404`, а не `403`.
+
+    ## Посылки
+
+    Студент собирает **черновик**: добавляет файлы (`multipart/form-data`, можно по нескольку за
+    раз) и удаляет их, пока не отправит. Отправка превращает черновик в посылку с очередным номером
+    попытки (`attempt` = 1, 2, …); следующий черновик начинается с нуля. Оценить можно только
+    **последнюю** отправленную посылку студента по заданию; оценку можно менять.
+
+    ## Чат
+
+    Под каждым заданием у каждого студента своя ветка: пишут студент и ассистенты или учителя
+    курса. Студент видит только свою ветку, сотрудники курса выбирают студента параметром
+    `student_id`. Сообщения — от новых к старым, страницами по курсору `before`.
+
+    ## Пагинация
+
+    Списки с `next_cursor` листаются курсором: передайте его в `cursor` следующего запроса, пока
+    он не станет `null` (динамическая подгрузка). Курсор непрозрачен для клиента, формат — на
+    усмотрение сервиса; невалидный курсор — `400 validation_failed`.
+
+    ## Форматы
+
+    - Тела ответов — JSON (`application/json`), кроме скачивания файлов. Порядок ключей не важен.
+    - Время — UTC с миллисекундами и `Z`: `2025-09-14T20:59:00.000Z`.
+    - Описания курсов и заданий — Markdown (CommonMark), в том числе со ссылками; отдаются как есть.
+    - Файл: до 5 MiB (`413` сверх), имя 1–255 символов без `/`; `content_type` — из заголовка
+      части multipart, по умолчанию `application/octet-stream`. В посылке не больше 20 файлов.
+    - Ошибки: `{"error": "<код>"}`, коды — `Error`.
+servers:
+  - url: http://127.0.0.1:8080
+security:
+  - bearer: []
+tags:
+  - name: student
+  - name: assistant
+  - name: admin
+
+paths:
+  /health:
+    get:
+      summary: Живость сервиса и базы
+      security: []
+      responses:
+        "200":
+          description: Сервис и база в порядке (`SELECT 1` прошёл).
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {const: ok}
+        "503":
+          description: База недоступна.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /courses:
+    get:
+      summary: Мои курсы, страницами
+      description: Свои курсы (админ — все), по `id`. Для бесконечной прокрутки — `next_cursor`.
+      tags: [student, assistant, teacher, admin]
+      parameters:
+        - {$ref: "#/components/parameters/limit"}
+        - {$ref: "#/components/parameters/cursor"}
+      responses:
+        "200":
+          description: Страница курсов.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [courses, next_cursor]
+                properties:
+                  courses:
+                    type: array
+                    items: {$ref: "#/components/schemas/Course"}
+                  next_cursor: {type: [string, "null"], description: null — это последняя страница}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+    post:
+      summary: Создать курс
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CourseCreate"}
+      responses:
+        "201":
+          description: Курс создан.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Course"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /courses/{courseId}:
+    parameters:
+      - $ref: "#/components/parameters/courseId"
+    get:
+      summary: Курс
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200":
+          description: Курс.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Course"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /courses/{courseId}/lessons:
+    parameters:
+      - $ref: "#/components/parameters/courseId"
+    get:
+      summary: Уроки курса с заданиями
+      description: По `position`, затем `id`; задания урока — по `deadline`, затем `id`.
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200":
+          description: Уроки.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [lessons]
+                properties:
+                  lessons:
+                    type: array
+                    items: {$ref: "#/components/schemas/Lesson"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      summary: Добавить урок
+      description: Только учитель этого курса (`teacher_courses`).
+      tags: [teacher]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LessonCreate"}
+      responses:
+        "201":
+          description: Урок (`assignments` пустой).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Lesson"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /courses/{courseId}/members:
+    parameters:
+      - $ref: "#/components/parameters/courseId"
+    post:
+      summary: Записать пользователя на курс
+      description: |
+        Добавляет строку в `student_courses`, `assistant_courses` или `teacher_courses` по `role`.
+        `role` должна совпадать с ролью пользователя, иначе `400`. Повторная запись — `409`.
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/Member"}
+      responses:
+        "201":
+          description: Записан.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Member"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /lessons/{lessonId}/assignments:
+    parameters:
+      - $ref: "#/components/parameters/lessonId"
+    post:
+      summary: Добавить задание в урок
+      description: Только учитель курса этого урока.
+      tags: [teacher]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/AssignmentCreate"}
+      responses:
+        "201":
+          description: Задание создано (`files` пустой).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Assignment"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /users:
+    post:
+      summary: Создать аккаунт
+      tags: [admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UserCreate"}
+      responses:
+        "201":
+          description: Пользователь создан.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/User"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /assignments:
+    get:
+      summary: Задания с дедлайнами
+      description: |
+        Задания своих курсов (админ — всех), по возрастанию `deadline`, затем `id`.
+      tags: [student, assistant, teacher, admin]
+      parameters:
+        - name: course_id
+          in: query
+          description: Только этот курс. Нецелое значение — `400 invalid_id`; чужой курс — пустой список.
+          schema: {$ref: "#/components/schemas/Id"}
+      responses:
+        "200":
+          description: Задания.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [assignments]
+                properties:
+                  assignments:
+                    type: array
+                    items: {$ref: "#/components/schemas/AssignmentSummary"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+
+  /assignments/{assignmentId}:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    get:
+      summary: Задание с описанием и списком файлов
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200":
+          description: Задание. `files` — по `id`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Assignment"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /assignments/{assignmentId}/files:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    post:
+      summary: Приложить файлы к заданию
+      description: Только учитель курса.
+      tags: [teacher]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: "#/components/schemas/FilesUpload"}
+      responses:
+        "201":
+          description: Добавленные файлы, в порядке частей запроса.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [files]
+                properties:
+                  files:
+                    type: array
+                    items: {$ref: "#/components/schemas/FileMeta"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+
+  /assignments/{assignmentId}/files/{fileId}:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+      - $ref: "#/components/parameters/fileId"
+    get:
+      summary: Скачать файл задания
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200": {$ref: "#/components/responses/FileContent"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /assignments/{assignmentId}/draft:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    get:
+      summary: Мой черновик посылки
+      tags: [student]
+      responses:
+        "200":
+          description: Черновик (`status` = `draft`).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404":
+          description: Нет задания или черновика.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+
+  /assignments/{assignmentId}/draft/files:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    post:
+      summary: Добавить файлы в черновик
+      description: Создаёт черновик, если его нет.
+      tags: [student]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {$ref: "#/components/schemas/FilesUpload"}
+      responses:
+        "201":
+          description: Черновик целиком.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "413": {$ref: "#/components/responses/PayloadTooLarge"}
+
+  /assignments/{assignmentId}/draft/files/{fileId}:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+      - $ref: "#/components/parameters/fileId"
+    delete:
+      summary: Убрать файл из черновика
+      tags: [student]
+      responses:
+        "200":
+          description: Черновик целиком (может остаться без файлов).
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /assignments/{assignmentId}/draft/submit:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    post:
+      summary: Отправить черновик
+      description: Нет черновика или он пустой — `409`. После дедлайна можно, посылка помечается `late`.
+      tags: [student]
+      responses:
+        "201":
+          description: Отправленная посылка.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /assignments/{assignmentId}/submissions:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+    get:
+      summary: Посылки по заданию
+      description: |
+        Студент — свои отправленные попытки, от последней к первой. Ассистент, учитель и админ —
+        последняя отправленная посылка каждого студента, по `student_id`, страницами.
+      tags: [student, assistant, teacher, admin]
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+        - name: offset
+          in: query
+          schema: {type: integer, minimum: 0, default: 0}
+      responses:
+        "200":
+          description: Посылки без списка файлов.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [submissions]
+                properties:
+                  submissions:
+                    type: array
+                    items: {$ref: "#/components/schemas/SubmissionSummary"}
+        "400":
+          description: "`invalid_id` или `validation_failed` (limit/offset вне диапазона)."
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /submissions/{submissionId}:
+    parameters:
+      - $ref: "#/components/parameters/submissionId"
+    get:
+      summary: Посылка с файлами и оценкой
+      description: Студент — только свои, ассистент и учитель — своих курсов, админ — любые. Чужие черновики не видны никому.
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200":
+          description: Посылка.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /submissions/{submissionId}/files/{fileId}:
+    parameters:
+      - $ref: "#/components/parameters/submissionId"
+      - $ref: "#/components/parameters/fileId"
+    get:
+      summary: Скачать файл посылки
+      description: Видимость как у `GET /submissions/{submissionId}`; свой черновик студенту виден.
+      tags: [student, assistant, teacher, admin]
+      responses:
+        "200": {$ref: "#/components/responses/FileContent"}
+        "400": {$ref: "#/components/responses/InvalidId"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+  /submissions/{submissionId}/grade:
+    parameters:
+      - $ref: "#/components/parameters/submissionId"
+    put:
+      summary: Оценить посылку
+      description: |
+        Только ассистент курса. Только последнюю отправленную посылку студента по заданию, иначе
+        `409`. `score` — от 0 до `max_score` задания. Повторная оценка заменяет прежнюю.
+      tags: [assistant]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/GradeRequest"}
+      responses:
+        "200":
+          description: Посылка с оценкой.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Submission"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+
+  /assignments/{assignmentId}/chat:
+    parameters:
+      - $ref: "#/components/parameters/assignmentId"
+      - name: student_id
+        in: query
+        description: |
+          Ветка какого студента. Студенту не нужен (если передан — только свой id, иначе `403`).
+          Ассистенту, учителю и админу обязателен (`400 validation_failed` без него); студент должен
+          быть записан на курс задания, иначе `404`.
+        schema: {$ref: "#/components/schemas/Id"}
+    get:
+      summary: Сообщения ветки, от новых к старым
+      tags: [student, assistant, teacher, admin]
+      parameters:
+        - {$ref: "#/components/parameters/limit"}
+        - {$ref: "#/components/parameters/cursor"}
+      responses:
+        "200":
+          description: Страница сообщений.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [messages, next_cursor]
+                properties:
+                  messages:
+                    type: array
+                    items: {$ref: "#/components/schemas/ChatMessage"}
+                  next_cursor: {type: [string, "null"], description: более старые сообщения; null — дальше нет}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+    post:
+      summary: Написать в ветку
+      description: Писать могут студент (в свою ветку), ассистенты и учителя курса. Админ — только читает (`403`).
+      tags: [student, assistant, teacher]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/ChatMessageCreate"}
+      responses:
+        "201":
+          description: Сообщение.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ChatMessage"}
+        "400": {$ref: "#/components/responses/ValidationFailed"}
+        "401": {$ref: "#/components/responses/Unauthorized"}
+        "403": {$ref: "#/components/responses/Forbidden"}
+        "404": {$ref: "#/components/responses/NotFound"}
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: HS256; клеймы — `JwtClaims`.
+
+  parameters:
+    courseId: {name: courseId, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    assignmentId: {name: assignmentId, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    submissionId: {name: submissionId, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    fileId: {name: fileId, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    lessonId: {name: lessonId, in: path, required: true, schema: {$ref: "#/components/schemas/Id"}}
+    limit:
+      name: limit
+      in: query
+      description: Размер страницы; вне диапазона — `400 validation_failed`.
+      schema: {type: integer, minimum: 1, maximum: 100, default: 20}
+    cursor:
+      name: cursor
+      in: query
+      description: "`next_cursor` из предыдущего ответа."
+      schema: {type: string}
+
+  responses:
+    Unauthorized:
+      description: "`missing_token` (нет заголовка или он не `Bearer …`) или `invalid_token`."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Forbidden:
+      description: "`forbidden`: эндпоинт не для этой роли."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    InvalidId:
+      description: "`invalid_id`: id в пути или `course_id` — не целое положительное число."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    NotFound:
+      description: "`not_found`: нет такого пути или ресурса, или он не виден пользователю."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    ValidationFailed:
+      description: "`invalid_id` или `validation_failed`: тело не по схеме (в том числе битый JSON или multipart)."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Conflict:
+      description: "`conflict`: занятое имя или код, повторная запись, пустой черновик, не последняя посылка."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    PayloadTooLarge:
+      description: "`payload_too_large`: файл больше 5 MiB."
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    FileContent:
+      description: Содержимое файла байт в байт.
+      headers:
+        Content-Disposition:
+          description: "`attachment; filename*=UTF-8''<имя>`, имя в percent-encoding по RFC 3986 (unreserved как есть, остальные байты UTF-8 — `%XX` заглавными)"
+          schema: {type: string}
+      content:
+        "*/*":
+          schema: {contentMediaType: application/octet-stream}
+
+  schemas:
+    Id:
+      type: integer
+      format: int64
+      minimum: 1
+    Timestamp:
+      type: string
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples: ["2025-09-14T20:59:00.000Z"]
+    Role:
+      type: string
+      enum: [student, assistant, teacher, admin]
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          enum: [missing_token, invalid_token, forbidden, invalid_id, not_found, validation_failed,
+                 conflict, payload_too_large, unavailable, internal]
+
+    JwtClaims:
+      type: object
+      required: [sub, name, role, exp]
+      description: Невалидные клеймы (нет `sub`, `role` не из списка и т. п.) — `401 invalid_token`.
+      properties:
+        sub: {type: string, pattern: '^[1-9][0-9]*$', description: id пользователя}
+        name: {type: string, description: ФИО}
+        role: {$ref: "#/components/schemas/Role"}
+        iat: {type: integer}
+        exp: {type: integer}
+
+    User:
+      type: object
+      required: [id, username, full_name, role]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        username: {type: string}
+        full_name: {type: string}
+        role: {$ref: "#/components/schemas/Role"}
+    UserCreate:
+      type: object
+      required: [username, full_name, role]
+      properties:
+        username: {type: string, pattern: '^[a-z0-9._-]{3,64}$'}
+        full_name: {type: string, minLength: 1, maxLength: 200}
+        role: {$ref: "#/components/schemas/Role"}
+
+    Course:
+      type: object
+      required: [id, code, title, description, term]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        code: {type: string, examples: [akos-1]}
+        title: {type: string, examples: [АКОС 1]}
+        description: {type: string, description: Markdown}
+        term: {type: string, examples: ["2025/26, осень"]}
+    CourseCreate:
+      type: object
+      required: [code, title, description, term]
+      properties:
+        code: {type: string, pattern: '^[a-z0-9-]{2,64}$'}
+        title: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 100000}
+        term: {type: string, minLength: 1, maxLength: 100}
+    Member:
+      type: object
+      required: [user_id, role]
+      properties:
+        course_id: {$ref: "#/components/schemas/Id", readOnly: true}
+        user_id: {$ref: "#/components/schemas/Id"}
+        role: {type: string, enum: [student, assistant, teacher]}
+
+    AssignmentSummary:
+      type: object
+      required: [id, course_id, lesson_id, title, deadline, max_score]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        course_id: {$ref: "#/components/schemas/Id"}
+        lesson_id: {$ref: "#/components/schemas/Id"}
+        title: {type: string}
+        deadline: {$ref: "#/components/schemas/Timestamp"}
+        max_score: {type: integer, minimum: 1}
+    Assignment:
+      allOf:
+        - $ref: "#/components/schemas/AssignmentSummary"
+        - type: object
+          required: [description, files]
+          properties:
+            description: {type: string, description: Markdown, может содержать ссылки}
+            files:
+              type: array
+              items: {$ref: "#/components/schemas/FileMeta"}
+    AssignmentCreate:
+      type: object
+      required: [title, description, deadline, max_score]
+      properties:
+        title: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 100000}
+        deadline: {$ref: "#/components/schemas/Timestamp"}
+        max_score: {type: integer, minimum: 1, maximum: 1000}
+
+    Lesson:
+      type: object
+      required: [id, course_id, position, title, description, assignments]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        course_id: {$ref: "#/components/schemas/Id"}
+        position: {type: integer}
+        title: {type: string}
+        description: {type: string, description: Markdown}
+        assignments:
+          type: array
+          items: {$ref: "#/components/schemas/AssignmentSummary"}
+    LessonCreate:
+      type: object
+      required: [position, title, description]
+      properties:
+        position: {type: integer, minimum: 0, maximum: 10000}
+        title: {type: string, minLength: 1, maxLength: 200}
+        description: {type: string, maxLength: 100000}
+
+    ChatMessage:
+      type: object
+      required: [id, assignment_id, student_id, author, body, created_at]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        assignment_id: {$ref: "#/components/schemas/Id"}
+        student_id: {$ref: "#/components/schemas/Id", description: ветка}
+        author:
+          type: object
+          required: [id, full_name, role]
+          properties:
+            id: {$ref: "#/components/schemas/Id"}
+            full_name: {type: string}
+            role: {$ref: "#/components/schemas/Role"}
+        body: {type: string}
+        created_at: {$ref: "#/components/schemas/Timestamp"}
+    ChatMessageCreate:
+      type: object
+      required: [body]
+      properties:
+        body: {type: string, minLength: 1, maxLength: 4000, description: текст; пустой после обрезки пробелов — 400}
+
+    FileMeta:
+      type: object
+      required: [id, name, content_type, size]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        name: {type: string}
+        content_type: {type: string}
+        size: {type: integer, description: байты}
+    FilesUpload:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          minItems: 1
+          items: {type: string, contentMediaType: application/octet-stream}
+      description: Одна или несколько частей с именем `files` и именем файла (`filename`).
+
+    SubmissionSummary:
+      type: object
+      required: [id, assignment_id, student_id, attempt, submitted_at, late, score]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        assignment_id: {$ref: "#/components/schemas/Id"}
+        student_id: {$ref: "#/components/schemas/Id"}
+        attempt: {type: integer, minimum: 1}
+        submitted_at: {$ref: "#/components/schemas/Timestamp"}
+        late: {type: boolean, description: "submitted_at > deadline задания"}
+        score: {type: [integer, "null"]}
+    Submission:
+      type: object
+      required: [id, assignment_id, student_id, status, attempt, submitted_at, late, score, feedback, graded_at, files]
+      properties:
+        id: {$ref: "#/components/schemas/Id"}
+        assignment_id: {$ref: "#/components/schemas/Id"}
+        student_id: {$ref: "#/components/schemas/Id"}
+        status: {type: string, enum: [draft, submitted]}
+        attempt: {type: [integer, "null"], description: null у черновика}
+        submitted_at:
+          oneOf: [{$ref: "#/components/schemas/Timestamp"}, {type: "null"}]
+        late: {type: boolean, description: false у черновика}
+        score: {type: [integer, "null"]}
+        feedback: {type: [string, "null"]}
+        graded_at:
+          oneOf: [{$ref: "#/components/schemas/Timestamp"}, {type: "null"}]
+        files:
+          type: array
+          items: {$ref: "#/components/schemas/FileMeta"}
+          description: по id
+    GradeRequest:
+      type: object
+      required: [score]
+      properties:
+        score: {type: integer, minimum: 0}
+        feedback: {type: [string, "null"], maxLength: 10000}

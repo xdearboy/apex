@@ -1,0 +1,13 @@
+services:
+  apex:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apex-proxy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./conf/apex.conf:/etc/apex/apex.conf:ro
+    restart: unless-stopped
+    stop_signal: SIGQUIT
+    stop_grace_period: 30s

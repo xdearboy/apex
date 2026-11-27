@@ -151,8 +151,13 @@ typedef struct {
     size_t server_index;
     uint64_t elapsed_us;
     int upstream_fd;
+    void *upstream_ssl;
+    void *upstream_server;
     char *leftover_data;
     size_t leftover_len;
+    char *trailers;
+    size_t trailers_len;
+    bool trailers_dynamic;
 } apex_proxy_response_t;
 typedef struct {
     size_t idle_connections;
@@ -191,6 +196,7 @@ int apex_proxy_forward(upstream_group_t *group, const apex_proxy_request_t *requ
 
 /* Operate on the calling thread's idle connection cache only. */
 void apex_proxy_pool_reset(void);
+void apex_proxy_thread_cleanup(void);
 void apex_proxy_pool_get_stats(apex_proxy_pool_stats_t *stats);
 
 const char *apex_proxy_strerror(int error_code);

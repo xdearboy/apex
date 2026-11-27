@@ -22,6 +22,28 @@
   reset when the drain path closed the listener; the accept queue is now drained before
   the listener is closed so idle clients always observe FIN.
 
+## [1.4.0]
+
+### Added
+- **HTTP/3 & QUIC Transport Engine**:
+  - Full RFC 9000 (QUIC), RFC 9114 (HTTP/3), and RFC 9204 (QPACK) transport engine powered by `ngtcp2 1.11.0`, `ngtcp2_crypto_ossl`, `nghttp3 1.8.0`, and OpenSSL 3.5.9.
+  - Dual-stack UDP listeners with `SO_REUSEPORT` bound concurrently on configured TLS ports.
+  - Dedicated dynamic Connection ID (CID) hash table (`cid_map`) tracking SCID, DCID, and newly issued CIDs via `quic_get_new_cid`.
+  - Automatic `Alt-Svc: h3=":<port>"; ma=86400` advertising header injected into all TLS responses.
+- **Full gRPC Streaming Engine**:
+  - Full-duplex gRPC Server-Streaming, Client-Streaming, and Bidirectional Streaming over HTTP/2.
+  - Trailing headers emitted via `nghttp2_submit_trailer` in `h2_data_read` at EOF with `NGHTTP2_DATA_FLAG_NO_END_STREAM`.
+  - Clean Trailers-Only response handling and propagation of `grpc-status`, `grpc-message`, and custom gRPC metadata.
+- **Automated Background ACME / Let's Encrypt TLS Renewal (RFC 8555)**:
+  - Autonomous background renewal worker evaluating certificate expiration.
+  - Automatic ECDSA P-256 key pair generation, CSR issuance, and RFC 8555 HTTP-01 challenge completion via `/.well-known/acme-challenge/*` router interceptor.
+  - Zero-downtime TLS context hot-reload via `apex_tls_reload_context`.
+- **Dual Extensibility Engine (LuaJIT 2.1 & WasmEdge 0.14.1)**:
+  - LuaJIT 2.1 integration supporting `access_by_lua`, `content_by_lua`, and `header_filter_by_lua` with C/Lua bridge (`apex.req.get_header()`, `apex.resp.set_header()`, `apex.say()`, `apex.exit()`, `apex.log()`).
+  - Native WebAssembly runtime integration using WasmEdge 0.14.1 Proxy ABI (`wasm_filter "<path.wasm>";`) with host functions for header mutation, access control, and dynamic body generation.
+- **Production Packaging**:
+  - Updated Debian packaging script to generate production package `apex_1.4.0_amd64.deb` including all Phase 13 runtime dependencies.
+
 ## [1.3.2]
 
 ### Changed / Code Quality

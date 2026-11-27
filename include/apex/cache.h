@@ -20,6 +20,7 @@ typedef struct {
     char *body;
     size_t body_len;
     uint64_t expires_at_ms;
+    uint64_t age_seconds;
 } apex_cached_response_t;
 
 apex_cache_manager_t *apex_cache_manager_create(const apex_config_t *config);

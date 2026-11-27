@@ -123,11 +123,11 @@ class TestDynamicDNSResolver(unittest.TestCase):
         cls.dns_server = MockDNSServer(ip_to_return="127.0.0.1", ttl=1)
         cls.apex_port = free_port()
 
-        cls.httpd1 = http.server.HTTPServer(("127.0.0.1", cls.backend_port1), SimpleEchoBackend)
+        cls.httpd1 = http.server.ThreadingHTTPServer(("127.0.0.1", cls.backend_port1), SimpleEchoBackend)
         cls.thread1 = threading.Thread(target=cls.httpd1.serve_forever, daemon=True)
         cls.thread1.start()
 
-        cls.httpd2 = http.server.HTTPServer(("127.0.0.1", cls.backend_port2), SimpleEchoBackend)
+        cls.httpd2 = http.server.ThreadingHTTPServer(("127.0.0.1", cls.backend_port2), SimpleEchoBackend)
         cls.thread2 = threading.Thread(target=cls.httpd2.serve_forever, daemon=True)
         cls.thread2.start()
 

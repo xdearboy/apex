@@ -14,6 +14,10 @@ Designed for extreme throughput and sub-millisecond tail latency, Apex utilizes 
 - **Edge-Triggered Epoll (`EPOLLET`)**: Non-blocking event loop using `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)`.
 - **Zero-Allocation Hot Path**: Pre-allocated connection state indexed by file descriptor; zero dynamic heap allocations per request.
 - **HTTP Pipelining**: Drains and batches pipelined requests in a single read/write syscall cycle.
+- **HTTP/3 & QUIC Engine**: Full RFC 9000 & RFC 9114 HTTP/3 server powered by `ngtcp2`, `nghttp3`, and OpenSSL 3.5.9 with connection migration and dynamic CID routing.
+- **Full gRPC Streaming**: Unary, server-streaming, client-streaming, and bidirectional gRPC reverse proxying over HTTP/2 with trailers and metadata propagation.
+- **Automated ACME TLS (RFC 8555)**: Automated background Let's Encrypt certificate issuance and zero-downtime TLS context hot-reload.
+- **Dual Extensibility Engine**: High-speed dynamic scripting with LuaJIT 2.1 and native sandboxed WebAssembly execution via WasmEdge 0.14.1.
 - **Microsecond Precision**: Microsecond-resolution timer heap with sub-millisecond polling accuracy.
 
 ## Quick Start

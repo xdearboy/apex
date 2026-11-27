@@ -4,12 +4,19 @@ tachyon
 hello-server
 tests/test_config
 tests/test_http
+tests/test_pool
+tests/test_filter
+examples/config_demo
+examples/hello_world
+examples/proxy_demo
+examples/web_frameworks
 *.dSYM/
 *.o
 *.so
 *.dylib
 *.a
 /src/build_meta.h
+/src/core/build_meta.h
 __pycache__/
 
 # Certificates and keys
@@ -24,3 +31,4 @@ __pycache__/
 .system_generated/
 OPENCODE_GUIDE.md
 .DS_Store
+*.deb

@@ -58,6 +58,11 @@ class BackendHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+class ThreadedBackend(http.server.ThreadingHTTPServer):
+    request_queue_size = 128
+    daemon_threads = True
+
+
 class TestUpstreamAPI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -65,11 +70,11 @@ class TestUpstreamAPI(unittest.TestCase):
         cls.port_be2 = free_port()
         cls.apex_port = free_port()
 
-        cls.httpd1 = http.server.HTTPServer(("127.0.0.1", cls.port_be1), BackendHandler)
+        cls.httpd1 = ThreadedBackend(("127.0.0.1", cls.port_be1), BackendHandler)
         cls.thread1 = threading.Thread(target=cls.httpd1.serve_forever, daemon=True)
         cls.thread1.start()
 
-        cls.httpd2 = http.server.HTTPServer(("127.0.0.1", cls.port_be2), BackendHandler)
+        cls.httpd2 = ThreadedBackend(("127.0.0.1", cls.port_be2), BackendHandler)
         cls.thread2 = threading.Thread(target=cls.httpd2.serve_forever, daemon=True)
         cls.thread2.start()
 
@@ -146,8 +151,12 @@ http {{
                 cls.proc.kill()
         cls.httpd1.shutdown()
         cls.httpd2.shutdown()
-        os.unlink(cls.conf_file.name)
-        os.unlink(cls.htpasswd_file.name)
+        for f in (getattr(cls, "conf_file", None), getattr(cls, "htpasswd_file", None)):
+            if f and hasattr(f, "name"):
+                try:
+                    os.unlink(f.name)
+                except OSError:
+                    pass
 
     def _request(self, method, path, body=None, headers=None):
         status, parsed, _ = self._request_full(method, path, body=body, headers=headers)

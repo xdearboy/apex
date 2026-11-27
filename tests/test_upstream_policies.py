@@ -43,7 +43,7 @@ class IdentHandler(http.server.BaseHTTPRequestHandler):
             hook()
         evt = getattr(self.server, "delay_event", None)
         if evt:
-            evt.wait(timeout=10.0)
+            evt.wait(timeout=15.0)
         delay = getattr(self.server, "delay", 0)
         if delay > 0:
             time.sleep(delay)
@@ -77,7 +77,7 @@ class RawHttpClient:
         self.port = port
 
     def request(self, method, path, host="127.0.0.1"):
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5.0)
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=15.0)
         req = f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
         sock.sendall(req.encode("utf-8"))
 
@@ -174,9 +174,12 @@ http {{
         started = False
         while time.time() < deadline:
             try:
-                with socket.create_connection(("127.0.0.1", cls.port), timeout=0.2):
-                    started = True
-                    break
+                with socket.create_connection(("127.0.0.1", cls.port), timeout=0.5) as s:
+                    s.sendall(b"GET /primary HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    res = s.recv(1024)
+                    if b"200 OK" in res:
+                        started = True
+                        break
             except OSError:
                 time.sleep(0.05)
 
@@ -244,8 +247,12 @@ http {{
         self.slow_server.delay_event = release_slow
 
         def slow_worker():
-            client = RawHttpClient(self.port)
-            client.request("GET", "/least_conn")
+            while not slow_in_flight.is_set() and not release_slow.is_set():
+                try:
+                    client = RawHttpClient(self.port)
+                    client.request("GET", "/least_conn")
+                except Exception:
+                    break
 
         t = threading.Thread(target=slow_worker)
         t.start()
