@@ -1249,7 +1249,36 @@ static void *worker_main(void *arg) {
             break;
         }
 
-        int ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        int ready_events_count = 0;
+#if defined(APEX_HAVE_URING)
+        if (worker->use_uring) {
+            struct __kernel_timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+            struct io_uring_cqe *cqe = NULL;
+            int ret = io_uring_wait_cqe_timeout(&worker->ring, &cqe, &ts);
+            if (ret == 0 && cqe != NULL) {
+                /* Multishot poll notification received */
+                bool rearm_needed = !(cqe->flags & IORING_CQE_F_MORE);
+                io_uring_cqe_seen(&worker->ring, cqe);
+                if (rearm_needed) {
+                    struct io_uring_sqe *sqe = io_uring_get_sqe(&worker->ring);
+                    if (sqe != NULL) {
+                        io_uring_prep_poll_multishot(sqe, worker->epoll_fd, POLLIN);
+                        io_uring_sqe_set_data64(sqe, 0x1ULL);
+                        io_uring_submit(&worker->ring);
+                    }
+                }
+                ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 0);
+            } else if (ret == -ETIME || ret == -EINTR) {
+                ready_events_count = 0;
+            } else {
+                ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 0);
+            }
+        } else {
+            ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        }
+#else
+        ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+#endif
         if (ready_events_count < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1398,6 +1427,12 @@ worker_finished:
     apex_static_cache_flush();
     apex_generation_release(worker->generation);
     worker->generation = NULL;
+#if defined(APEX_HAVE_URING)
+    if (worker->use_uring) {
+        io_uring_queue_exit(&worker->ring);
+        worker->use_uring = false;
+    }
+#endif
     atomic_store_explicit(&worker->finished, true, memory_order_release);
     if (notify_fd(worker->control->status_fd) != 0) {
         atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
@@ -1574,6 +1609,24 @@ static int prepare_worker(worker_arg_t *worker, const apex_listener_set_t *liste
         close_fd(&worker->epoll_fd);
         return -1;
     }
+#if defined(APEX_HAVE_URING)
+    worker->use_uring = false;
+    int uring_ret = io_uring_queue_init(MAX_EVENTS * 2, &worker->ring, 0);
+    if (uring_ret == 0) {
+        struct io_uring_sqe *sqe = io_uring_get_sqe(&worker->ring);
+        if (sqe != NULL) {
+            io_uring_prep_poll_multishot(sqe, worker->epoll_fd, POLLIN);
+            io_uring_sqe_set_data64(sqe, 0x1ULL);
+            if (io_uring_submit(&worker->ring) >= 0) {
+                worker->use_uring = true;
+            } else {
+                io_uring_queue_exit(&worker->ring);
+            }
+        } else {
+            io_uring_queue_exit(&worker->ring);
+        }
+    }
+#endif
     worker->listener_count = listener_set->count;
     for (size_t li = 0; li < listener_set->count; li++) {
         const apex_listener_endpoint_t *ep = &listener_set->endpoints[li];
@@ -2110,6 +2163,12 @@ cleanup:
             if (close_fd(&workers[index].epoll_fd) != 0) {
                 result = 1;
             }
+#if defined(APEX_HAVE_URING)
+            if (workers[index].use_uring) {
+                io_uring_queue_exit(&workers[index].ring);
+                workers[index].use_uring = false;
+            }
+#endif
         }
         free(workers);
     }

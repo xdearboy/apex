@@ -2019,107 +2019,60 @@ static bool parse_compress_types(parser_t *parser, char ***types_out, size_t *co
     return true;
 }
 
-static bool parse_compress_directive(parser_t *parser, const token_t *directive,
-                                     apex_compress_config_t *compress, bool *has_compress,
-                                     bool *handled) {
+static bool parse_compress_algo_directive(parser_t *parser, const token_t *directive,
+                                           const char *algo, bool *enabled, bool *has_flag,
+                                           uint32_t *min_length, int *comp_level,
+                                           int min_lvl, int max_lvl,
+                                           char ***types, size_t *type_count,
+                                           bool *has_compress, bool *handled) {
+    size_t algo_len = strlen(algo);
+    if (!token_is_word(directive, algo) &&
+        (strncmp(directive->text, algo, algo_len) != 0 || directive->text[algo_len] != '_')) {
+        return true;
+    }
+
     *handled = true;
-    if (token_is_word(directive, "gzip")) {
+    const char *suffix = directive->text + algo_len;
+
+    if (*suffix == '\0') {
         const token_t *val = parser_scalar(parser, "on or off");
         if (val == NULL) return false;
         if (token_is_word(val, "on")) {
-            compress->gzip_enabled = true;
-            compress->has_gzip = true;
+            *enabled = true;
+            *has_flag = true;
             *has_compress = true;
         } else if (token_is_word(val, "off")) {
-            compress->gzip_enabled = false;
-            compress->has_gzip = true;
+            *enabled = false;
+            *has_flag = true;
             *has_compress = true;
         } else {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "gzip must be on or off");
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "%s must be on or off", algo);
             return false;
         }
-    } else if (token_is_word(directive, "gzip_min_length")) {
+    } else if (strcmp(suffix, "_min_length") == 0) {
         const token_t *val = parser_scalar(parser, "a minimum body length in bytes");
         if (val == NULL) return false;
         size_t size_bytes = 0;
         if (!parse_size_str(val->text, &size_bytes)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid gzip_min_length");
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid %s", directive->text);
             return false;
         }
-        compress->gzip_min_length = (uint32_t)size_bytes;
+        if (min_length != NULL) *min_length = (uint32_t)size_bytes;
         *has_compress = true;
-    } else if (token_is_word(directive, "gzip_comp_level")) {
-        const token_t *val = parser_scalar(parser, "a compression level (1-9)");
+    } else if (strcmp(suffix, "_comp_level") == 0) {
+        char desc[64];
+        snprintf(desc, sizeof(desc), "a compression level (%d-%d)", min_lvl, max_lvl);
+        const token_t *val = parser_scalar(parser, desc);
         if (val == NULL) return false;
         uint64_t level = 0;
-        if (!token_to_u64(val, 1, 9, &level)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "gzip_comp_level must be between 1 and 9");
+        if (!token_to_u64(val, (uint64_t)min_lvl, (uint64_t)max_lvl, &level)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "%s must be between %d and %d", directive->text, min_lvl, max_lvl);
             return false;
         }
-        compress->gzip_comp_level = (int)level;
+        *comp_level = (int)level;
         *has_compress = true;
-    } else if (token_is_word(directive, "gzip_types")) {
-        if (!parse_compress_types(parser, &compress->gzip_types, &compress->gzip_type_count)) {
-            return false;
-        }
-        *has_compress = true;
-    } else if (token_is_word(directive, "brotli")) {
-        const token_t *val = parser_scalar(parser, "on or off");
-        if (val == NULL) return false;
-        if (token_is_word(val, "on")) {
-            compress->brotli_enabled = true;
-            compress->has_brotli = true;
-            *has_compress = true;
-        } else if (token_is_word(val, "off")) {
-            compress->brotli_enabled = false;
-            compress->has_brotli = true;
-            *has_compress = true;
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "brotli must be on or off");
-            return false;
-        }
-    } else if (token_is_word(directive, "brotli_comp_level")) {
-        const token_t *val = parser_scalar(parser, "a compression level (1-11)");
-        if (val == NULL) return false;
-        uint64_t level = 0;
-        if (!token_to_u64(val, 1, 11, &level)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "brotli_comp_level must be between 1 and 11");
-            return false;
-        }
-        compress->brotli_comp_level = (int)level;
-        *has_compress = true;
-    } else if (token_is_word(directive, "brotli_types")) {
-        if (!parse_compress_types(parser, &compress->brotli_types, &compress->brotli_type_count)) {
-            return false;
-        }
-        *has_compress = true;
-    } else if (token_is_word(directive, "zstd")) {
-        const token_t *val = parser_scalar(parser, "on or off");
-        if (val == NULL) return false;
-        if (token_is_word(val, "on")) {
-            compress->zstd_enabled = true;
-            compress->has_zstd = true;
-            *has_compress = true;
-        } else if (token_is_word(val, "off")) {
-            compress->zstd_enabled = false;
-            compress->has_zstd = true;
-            *has_compress = true;
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "zstd must be on or off");
-            return false;
-        }
-    } else if (token_is_word(directive, "zstd_comp_level")) {
-        const token_t *val = parser_scalar(parser, "a compression level (1-19)");
-        if (val == NULL) return false;
-        uint64_t level = 0;
-        if (!token_to_u64(val, 1, 19, &level)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "zstd_comp_level must be between 1 and 19");
-            return false;
-        }
-        compress->zstd_comp_level = (int)level;
-        *has_compress = true;
-    } else if (token_is_word(directive, "zstd_types")) {
-        if (!parse_compress_types(parser, &compress->zstd_types, &compress->zstd_type_count)) {
+    } else if (strcmp(suffix, "_types") == 0) {
+        if (!parse_compress_types(parser, types, type_count)) {
             return false;
         }
         *has_compress = true;
@@ -2129,6 +2082,37 @@ static bool parse_compress_directive(parser_t *parser, const token_t *directive,
     return true;
 }
 
+static bool parse_compress_directive(parser_t *parser, const token_t *directive,
+                                     apex_compress_config_t *compress, bool *has_compress,
+                                     bool *handled) {
+    *handled = false;
+    if (!parse_compress_algo_directive(parser, directive, "gzip",
+                                       &compress->gzip_enabled, &compress->has_gzip,
+                                       &compress->gzip_min_length, &compress->gzip_comp_level,
+                                       1, 9, &compress->gzip_types, &compress->gzip_type_count,
+                                       has_compress, handled)) {
+        return false;
+    }
+    if (*handled) return true;
+
+    if (!parse_compress_algo_directive(parser, directive, "brotli",
+                                       &compress->brotli_enabled, &compress->has_brotli,
+                                       NULL, &compress->brotli_comp_level,
+                                       1, 11, &compress->brotli_types, &compress->brotli_type_count,
+                                       has_compress, handled)) {
+        return false;
+    }
+    if (*handled) return true;
+
+    if (!parse_compress_algo_directive(parser, directive, "zstd",
+                                       &compress->zstd_enabled, &compress->has_zstd,
+                                       NULL, &compress->zstd_comp_level,
+                                       1, 19, &compress->zstd_types, &compress->zstd_type_count,
+                                       has_compress, handled)) {
+        return false;
+    }
+    return true;
+}
 static bool compress_config_inherit(apex_compress_config_t *dst, bool *dst_has,
                                     const apex_compress_config_t *src, bool src_has) {
     if (!src_has) return true;

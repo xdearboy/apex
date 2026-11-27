@@ -65,8 +65,10 @@ WASM_CFLAGS := $(shell pkg-config --cflags wasmedge 2>/dev/null || printf '')
 WASM_LIBS := $(shell pkg-config --libs wasmedge 2>/dev/null || printf '%s ' -lwasmedge)
 QUIC_CFLAGS := $(shell pkg-config --cflags libngtcp2 libngtcp2_crypto_ossl libnghttp3 2>/dev/null || printf '')
 QUIC_LIBS := $(shell pkg-config --libs libngtcp2 libngtcp2_crypto_ossl libnghttp3 2>/dev/null || printf '%s ' -lngtcp2 -lngtcp2_crypto_ossl -lnghttp3)
-CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS) $(COMPRESS_CFLAGS) $(LUA_CFLAGS) $(WASM_CFLAGS) $(QUIC_CFLAGS)
-LDLIBS = $(TLS_LIBS) $(H2_LIBS) $(COMPRESS_LIBS) $(LUA_LIBS) $(WASM_LIBS) $(QUIC_LIBS) -ldl -lm
+URING_CFLAGS := $(shell pkg-config --cflags liburing 2>/dev/null && printf '%s ' -DAPEX_HAVE_URING)
+URING_LIBS := $(shell pkg-config --libs liburing 2>/dev/null)
+CFLAGS += $(TLS_CFLAGS) $(H2_CFLAGS) $(COMPRESS_CFLAGS) $(LUA_CFLAGS) $(WASM_CFLAGS) $(QUIC_CFLAGS) $(URING_CFLAGS)
+LDLIBS = $(TLS_LIBS) $(H2_LIBS) $(COMPRESS_LIBS) $(LUA_LIBS) $(WASM_LIBS) $(QUIC_LIBS) $(URING_LIBS) -ldl -lm
 
 EXAMPLES = examples/web_frameworks examples/hello_world examples/proxy_demo \
            examples/config_demo examples/mod_security_headers.so

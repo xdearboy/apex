@@ -35,7 +35,7 @@ Section: net
 Priority: optional
 Architecture: ${ARCH}
 Maintainer: Apex Proxy Team <apex@example.com>
-Depends: libc6, libssl3, libnghttp2-14, libbrotlienc1, libzstd1, zlib1g, libluajit-5.1-2, libwasmedge0, libngtcp2-16, libngtcp2-crypto-ossl0, libnghttp3-9
+Depends: libc6, libssl3t64 | libssl3, libnghttp2-14, libbrotli1 | libbrotlienc1, libzstd1, zlib1g, libluajit-5.1-2, libwasmedge0, libngtcp2-16, libngtcp2-crypto-ossl0, libnghttp3-9
 Description: Apex high-performance HTTP reverse proxy and edge router
  Apex is an ultra-low latency, concurrent reverse proxy, load balancer,
  and edge router written in C23 with native HTTP/1.1, HTTP/2, HTTP/3 (QUIC),

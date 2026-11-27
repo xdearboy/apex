@@ -39,6 +39,11 @@
 
 #include <openssl/ssl.h>
 
+#if defined(APEX_HAVE_URING)
+#include <liburing.h>
+#include <poll.h>
+#endif
+
 #define MAX_FDS 65536
 #define MAX_EVENTS 512
 #define BUF_SIZE 16384
@@ -223,6 +228,10 @@ struct worker_arg {
     _Atomic int error;
     _Atomic bool finished;
     apex_worker_metrics_t metrics;
+#if defined(APEX_HAVE_URING)
+    bool use_uring;
+    struct io_uring ring;
+#endif
 } __attribute__((aligned(64)));
 
 void apex_worker_set_current(worker_arg_t *worker);
