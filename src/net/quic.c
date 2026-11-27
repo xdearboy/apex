@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/udp.h>
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
@@ -21,9 +22,19 @@
 #include <openssl/rand.h>
 #include <openssl/err.h>
 
+#ifndef SOL_UDP
+#define SOL_UDP 17
+#endif
+
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+
 #define QUIC_CONN_MAP_SIZE 1024
 #define QUIC_MAX_HEADERS 64
 #define QUIC_OUTPUT_PKT_SIZE 1452
+#define QUIC_GSO_MAX_BURST 65536
+#define QUIC_RECV_BATCH 16
 
 /* Upstream ngtcp2_crypto declarations */
 int ngtcp2_crypto_recv_client_initial_cb(ngtcp2_conn *conn, const ngtcp2_cid *dcid, void *user_data);
@@ -135,6 +146,7 @@ struct apex_quic_server {
     apex_quic_cid_entry_t *cid_map[QUIC_CONN_MAP_SIZE];
     apex_quic_conn_t *all_conns;
     size_t connection_count;
+    bool gso_disabled;
 };
 
 static ngtcp2_tstamp quic_get_tstamp(void) {
@@ -775,16 +787,92 @@ static int q_acked_stream_data_offset(ngtcp2_conn *conn, int64_t stream_id,
 
 static int q_stream_close(ngtcp2_conn *conn, uint32_t flags, int64_t stream_id,
                           uint64_t app_error_code, void *user_data, void *stream_user_data) {
-    (void)conn; (void)flags; (void)stream_user_data;
+    (void)flags; (void)stream_user_data;
     apex_quic_conn_t *c = user_data;
     if (c->h3conn != NULL) {
         nghttp3_conn_close_stream(c->h3conn, stream_id, app_error_code);
     }
+    if ((stream_id & 0x02) == 0) {
+        ngtcp2_conn_extend_max_streams_bidi(conn, 1);
+    }
     return 0;
+}
+
+static void quic_send_burst(apex_quic_conn_t *conn, const uint8_t *buf, size_t len,
+                            size_t seg_size, size_t pkt_cnt) {
+    if (conn == NULL || len == 0 || pkt_cnt == 0) {
+        return;
+    }
+
+    const ngtcp2_path *active_path = ngtcp2_conn_get_path(conn->qconn);
+    const struct sockaddr *dest_addr = (active_path && active_path->remote.addr)
+                                       ? (const struct sockaddr *)active_path->remote.addr
+                                       : (const struct sockaddr *)&conn->peer_addr;
+    socklen_t dest_len = (active_path && active_path->remote.addr)
+                         ? (socklen_t)active_path->remote.addrlen
+                         : conn->peer_addrlen;
+
+    if (pkt_cnt == 1 || conn->server->gso_disabled) {
+        /* Single datagram or GSO disabled: send segment by segment */
+        size_t offset = 0;
+        while (offset < len) {
+            size_t send_sz = (len - offset > seg_size) ? seg_size : (len - offset);
+            ssize_t sent = sendto(conn->server->udp_fd, buf + offset, send_sz, 0,
+                                  dest_addr, dest_len);
+            if (sent < 0) {
+                break;
+            }
+            offset += send_sz;
+        }
+        return;
+    }
+
+    /* Multiple datagrams: send as a single GSO burst via sendmsg */
+    struct msghdr msg;
+    struct iovec iov;
+    char cbuf[CMSG_SPACE(sizeof(uint16_t))];
+
+    iov.iov_base = (void *)buf;
+    iov.iov_len = len;
+
+    memset(&msg, 0, sizeof(msg));
+    msg.msg_name = (void *)dest_addr;
+    msg.msg_namelen = dest_len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf;
+    msg.msg_controllen = sizeof(cbuf);
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg != NULL) {
+        cmsg->cmsg_level = SOL_UDP;
+        cmsg->cmsg_type = UDP_SEGMENT;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+        uint16_t gso_size = (uint16_t)seg_size;
+        memcpy(CMSG_DATA(cmsg), &gso_size, sizeof(gso_size));
+    }
+
+    ssize_t sent = sendmsg(conn->server->udp_fd, &msg, 0);
+    if (sent < 0) {
+        if (errno == EINVAL || errno == ENOPROTOOPT || errno == EOPNOTSUPP) {
+            /* Kernel/driver does not support UDP_SEGMENT: disable GSO and fallback */
+            conn->server->gso_disabled = true;
+            quic_send_burst(conn, buf, len, seg_size, 1);
+        }
+    }
 }
 
 static void apex_quic_conn_send(apex_quic_conn_t *conn) {
     ngtcp2_tstamp ts = quic_get_tstamp();
+    size_t seg_size = ngtcp2_conn_get_path_max_tx_udp_payload_size(conn->qconn);
+    if (seg_size == 0 || seg_size > QUIC_OUTPUT_PKT_SIZE) {
+        seg_size = QUIC_OUTPUT_PKT_SIZE;
+    }
+
+    uint8_t gso_buf[QUIC_GSO_MAX_BURST];
+    size_t gso_len = 0;
+    size_t pkt_cnt = 0;
+
     while (1) {
         int64_t stream_id = -1;
         int fin = 0;
@@ -798,7 +886,13 @@ static void apex_quic_conn_send(apex_quic_conn_t *conn) {
             }
         }
 
-        uint8_t outbuf[QUIC_OUTPUT_PKT_SIZE];
+        if (gso_len + seg_size > sizeof(gso_buf)) {
+            quic_send_burst(conn, gso_buf, gso_len, seg_size, pkt_cnt);
+            gso_len = 0;
+            pkt_cnt = 0;
+        }
+
+        uint8_t *outpkt = gso_buf + gso_len;
         ngtcp2_ssize nwrite = 0;
 
         if (h3veccnt > 0 || stream_id >= 0) {
@@ -810,33 +904,34 @@ static void apex_quic_conn_send(apex_quic_conn_t *conn) {
             uint32_t flags = fin ? NGTCP2_WRITE_STREAM_FLAG_FIN : NGTCP2_WRITE_STREAM_FLAG_NONE;
             ngtcp2_ssize pdatalen = 0;
             nwrite = ngtcp2_conn_writev_stream(conn->qconn, &conn->path, NULL,
-                                               outbuf, sizeof(outbuf), &pdatalen,
+                                               outpkt, seg_size, &pdatalen,
                                                flags, stream_id, qvec, (size_t)h3veccnt, ts);
             if (nwrite > 0 && pdatalen >= 0) {
                 nghttp3_conn_add_write_offset(conn->h3conn, stream_id, (size_t)pdatalen);
             }
         } else {
             nwrite = ngtcp2_conn_write_pkt(conn->qconn, &conn->path, NULL,
-                                           outbuf, sizeof(outbuf), ts);
+                                           outpkt, seg_size, ts);
         }
 
         if (nwrite <= 0) {
             break;
         }
 
-        const ngtcp2_path *active_path = ngtcp2_conn_get_path(conn->qconn);
-        const struct sockaddr *dest_addr = (active_path && active_path->remote.addr)
-                                           ? (const struct sockaddr *)active_path->remote.addr
-                                           : (const struct sockaddr *)&conn->peer_addr;
-        socklen_t dest_len = (active_path && active_path->remote.addr)
-                             ? (socklen_t)active_path->remote.addrlen
-                             : conn->peer_addrlen;
+        gso_len += (size_t)nwrite;
+        pkt_cnt++;
 
-        ssize_t sent = sendto(conn->server->udp_fd, outbuf, (size_t)nwrite, 0,
-                              dest_addr, dest_len);
-        if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            break;
+        /* In GSO, all segments except the last must be exactly seg_size.
+         * If this packet is smaller than seg_size, flush the burst. */
+        if ((size_t)nwrite < seg_size || conn->server->gso_disabled) {
+            quic_send_burst(conn, gso_buf, gso_len, seg_size, pkt_cnt);
+            gso_len = 0;
+            pkt_cnt = 0;
         }
+    }
+
+    if (pkt_cnt > 0) {
+        quic_send_burst(conn, gso_buf, gso_len, seg_size, pkt_cnt);
     }
 }
 
@@ -900,131 +995,157 @@ void apex_quic_process_read(apex_quic_server_t *server) {
     }
 
     while (1) {
-        uint8_t pkt[4096];
-        struct sockaddr_storage peer;
-        socklen_t peer_len = sizeof(peer);
-        ssize_t nread = recvfrom(server->udp_fd, pkt, sizeof(pkt), 0, (struct sockaddr *)&peer, &peer_len);
-        if (nread <= 0) {
+        struct mmsghdr msgs[QUIC_RECV_BATCH];
+        struct iovec iovecs[QUIC_RECV_BATCH];
+        uint8_t pkts[QUIC_RECV_BATCH][4096];
+        struct sockaddr_storage peers[QUIC_RECV_BATCH];
+
+        memset(msgs, 0, sizeof(msgs));
+        for (int i = 0; i < QUIC_RECV_BATCH; i++) {
+            iovecs[i].iov_base = pkts[i];
+            iovecs[i].iov_len = sizeof(pkts[i]);
+            msgs[i].msg_hdr.msg_name = &peers[i];
+            msgs[i].msg_hdr.msg_namelen = sizeof(peers[i]);
+            msgs[i].msg_hdr.msg_iov = &iovecs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+        }
+
+        int num_msgs = recvmmsg(server->udp_fd, msgs, QUIC_RECV_BATCH, MSG_DONTWAIT, NULL);
+        if (num_msgs <= 0) {
             break;
         }
 
-        ngtcp2_version_cid vcid;
-        int dres = ngtcp2_pkt_decode_version_cid(&vcid, pkt, (size_t)nread, 16);
-        if (dres < 0) {
-            continue;
-        }
+        for (int m = 0; m < num_msgs; m++) {
+            ssize_t nread = (ssize_t)msgs[m].msg_len;
+            if (nread <= 0) {
+                continue;
+            }
 
-        apex_quic_conn_t *conn = quic_find_conn(server, vcid.dcid, vcid.dcidlen);
-        if (conn != NULL) {
-            ngtcp2_path pkt_path = {
-                .local = conn->path.local,
-                .remote = {
-                    .addr = (struct sockaddr *)&peer,
-                    .addrlen = peer_len
-                }
+            uint8_t *pkt = pkts[m];
+            struct sockaddr_storage *peer = &peers[m];
+            socklen_t peer_len = msgs[m].msg_hdr.msg_namelen;
+
+            ngtcp2_version_cid vcid;
+            int dres = ngtcp2_pkt_decode_version_cid(&vcid, pkt, (size_t)nread, 16);
+            if (dres < 0) {
+                continue;
+            }
+
+            apex_quic_conn_t *conn = quic_find_conn(server, vcid.dcid, vcid.dcidlen);
+            if (conn != NULL) {
+                ngtcp2_path pkt_path = {
+                    .local = conn->path.local,
+                    .remote = {
+                        .addr = (struct sockaddr *)peer,
+                        .addrlen = peer_len
+                    }
+                };
+                (void)ngtcp2_conn_read_pkt(conn->qconn, &pkt_path, NULL, pkt, (size_t)nread, quic_get_tstamp());
+                apex_quic_conn_send(conn);
+                continue;
+            }
+
+            /* Not found: check if it is a new Initial packet */
+            ngtcp2_pkt_hd hd;
+            int arv = ngtcp2_accept(&hd, pkt, (size_t)nread);
+            if (arv < 0 || hd.type != NGTCP2_PKT_INITIAL) {
+                continue;
+            }
+
+            conn = calloc(1, sizeof(*conn));
+            if (conn == NULL) {
+                continue;
+            }
+            conn->server = server;
+            memcpy(&conn->peer_addr, peer, peer_len);
+            conn->peer_addrlen = peer_len;
+
+            struct sockaddr_storage saddr;
+            socklen_t saddr_len = sizeof(saddr);
+            getsockname(server->udp_fd, (struct sockaddr *)&saddr, &saddr_len);
+            memcpy(&conn->local_addr, &saddr, saddr_len);
+            conn->local_addrlen = saddr_len;
+
+            conn->path.local.addr = (struct sockaddr *)&conn->local_addr;
+            conn->path.local.addrlen = conn->local_addrlen;
+            conn->path.remote.addr = (struct sockaddr *)&conn->peer_addr;
+            conn->path.remote.addrlen = conn->peer_addrlen;
+
+            conn->ssl = SSL_new(server->ssl_ctx);
+            if (conn->ssl == NULL) {
+                free(conn);
+                continue;
+            }
+            SSL_set_accept_state(conn->ssl);
+            conn->conn_ref.get_conn = quic_conn_ref_get_conn;
+            conn->conn_ref.user_data = conn;
+            SSL_set_app_data(conn->ssl, &conn->conn_ref);
+            ngtcp2_crypto_ossl_configure_server_session(conn->ssl);
+            ngtcp2_crypto_ossl_ctx_new(&conn->ossl_ctx, conn->ssl);
+
+            ngtcp2_callbacks cb = {
+                .recv_client_initial = ngtcp2_crypto_recv_client_initial_cb,
+                .recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb,
+                .handshake_completed = q_handshake_completed,
+                .encrypt = ngtcp2_crypto_encrypt_cb,
+                .decrypt = ngtcp2_crypto_decrypt_cb,
+                .hp_mask = ngtcp2_crypto_hp_mask_cb,
+                .recv_stream_data = q_recv_stream_data,
+                .acked_stream_data_offset = q_acked_stream_data_offset,
+                .stream_close = q_stream_close,
+                .rand = quic_rand,
+                .get_new_connection_id = quic_get_new_cid,
+                .update_key = ngtcp2_crypto_update_key_cb,
+                .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
+                .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
+                .get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb,
+                .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
             };
-            (void)ngtcp2_conn_read_pkt(conn->qconn, &pkt_path, NULL, pkt, (size_t)nread, quic_get_tstamp());
+
+            ngtcp2_settings settings;
+            ngtcp2_settings_default(&settings);
+            settings.initial_ts = quic_get_tstamp();
+
+            ngtcp2_transport_params params;
+            ngtcp2_transport_params_default(&params);
+            params.initial_max_streams_bidi = 10000;
+            params.initial_max_streams_uni = 1000;
+            params.initial_max_data = 1024 * 1024 * 100;
+            params.initial_max_stream_data_bidi_local = 1024 * 1024 * 10;
+            params.initial_max_stream_data_bidi_remote = 1024 * 1024 * 10;
+            params.initial_max_stream_data_uni = 1024 * 1024 * 10;
+            params.active_connection_id_limit = 4;
+            params.original_dcid = hd.dcid;
+            params.original_dcid_present = 1;
+
+            conn->dcid = hd.dcid;
+            conn->scid.datalen = 16;
+            RAND_bytes(conn->scid.data, 16);
+            if (server->worker != NULL) {
+                conn->scid.data[0] = (uint8_t)(server->worker->cpu & 0xFF);
+            }
+
+            int crv = ngtcp2_conn_server_new(&conn->qconn, &hd.scid, &conn->scid,
+                                             &conn->path, hd.version,
+                                             &cb, &settings, &params, NULL, conn);
+            if (crv != 0) {
+                SSL_set_app_data(conn->ssl, NULL);
+                SSL_free(conn->ssl);
+                ngtcp2_crypto_ossl_ctx_del(conn->ossl_ctx);
+                free(conn);
+                continue;
+            }
+
+            ngtcp2_conn_set_tls_native_handle(conn->qconn, conn->ossl_ctx);
+            conn->all_next = server->all_conns;
+            server->all_conns = conn;
+            server->connection_count++;
+
+            quic_insert_cid(server, conn, conn->scid.data, conn->scid.datalen);
+            quic_insert_cid(server, conn, hd.dcid.data, hd.dcid.datalen);
+
+            (void)ngtcp2_conn_read_pkt(conn->qconn, &conn->path, NULL, pkt, (size_t)nread, quic_get_tstamp());
             apex_quic_conn_send(conn);
-            continue;
         }
-
-        /* Not found: check if it is a new Initial packet */
-        ngtcp2_pkt_hd hd;
-        int arv = ngtcp2_accept(&hd, pkt, (size_t)nread);
-        if (arv < 0 || hd.type != NGTCP2_PKT_INITIAL) {
-            continue;
-        }
-
-        conn = calloc(1, sizeof(*conn));
-        if (conn == NULL) {
-            continue;
-        }
-        conn->server = server;
-        memcpy(&conn->peer_addr, &peer, peer_len);
-        conn->peer_addrlen = peer_len;
-
-        struct sockaddr_storage saddr;
-        socklen_t saddr_len = sizeof(saddr);
-        getsockname(server->udp_fd, (struct sockaddr *)&saddr, &saddr_len);
-        memcpy(&conn->local_addr, &saddr, saddr_len);
-        conn->local_addrlen = saddr_len;
-
-        conn->path.local.addr = (struct sockaddr *)&conn->local_addr;
-        conn->path.local.addrlen = conn->local_addrlen;
-        conn->path.remote.addr = (struct sockaddr *)&conn->peer_addr;
-        conn->path.remote.addrlen = conn->peer_addrlen;
-
-        conn->ssl = SSL_new(server->ssl_ctx);
-        if (conn->ssl == NULL) {
-            free(conn);
-            continue;
-        }
-        SSL_set_accept_state(conn->ssl);
-        conn->conn_ref.get_conn = quic_conn_ref_get_conn;
-        conn->conn_ref.user_data = conn;
-        SSL_set_app_data(conn->ssl, &conn->conn_ref);
-        ngtcp2_crypto_ossl_configure_server_session(conn->ssl);
-        ngtcp2_crypto_ossl_ctx_new(&conn->ossl_ctx, conn->ssl);
-
-        ngtcp2_callbacks cb = {
-            .recv_client_initial = ngtcp2_crypto_recv_client_initial_cb,
-            .recv_crypto_data = ngtcp2_crypto_recv_crypto_data_cb,
-            .handshake_completed = q_handshake_completed,
-            .encrypt = ngtcp2_crypto_encrypt_cb,
-            .decrypt = ngtcp2_crypto_decrypt_cb,
-            .hp_mask = ngtcp2_crypto_hp_mask_cb,
-            .recv_stream_data = q_recv_stream_data,
-            .acked_stream_data_offset = q_acked_stream_data_offset,
-            .stream_close = q_stream_close,
-            .rand = quic_rand,
-            .get_new_connection_id = quic_get_new_cid,
-            .update_key = ngtcp2_crypto_update_key_cb,
-            .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
-            .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
-            .get_path_challenge_data = ngtcp2_crypto_get_path_challenge_data_cb,
-            .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
-        };
-
-        ngtcp2_settings settings;
-        ngtcp2_settings_default(&settings);
-        settings.initial_ts = quic_get_tstamp();
-
-        ngtcp2_transport_params params;
-        ngtcp2_transport_params_default(&params);
-        params.initial_max_streams_bidi = 100;
-        params.initial_max_streams_uni = 100;
-        params.initial_max_data = 1024 * 1024 * 10;
-        params.initial_max_stream_data_bidi_local = 1024 * 1024 * 2;
-        params.initial_max_stream_data_bidi_remote = 1024 * 1024 * 2;
-        params.initial_max_stream_data_uni = 1024 * 1024 * 2;
-        params.active_connection_id_limit = 4;
-        params.original_dcid = hd.dcid;
-        params.original_dcid_present = 1;
-
-        conn->dcid = hd.dcid;
-        conn->scid.datalen = 16;
-        RAND_bytes(conn->scid.data, 16);
-
-        int crv = ngtcp2_conn_server_new(&conn->qconn, &hd.scid, &conn->scid,
-                                         &conn->path, hd.version,
-                                         &cb, &settings, &params, NULL, conn);
-        if (crv != 0) {
-            SSL_set_app_data(conn->ssl, NULL);
-            SSL_free(conn->ssl);
-            ngtcp2_crypto_ossl_ctx_del(conn->ossl_ctx);
-            free(conn);
-            continue;
-        }
-
-        ngtcp2_conn_set_tls_native_handle(conn->qconn, conn->ossl_ctx);
-        conn->all_next = server->all_conns;
-        server->all_conns = conn;
-        server->connection_count++;
-
-        quic_insert_cid(server, conn, conn->scid.data, conn->scid.datalen);
-        quic_insert_cid(server, conn, hd.dcid.data, hd.dcid.datalen);
-
-        (void)ngtcp2_conn_read_pkt(conn->qconn, &conn->path, NULL, pkt, (size_t)nread, quic_get_tstamp());
-        apex_quic_conn_send(conn);
     }
 }

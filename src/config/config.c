@@ -1454,22 +1454,23 @@ static bool server_add_name(parser_t *parser, apex_server_config_t *server, cons
     return true;
 }
 
-static bool server_add_error_page(parser_t *parser, apex_server_config_t *server, int status_code,
-                                  const token_t *path) {
-    if (server->error_page_count >= 32u) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "server declares too many error pages");
+static bool config_add_error_page(parser_t *parser, apex_error_page_config_t **pages_ptr,
+                                  size_t *count_ptr, size_t *cap_ptr, const char *ctx_name,
+                                  int status_code, const token_t *path) {
+    if (*count_ptr >= 32u) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "%s declares too many error pages", ctx_name);
         return false;
     }
 
-    if (server->error_page_count == server->error_page_capacity) {
-        size_t capacity = server->error_page_capacity ? server->error_page_capacity * 2u : 4u;
-        apex_error_page_config_t *grown = realloc(server->error_pages, capacity * sizeof(*grown));
+    if (*count_ptr == *cap_ptr) {
+        size_t capacity = *cap_ptr ? *cap_ptr * 2u : 4u;
+        apex_error_page_config_t *grown = realloc(*pages_ptr, capacity * sizeof(*grown));
         if (grown == NULL) {
             config_oom(parser->error);
             return false;
         }
-        server->error_pages = grown;
-        server->error_page_capacity = capacity;
+        *pages_ptr = grown;
+        *cap_ptr = capacity;
     }
 
     char *copy = config_strdup_range(path->text, path->length);
@@ -1478,62 +1479,21 @@ static bool server_add_error_page(parser_t *parser, apex_server_config_t *server
         return false;
     }
 
-    for (size_t index = 0; index < server->error_page_count; index++) {
-        if (server->error_pages[index].status_code == status_code) {
-            free(server->error_pages[index].path);
-            server->error_pages[index].path = copy;
-            server->error_pages[index].line = path->line;
+    for (size_t index = 0; index < *count_ptr; index++) {
+        if ((*pages_ptr)[index].status_code == status_code) {
+            free((*pages_ptr)[index].path);
+            (*pages_ptr)[index].path = copy;
+            (*pages_ptr)[index].line = path->line;
             return true;
         }
     }
 
-    apex_error_page_config_t *entry = &server->error_pages[server->error_page_count++];
+    apex_error_page_config_t *entry = &(*pages_ptr)[(*count_ptr)++];
     entry->status_code = status_code;
     entry->path = copy;
     entry->line = path->line;
     return true;
 }
-
-static bool location_add_error_page(parser_t *parser, apex_location_config_t *location, int status_code,
-                                    const token_t *path) {
-    if (location->error_page_count >= 32u) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location declares too many error pages");
-        return false;
-    }
-
-    if (location->error_page_count == location->error_page_capacity) {
-        size_t capacity = location->error_page_capacity ? location->error_page_capacity * 2u : 4u;
-        apex_error_page_config_t *grown = realloc(location->error_pages, capacity * sizeof(*grown));
-        if (grown == NULL) {
-            config_oom(parser->error);
-            return false;
-        }
-        location->error_pages = grown;
-        location->error_page_capacity = capacity;
-    }
-
-    char *copy = config_strdup_range(path->text, path->length);
-    if (copy == NULL) {
-        config_oom(parser->error);
-        return false;
-    }
-
-    for (size_t index = 0; index < location->error_page_count; index++) {
-        if (location->error_pages[index].status_code == status_code) {
-            free(location->error_pages[index].path);
-            location->error_pages[index].path = copy;
-            location->error_pages[index].line = path->line;
-            return true;
-        }
-    }
-
-    apex_error_page_config_t *entry = &location->error_pages[location->error_page_count++];
-    entry->status_code = status_code;
-    entry->path = copy;
-    entry->line = path->line;
-    return true;
-}
-
 static apex_location_config_t *server_add_location(parser_t *parser, apex_server_config_t *server,
                                                     const token_t *begin) {
     if (server->location_count >= APEX_CONFIG_MAX_LOCATIONS) {
@@ -1732,90 +1692,6 @@ static bool config_add_module(parser_t *parser, const token_t *name) {
         return false;
     }
     config->modules[config->module_count++] = copy;
-    return true;
-}
-
-static bool parse_tls_block(parser_t *parser, apex_server_config_t *server) {
-    if (!parser_expect_lbrace(parser)) {
-        return false;
-    }
-    server->tls.enabled = true;
-
-    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
-        const token_t *directive = parser_peek(parser);
-        if (directive->kind == TOKEN_EOF) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'tls' block");
-            return false;
-        }
-        if (directive->kind != TOKEN_WORD) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a tls directive");
-            return false;
-        }
-        parser_advance(parser);
-
-        if (token_is_word(directive, "certificate") || token_is_word(directive, "private_key") ||
-            token_is_word(directive, "ciphers")) {
-            const token_t *value = parser_scalar(parser, "a value");
-            if (value == NULL) {
-                return false;
-            }
-            char **field = token_is_word(directive, "certificate")   ? &server->tls.certificate
-                           : token_is_word(directive, "private_key") ? &server->tls.private_key
-                                                                     : &server->tls.ciphers;
-            free(*field);
-            *field = config_strdup_range(value->text, value->length);
-            if (*field == NULL) {
-                return config_oom(parser->error);
-            }
-        } else if (token_is_word(directive, "protocols")) {
-            size_t count = 0;
-            while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
-                const token_t *protocol = parser_scalar(parser, "a protocol name");
-                if (protocol == NULL) {
-                    return false;
-                }
-                if (!tls_add_protocol(parser, &server->tls, protocol)) {
-                    return false;
-                }
-                count++;
-            }
-            if (count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "expected at least one protocol");
-                return false;
-            }
-        } else if (token_is_word(directive, "client_auth")) {
-            const token_t *value = parser_scalar(parser, "a client authentication mode");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "off")) {
-                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_OFF;
-            } else if (token_is_word(value, "optional")) {
-                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_OPTIONAL;
-            } else if (token_is_word(value, "required")) {
-                server->tls.client_auth = APEX_TLS_CLIENT_AUTH_REQUIRED;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "client_auth must be off, optional, or required");
-                return false;
-            }
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown tls directive '%s'", directive->text);
-            parser_hint(parser, "tls accepts certificate, private_key, protocols, ciphers, client_auth");
-            return false;
-        }
-
-        if (!parser_expect_semicolon(parser)) {
-            return false;
-        }
-    }
-
-    if (!parser_expect_rbrace(parser)) {
-        return false;
-    }
-    if (server->tls.certificate == NULL || server->tls.private_key == NULL) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, NULL, "tls block requires certificate and private_key");
-        return false;
-    }
     return true;
 }
 
@@ -3272,1591 +3148,6 @@ static bool parse_extensibility_directive(parser_t *parser, const token_t *direc
     return true;
 }
 
-static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
-    const token_t *begin = parser_peek(parser);
-    bool exact = false;
-    const token_t *match = parser_peek(parser);
-    if ((match->kind == TOKEN_WORD || match->kind == TOKEN_STRING) && match->text != NULL &&
-        strcmp(match->text, "=") == 0) {
-        exact = true;
-        parser_advance(parser);
-    }
-
-    const token_t *path = parser_scalar(parser, "a location path");
-    if (path == NULL) {
-        return false;
-    }
-    if (path->length == 0 || path->text[0] != '/') {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path must start with '/'");
-        return false;
-    }
-    if (path->text[0] == '~' || path->text[0] == '@') {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "regex and named locations are not supported");
-        return false;
-    }
-    for (size_t index = 0; index < path->length; index++) {
-        unsigned char byte = (unsigned char)path->text[index];
-        if (byte <= 0x20 || byte == '\r' || byte == '\n') {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path contains whitespace");
-            return false;
-        }
-    }
-
-    apex_location_config_t *location = server_add_location(parser, server, begin);
-    if (location == NULL) {
-        return false;
-    }
-    location->path = config_strdup_range(path->text, path->length);
-    if (location->path == NULL) {
-        return config_oom(parser->error);
-    }
-    location->exact = exact;
-    location->sendfile = true;
-    location->etag = true;
-    location->precompressed = true;
-
-    if (!parser_expect_lbrace(parser)) {
-        return false;
-    }
-
-    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
-        const token_t *directive = parser_peek(parser);
-        if (directive->kind == TOKEN_EOF) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'location' block");
-            return false;
-        }
-        if (directive->kind != TOKEN_WORD) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a location directive");
-            return false;
-        }
-        parser_advance(parser);
-
-        bool handled_ext = false;
-        if (!parse_extensibility_directive(parser, directive,
-                                          &location->access_by_lua,
-                                          &location->content_by_lua,
-                                          &location->header_filter_by_lua,
-                                          location->wasm_filter_path,
-                                          sizeof(location->wasm_filter_path),
-                                          &handled_ext)) {
-            return false;
-        }
-        if (handled_ext) {
-            continue;
-        }
-
-        if (token_is_word(directive, "proxy_pass")) {
-            const token_t *value = parser_scalar(parser, "an upstream name or host:port");
-            if (value == NULL || !location_set_proxy_pass(parser, location, value)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "root")) {
-            if (location->target != APEX_PROXY_TARGET_NONE || location->root != NULL) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive,
-                             "location cannot declare more than one terminal action");
-                return false;
-            }
-            const token_t *value = parser_scalar(parser, "a filesystem path");
-            if (value == NULL) {
-                return false;
-            }
-            location->root = config_strdup_range(value->text, value->length);
-            if (location->root == NULL) {
-                return config_oom(parser->error);
-            }
-        } else if (token_is_word(directive, "index")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *value = parser_scalar(parser, "an index filename");
-                if (value == NULL || !location_add_index(parser, location, value)) {
-                    return false;
-                }
-            }
-        } else if (token_is_word(directive, "try_files")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *value = parser_scalar(parser, "a try_files pattern");
-                if (value == NULL || !location_add_try_file(parser, location, value)) {
-                    return false;
-                }
-            }
-        } else if (token_is_word(directive, "sendfile")) {
-            const token_t *value = parser_scalar(parser, "on or off");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "on")) {
-                location->sendfile = true;
-            } else if (token_is_word(value, "off")) {
-                location->sendfile = false;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "sendfile must be 'on' or 'off'");
-                return false;
-            }
-        } else if (token_is_word(directive, "etag")) {
-            const token_t *value = parser_scalar(parser, "on or off");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "on")) {
-                location->etag = true;
-            } else if (token_is_word(value, "off")) {
-                location->etag = false;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "etag must be 'on' or 'off'");
-                return false;
-            }
-        } else if (token_is_word(directive, "precompressed") || token_is_word(directive, "gzip_static") ||
-                   token_is_word(directive, "brotli_static")) {
-            const token_t *value = parser_scalar(parser, "on or off");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "on")) {
-                location->precompressed = true;
-            } else if (token_is_word(value, "off")) {
-                location->precompressed = false;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "precompressed must be 'on' or 'off'");
-                return false;
-            }
-        } else if (token_is_word(directive, "proxy_set_header")) {
-            const token_t *name = parser_scalar(parser, "a header name");
-            const token_t *value = parser_scalar(parser, "a header value");
-            if (name == NULL || value == NULL || !location_add_header(parser, location, name, value)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "proxy_connect_timeout") ||
-                   token_is_word(directive, "proxy_read_timeout")) {
-            const token_t *value = parser_scalar(parser, "a duration");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t milliseconds = 0;
-            if (!token_to_duration_ms(value, &milliseconds)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
-                return false;
-            }
-            if (token_is_word(directive, "proxy_connect_timeout")) {
-                location->has_connect_timeout = true;
-                location->connect_timeout_ms = milliseconds;
-            } else {
-                location->has_read_timeout = true;
-                location->read_timeout_ms = milliseconds;
-            }
-        } else if (token_is_word(directive, "proxy_http_version")) {
-            const token_t *value = parser_scalar(parser, "1.0 or 1.1");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "1.0")) {
-                location->http_version = 10;
-            } else if (token_is_word(value, "1.1")) {
-                location->http_version = 11;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_http_version must be 1.0 or 1.1");
-                return false;
-            }
-        } else if (token_is_word(directive, "return")) {
-            const token_t *first = parser_scalar(parser, "a redirect code or URL");
-            if (first == NULL) {
-                return false;
-            }
-            int code = 302;
-            const token_t *url_tok = NULL;
-            if (first->length > 0 && isdigit((unsigned char)first->text[0])) {
-                uint64_t cval = 0;
-                if (!token_to_u64(first, 200, 599, &cval)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, first, "invalid return status code");
-                    return false;
-                }
-                code = (int)cval;
-                if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                    url_tok = parser_scalar(parser, "a redirect URL or text");
-                    if (url_tok == NULL) {
-                        return false;
-                    }
-                }
-            } else {
-                url_tok = first;
-            }
-
-            location->return_code = code;
-            if (url_tok != NULL) {
-                if (url_tok->length >= sizeof(location->return_url)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, url_tok, "return URL is too long");
-                    return false;
-                }
-                memcpy(location->return_url, url_tok->text, url_tok->length);
-                location->return_url[url_tok->length] = '\0';
-            } else {
-                location->return_url[0] = '\0';
-            }
-        } else if (token_is_word(directive, "allow") || token_is_word(directive, "deny")) {
-            bool allow = token_is_word(directive, "allow");
-            const token_t *val = parser_scalar(parser, "a CIDR address or 'all'");
-            if (val == NULL) {
-                return false;
-            }
-            if (location->acl_rule_count >= APEX_CONFIG_MAX_ACL_RULES) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many allow/deny rules (max %u)",
-                             (unsigned)APEX_CONFIG_MAX_ACL_RULES);
-                return false;
-            }
-            apex_acl_rule_t *rule = &location->acl_rules[location->acl_rule_count];
-            memset(rule, 0, sizeof(*rule));
-            rule->allow = allow;
-            if (!config_parse_cidr(val->text, val->length, rule)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid CIDR address '%s'", val->text);
-                return false;
-            }
-            location->acl_rule_count++;
-        } else if (token_is_word(directive, "limit_req")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *arg = parser_scalar(parser, "limit_req parameter");
-                if (arg == NULL) return false;
-                if (strncmp(arg->text, "zone=", 5) == 0) {
-                    snprintf(location->limit_req_zone, sizeof(location->limit_req_zone), "%s", arg->text + 5);
-                } else if (strncmp(arg->text, "burst=", 6) == 0) {
-                    location->limit_req_burst = (uint32_t)strtoul(arg->text + 6, NULL, 10);
-                } else if (strcmp(arg->text, "nodelay") == 0) {
-                    location->limit_req_nodelay = true;
-                } else if (location->limit_req_zone[0] == '\0') {
-                    snprintf(location->limit_req_zone, sizeof(location->limit_req_zone), "%s", arg->text);
-                }
-            }
-        } else if (token_is_word(directive, "limit_req_status")) {
-            const token_t *val = parser_scalar(parser, "status code");
-            if (val == NULL) return false;
-            uint64_t code = 0;
-            if (!token_to_u64(val, 400, 599, &code)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_req_status");
-                return false;
-            }
-            location->limit_req_status = (int)code;
-        } else if (token_is_word(directive, "limit_conn")) {
-            const token_t *first = parser_scalar(parser, "zone name");
-            if (first == NULL) return false;
-            if (strncmp(first->text, "zone=", 5) == 0) {
-                snprintf(location->limit_conn_zone, sizeof(location->limit_conn_zone), "%s", first->text + 5);
-            } else {
-                snprintf(location->limit_conn_zone, sizeof(location->limit_conn_zone), "%s", first->text);
-            }
-            const token_t *second = parser_scalar(parser, "max connections");
-            if (second == NULL) return false;
-            location->limit_conn_max = (uint32_t)strtoul(second->text, NULL, 10);
-        } else if (token_is_word(directive, "limit_conn_status")) {
-            const token_t *val = parser_scalar(parser, "status code");
-            if (val == NULL) return false;
-            uint64_t code = 0;
-            if (!token_to_u64(val, 400, 599, &code)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_conn_status");
-                return false;
-            }
-            location->limit_conn_status = (int)code;
-        } else if (token_is_word(directive, "stub_status")) {
-            location->stub_status = true;
-            if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *val = parser_scalar(parser, "stub_status arg");
-                if (val != NULL && token_is_word(val, "off")) {
-                    location->stub_status = false;
-                }
-            }
-        } else if (token_is_word(directive, "metrics")) {
-            location->metrics = true;
-            if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *val = parser_scalar(parser, "metrics arg");
-                if (val != NULL && token_is_word(val, "off")) {
-                    location->metrics = false;
-                }
-            }
-        } else if (token_is_word(directive, "proxy_cache")) {
-            const token_t *val = parser_scalar(parser, "cache zone name or off");
-            if (val == NULL) return false;
-            if (token_is_word(val, "off")) {
-                location->proxy_cache[0] = '\0';
-            } else {
-                snprintf(location->proxy_cache, sizeof(location->proxy_cache), "%s", val->text);
-            }
-        } else if (token_is_word(directive, "proxy_cache_key")) {
-            const token_t *val = parser_scalar(parser, "cache key");
-            if (val == NULL) return false;
-            snprintf(location->proxy_cache_key, sizeof(location->proxy_cache_key), "%s", val->text);
-        } else if (token_is_word(directive, "proxy_cache_bypass")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *arg = parser_scalar(parser, "bypass variable");
-                if (arg == NULL) return false;
-                if (location->proxy_cache_bypass[0] != '\0') {
-                    strncat(location->proxy_cache_bypass, " ",
-                            sizeof(location->proxy_cache_bypass) - strlen(location->proxy_cache_bypass) - 1);
-                }
-                strncat(location->proxy_cache_bypass, arg->text,
-                        sizeof(location->proxy_cache_bypass) - strlen(location->proxy_cache_bypass) - 1);
-            }
-        } else if (token_is_word(directive, "proxy_cache_valid")) {
-            token_t tokens[8];
-            size_t count = 0;
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *tok = parser_scalar(parser, "proxy_cache_valid parameter");
-                if (tok == NULL) return false;
-                if (count < 8) {
-                    tokens[count++] = *tok;
-                }
-            }
-            if (count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_valid requires arguments");
-                return false;
-            }
-            uint64_t valid_ms = 0;
-            if (!token_to_duration_ms(&tokens[count - 1], &valid_ms)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, &tokens[count - 1],
-                             "invalid cache validity duration '%s'", tokens[count - 1].text);
-                return false;
-            }
-            if (count == 1) {
-                int default_codes[] = {200, 301, 302};
-                for (size_t c = 0; c < 3 && location->cache_valid_rule_count < 8; c++) {
-                    location->cache_valid_rules[location->cache_valid_rule_count].status_code = default_codes[c];
-                    location->cache_valid_rules[location->cache_valid_rule_count].valid_ms = valid_ms;
-                    location->cache_valid_rule_count++;
-                }
-            } else {
-                for (size_t c = 0; c < count - 1 && location->cache_valid_rule_count < 8; c++) {
-                    int code = 0;
-                    if (token_is_word(&tokens[c], "any")) {
-                        code = 0;
-                    } else {
-                        code = atoi(tokens[c].text);
-                    }
-                    location->cache_valid_rules[location->cache_valid_rule_count].status_code = code;
-                    location->cache_valid_rules[location->cache_valid_rule_count].valid_ms = valid_ms;
-                    location->cache_valid_rule_count++;
-                }
-            }
-        } else if (token_is_word(directive, "set_real_ip_from")) {
-            if (!config_parse_set_real_ip_from(parser, directive, location->real_ip_rules,
-                                              &location->real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "real_ip_header")) {
-            if (!config_parse_real_ip_header(parser, location->real_ip_header, sizeof(location->real_ip_header))) {
-                return false;
-            }
-            location->has_real_ip_header = true;
-        } else if (token_is_word(directive, "real_ip_recursive")) {
-            if (!config_parse_real_ip_recursive(parser, &location->real_ip_recursive)) {
-                return false;
-            }
-            location->has_real_ip_recursive = true;
-        } else if (token_is_word(directive, "access_log")) {
-            if (!config_parse_access_log(parser, directive, &location->access_log)) {
-                return false;
-            }
-            location->has_access_log = true;
-        } else if (token_is_word(directive, "fastcgi_pass")) {
-            const token_t *value = parser_scalar(parser, "a fastcgi backend endpoint (host:port or unix:/path)");
-            if (value == NULL) {
-                return false;
-            }
-            if (value->length >= sizeof(location->fastcgi_pass)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "fastcgi_pass endpoint is too long");
-                return false;
-            }
-            snprintf(location->fastcgi_pass, sizeof(location->fastcgi_pass), "%s", value->text);
-        } else if (token_is_word(directive, "fastcgi_index")) {
-            const token_t *value = parser_scalar(parser, "a fastcgi index filename");
-            if (value == NULL) {
-                return false;
-            }
-            if (value->length >= sizeof(location->fastcgi_index)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "fastcgi_index filename is too long");
-                return false;
-            }
-            snprintf(location->fastcgi_index, sizeof(location->fastcgi_index), "%s", value->text);
-        } else if (token_is_word(directive, "fastcgi_param")) {
-            const token_t *key = parser_scalar(parser, "a fastcgi parameter name");
-            if (key == NULL) {
-                return false;
-            }
-            const token_t *val = parser_scalar(parser, "a fastcgi parameter value");
-            if (val == NULL) {
-                return false;
-            }
-            if (location->fastcgi_param_count >= location->fastcgi_param_capacity) {
-                size_t ncap = location->fastcgi_param_capacity ? location->fastcgi_param_capacity * 2 : 8;
-                apex_config_header_t *nparams = realloc(location->fastcgi_params, ncap * sizeof(apex_config_header_t));
-                if (!nparams) return config_oom(parser->error);
-                location->fastcgi_params = nparams;
-                location->fastcgi_param_capacity = ncap;
-            }
-            apex_config_header_t *p = &location->fastcgi_params[location->fastcgi_param_count++];
-            p->name = config_strdup_range(key->text, key->length);
-            p->value = config_strdup_range(val->text, val->length);
-            p->line = key->line;
-            if (!p->name || !p->value) return config_oom(parser->error);
-        } else if (token_is_word(directive, "add_header")) {
-            if (!config_add_response_header(parser, &location->add_headers,
-                                            &location->add_header_count,
-                                            &location->add_header_capacity)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "proxy_ssl_server_name")) {
-            const token_t *value = parser_scalar(parser, "on or off");
-            if (value == NULL) return false;
-            if (token_is_word(value, "on")) {
-                location->proxy_ssl_server_name = true;
-            } else if (token_is_word(value, "off")) {
-                location->proxy_ssl_server_name = false;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_ssl_server_name must be on or off");
-                return false;
-            }
-        } else if (token_is_word(directive, "proxy_ssl_name")) {
-            const token_t *value = parser_scalar(parser, "a server name");
-            if (value == NULL) return false;
-            if (value->length >= sizeof(location->proxy_ssl_name)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_ssl_name is too long");
-                return false;
-            }
-            memcpy(location->proxy_ssl_name, value->text, value->length);
-            location->proxy_ssl_name[value->length] = '\0';
-        } else if (token_is_word(directive, "error_page")) {
-            int codes[16];
-            size_t code_count = 0;
-            while (parser_peek(parser)->kind == TOKEN_WORD &&
-                   isdigit((unsigned char)parser_peek(parser)->text[0])) {
-                const token_t *code_token = parser_scalar(parser, "an HTTP status code");
-                if (code_token == NULL) {
-                    return false;
-                }
-                uint64_t code_val = 0;
-                if (!token_to_u64(code_token, 300, 599, &code_val)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, code_token, "invalid HTTP error status code");
-                    return false;
-                }
-                if (code_count < sizeof(codes) / sizeof(codes[0])) {
-                    codes[code_count++] = (int)code_val;
-                }
-            }
-            if (code_count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "error_page requires at least one status code");
-                return false;
-            }
-            const token_t *path_token = parser_scalar(parser, "a file path for error_page");
-            if (path_token == NULL) {
-                return false;
-            }
-            for (size_t c = 0; c < code_count; c++) {
-                if (!location_add_error_page(parser, location, codes[c], path_token)) {
-                    return false;
-                }
-            }
-        } else if (token_is_word(directive, "client_max_body_size")) {
-            if (!parse_client_max_body_size(parser, &location->client_max_body_size, &location->has_client_max_body_size)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache")) {
-            if (!parse_open_file_cache_directive(parser, &location->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_valid")) {
-            if (!parse_open_file_cache_valid_directive(parser, &location->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_min_uses")) {
-            if (!parse_open_file_cache_min_uses_directive(parser, &location->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_errors")) {
-            if (!parse_open_file_cache_errors_directive(parser, &location->open_file_cache)) {
-                return false;
-            }
-        } else {
-            bool handled_failover = false;
-            if (!parse_failover_directive(parser, directive, &location->next_upstream,
-                                          &location->has_next_upstream,
-                                          &location->proxy_intercept_errors,
-                                          &location->has_proxy_intercept_errors,
-                                          &handled_failover)) {
-                return false;
-            }
-            if (handled_failover) {
-                /* handled */
-            } else {
-                bool handled_cookie = false;
-                if (!parse_cookie_directive(parser, directive,
-                                            &location->cookie_domains, &location->cookie_domain_count,
-                                            &location->cookie_domain_capacity, &location->cookie_domain_off,
-                                            &location->cookie_paths, &location->cookie_path_count,
-                                            &location->cookie_path_capacity, &location->cookie_path_off,
-                                            &handled_cookie)) {
-                    return false;
-                }
-                if (handled_cookie) {
-                    /* handled */
-                } else {
-                    bool handled_sub = false;
-                    if (!parse_sub_filter_directive(parser, directive, &location->sub_filter, &handled_sub)) {
-                        return false;
-                    }
-                    if (handled_sub) {
-                        /* handled */
-                    } else {
-                        bool handled_res = false;
-                        if (!parse_resolver_directive(parser, directive, &location->resolver, &handled_res)) {
-                            return false;
-                        }
-                        if (handled_res) {
-                            /* handled */
-                        } else {
-                            bool handled_otel = false;
-                            if (!parse_otel_directive(parser, directive, &location->otel, &handled_otel)) {
-                                return false;
-                            }
-                            if (handled_otel) {
-                                /* handled */
-                            } else {
-                                bool handled_api = false;
-                                if (!parse_api_directive(parser, directive, &location->api, &handled_api)) {
-                                    return false;
-                                }
-                                if (handled_api) {
-                                    /* handled */
-                                } else {
-                                    bool handled_auth = false;
-                                    if (!parse_auth_basic_directive(parser, directive, &location->auth_basic, &handled_auth)) {
-                                        return false;
-                                    }
-                                    if (handled_auth) {
-                                        /* handled */
-                                    } else {
-                                        bool handled_compress = false;
-                                        if (parse_compress_directive(parser, directive, &location->compress, &location->has_compress, &handled_compress)) {
-                                            if (!handled_compress) {
-                                                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'",
-                                                             directive->text);
-                                                parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
-                                                                    "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, client_max_body_size, gzip, brotli, zstd");
-                                                return false;
-                                            }
-                                        } else {
-                                            return false;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (!parser_expect_semicolon(parser)) {
-            return false;
-        }
-    }
-
-    if (!parser_expect_rbrace(parser)) {
-        return false;
-    }
-
-    if (!location->has_client_max_body_size && server->has_client_max_body_size) {
-        location->client_max_body_size = server->client_max_body_size;
-        location->has_client_max_body_size = true;
-    }
-
-    /* Inherit server root if not configured in location */
-    if (location->root == NULL && server->root != NULL) {
-        location->root = config_strdup_range(server->root, strlen(server->root));
-        if (location->root == NULL) return config_oom(parser->error);
-    }
-
-    /* Inherit server cache settings if not explicitly configured in location */
-    if (location->proxy_cache[0] == '\0' && server->proxy_cache[0] != '\0') {
-        snprintf(location->proxy_cache, sizeof(location->proxy_cache), "%s", server->proxy_cache);
-        if (location->proxy_cache_key[0] == '\0' && server->proxy_cache_key[0] != '\0') {
-            snprintf(location->proxy_cache_key, sizeof(location->proxy_cache_key), "%s", server->proxy_cache_key);
-        }
-        if (location->proxy_cache_bypass[0] == '\0' && server->proxy_cache_bypass[0] != '\0') {
-            snprintf(location->proxy_cache_bypass, sizeof(location->proxy_cache_bypass), "%s", server->proxy_cache_bypass);
-        }
-        if (location->cache_valid_rule_count == 0 && server->cache_valid_rule_count > 0) {
-            location->cache_valid_rule_count = server->cache_valid_rule_count;
-            memcpy(location->cache_valid_rules, server->cache_valid_rules, sizeof(server->cache_valid_rules));
-        }
-    }
-
-    /* Inherit server real_ip and access_log settings if not configured in location */
-    if (!location->has_access_log && server->has_access_log) {
-        location->access_log = server->access_log;
-        location->has_access_log = true;
-    }
-    if (location->real_ip_rule_count == 0 && server->real_ip_rule_count > 0) {
-        location->real_ip_rule_count = server->real_ip_rule_count;
-        memcpy(location->real_ip_rules, server->real_ip_rules, sizeof(server->real_ip_rules));
-    }
-    if (!location->has_real_ip_header && server->has_real_ip_header) {
-        snprintf(location->real_ip_header, sizeof(location->real_ip_header), "%s", server->real_ip_header);
-        location->has_real_ip_header = true;
-    }
-    if (!location->has_real_ip_recursive && server->has_real_ip_recursive) {
-        location->real_ip_recursive = server->real_ip_recursive;
-        location->has_real_ip_recursive = true;
-    }
-    if (!compress_config_inherit(&location->compress, &location->has_compress, &server->compress, server->has_compress)) {
-        return config_oom(parser->error);
-    }
-    next_upstream_inherit(&location->next_upstream, &location->has_next_upstream,
-                          &server->next_upstream, server->has_next_upstream);
-    proxy_intercept_errors_inherit(&location->proxy_intercept_errors, &location->has_proxy_intercept_errors,
-                                   server->proxy_intercept_errors, server->has_proxy_intercept_errors);
-    if (location->error_page_count == 0 && server->error_page_count > 0) {
-        location->error_pages = calloc(server->error_page_count, sizeof(apex_error_page_config_t));
-        if (location->error_pages == NULL) return config_oom(parser->error);
-        location->error_page_count = server->error_page_count;
-        location->error_page_capacity = server->error_page_count;
-        for (size_t i = 0; i < server->error_page_count; i++) {
-            location->error_pages[i].status_code = server->error_pages[i].status_code;
-            location->error_pages[i].line = server->error_pages[i].line;
-            location->error_pages[i].path = config_strdup_range(server->error_pages[i].path, strlen(server->error_pages[i].path));
-            if (location->error_pages[i].path == NULL) return config_oom(parser->error);
-        }
-    }
-    cookie_domain_inherit(&location->cookie_domains, &location->cookie_domain_count, &location->cookie_domain_capacity, location->cookie_domain_off,
-                          server->cookie_domains, server->cookie_domain_count, server->cookie_domain_off);
-    cookie_path_inherit(&location->cookie_paths, &location->cookie_path_count, &location->cookie_path_capacity, location->cookie_path_off,
-                        server->cookie_paths, server->cookie_path_count, server->cookie_path_off);
-    sub_filter_inherit(&location->sub_filter, &server->sub_filter);
-    resolver_inherit(&location->resolver, &server->resolver);
-    otel_inherit(&location->otel, &server->otel);
-    api_inherit(&location->api, &server->api);
-    auth_basic_inherit(&location->auth_basic, &server->auth_basic);
-    open_file_cache_inherit(&location->open_file_cache, &server->open_file_cache);
-
-    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
-        !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0' && !location->api.enabled &&
-        location->content_by_lua == NULL) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, fastcgi_pass, root, return, stub_status, metrics, content_by_lua, or api");
-        return false;
-    }
-    return true;
-}
-
-static bool parse_server_block(parser_t *parser) {
-    const token_t *begin = parser_peek(parser);
-    if (!parser_expect_lbrace(parser)) {
-        return false;
-    }
-
-    apex_server_config_t *server = config_add_server(parser, begin);
-    if (server == NULL) {
-        return false;
-    }
-    bool have_listen = false;
-
-    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
-        const token_t *directive = parser_peek(parser);
-        if (directive->kind == TOKEN_EOF) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'server' block");
-            return false;
-        }
-        if (directive->kind != TOKEN_WORD) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a server directive");
-            return false;
-        }
-        parser_advance(parser);
-
-        bool handled_ext = false;
-        if (!parse_extensibility_directive(parser, directive,
-                                          &server->access_by_lua,
-                                          NULL,
-                                          &server->header_filter_by_lua,
-                                          server->wasm_filter_path,
-                                          sizeof(server->wasm_filter_path),
-                                          &handled_ext)) {
-            return false;
-        }
-        if (handled_ext) {
-            continue;
-        }
-
-        if (token_is_word(directive, "listen")) {
-            if (have_listen) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "server declares listen more than once");
-                return false;
-            }
-            const token_t *value = parser_scalar(parser, "a listen address");
-            if (value == NULL) {
-                return false;
-            }
-
-            char listen_text[APEX_CONFIG_HOST_MAX * 2u];
-            if (value->length >= sizeof(listen_text)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "listen address is too long");
-                return false;
-            }
-            memcpy(listen_text, value->text, value->length);
-            listen_text[value->length] = '\0';
-
-            uint16_t port = 0;
-            if (listen_text[0] == ':' || listen_text[0] == '[') {
-                if (!parse_host_port(listen_text, true, true, server->listen_host, sizeof(server->listen_host),
-                                     &port)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'",
-                                 value->text);
-                    return false;
-                }
-            } else if (strchr(listen_text, ':') == NULL) {
-                uint64_t parsed = 0;
-                const token_t *port_token = value;
-                if (!token_to_u64(port_token, 0, 65535, &parsed)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen port");
-                    return false;
-                }
-                server->listen_host[0] = '\0';
-                port = (uint16_t)parsed;
-            } else {
-                if (!parse_host_port(listen_text, false, true, server->listen_host, sizeof(server->listen_host),
-                                     &port)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'",
-                                 value->text);
-                    return false;
-                }
-            }
-
-            server->listen_port = port;
-            have_listen = true;
-
-            if (token_is_word(parser_peek(parser), "tls")) {
-                parser_advance(parser);
-                server->listen_tls = true;
-            }
-        } else if (token_is_word(directive, "server_name")) {
-            size_t count = 0;
-            while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
-                const token_t *name = parser_scalar(parser, "a server name");
-                if (name == NULL || !server_add_name(parser, server, name)) {
-                    return false;
-                }
-                count++;
-            }
-            if (count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "server_name requires a name");
-                return false;
-            }
-        } else if (token_is_word(directive, "tls")) {
-            if (server->tls.enabled) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "server declares tls more than once");
-                return false;
-            }
-            if (!parse_tls_block(parser, server)) {
-                return false;
-            }
-            continue;
-        } else if (token_is_word(directive, "acme")) {
-            if (parser_peek(parser)->kind == TOKEN_LBRACE) {
-                if (!parse_acme_block(parser, &server->acme)) {
-                    return false;
-                }
-                continue;
-            }
-            if (!parse_acme_directive(parser, directive, &server->acme)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "location")) {
-            if (!parse_location_block(parser, server)) {
-                return false;
-            }
-            continue;
-        } else if (token_is_word(directive, "error_page")) {
-            int codes[16];
-            size_t code_count = 0;
-            while (parser_peek(parser)->kind == TOKEN_WORD &&
-                   isdigit((unsigned char)parser_peek(parser)->text[0])) {
-                const token_t *code_token = parser_scalar(parser, "an HTTP status code");
-                if (code_token == NULL) {
-                    return false;
-                }
-                uint64_t code_val = 0;
-                if (!token_to_u64(code_token, 300, 599, &code_val)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, code_token, "invalid HTTP error status code");
-                    return false;
-                }
-                if (code_count < sizeof(codes) / sizeof(codes[0])) {
-                    codes[code_count++] = (int)code_val;
-                }
-            }
-            if (code_count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "error_page requires at least one status code");
-                return false;
-            }
-            const token_t *path_token = parser_scalar(parser, "a file path for error_page");
-            if (path_token == NULL) {
-                return false;
-            }
-            for (size_t c = 0; c < code_count; c++) {
-                if (!server_add_error_page(parser, server, codes[c], path_token)) {
-                    return false;
-                }
-            }
-        } else if (token_is_word(directive, "return")) {
-            const token_t *first = parser_scalar(parser, "a redirect code or URL");
-            if (first == NULL) {
-                return false;
-            }
-            int code = 302;
-            const token_t *url_tok = NULL;
-            if (first->length > 0 && isdigit((unsigned char)first->text[0])) {
-                uint64_t cval = 0;
-                if (!token_to_u64(first, 200, 599, &cval)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, first, "invalid return status code");
-                    return false;
-                }
-                code = (int)cval;
-                if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                    url_tok = parser_scalar(parser, "a redirect URL or text");
-                    if (url_tok == NULL) {
-                        return false;
-                    }
-                }
-            } else {
-                url_tok = first;
-            }
-
-            server->return_code = code;
-            if (url_tok != NULL) {
-                if (url_tok->length >= sizeof(server->return_url)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, url_tok, "return URL is too long");
-                    return false;
-                }
-                memcpy(server->return_url, url_tok->text, url_tok->length);
-                server->return_url[url_tok->length] = '\0';
-            } else {
-                server->return_url[0] = '\0';
-            }
-        } else if (token_is_word(directive, "allow") || token_is_word(directive, "deny")) {
-            bool allow = token_is_word(directive, "allow");
-            const token_t *val = parser_scalar(parser, "a CIDR address or 'all'");
-            if (val == NULL) {
-                return false;
-            }
-            if (server->acl_rule_count >= APEX_CONFIG_MAX_ACL_RULES) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many allow/deny rules (max %u)",
-                             (unsigned)APEX_CONFIG_MAX_ACL_RULES);
-                return false;
-            }
-            apex_acl_rule_t *rule = &server->acl_rules[server->acl_rule_count];
-            memset(rule, 0, sizeof(*rule));
-            rule->allow = allow;
-            if (!config_parse_cidr(val->text, val->length, rule)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid CIDR address '%s'", val->text);
-                return false;
-            }
-            server->acl_rule_count++;
-        } else if (token_is_word(directive, "limit_req")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *arg = parser_scalar(parser, "limit_req parameter");
-                if (arg == NULL) return false;
-                if (strncmp(arg->text, "zone=", 5) == 0) {
-                    snprintf(server->limit_req_zone, sizeof(server->limit_req_zone), "%s", arg->text + 5);
-                } else if (strncmp(arg->text, "burst=", 6) == 0) {
-                    server->limit_req_burst = (uint32_t)strtoul(arg->text + 6, NULL, 10);
-                } else if (strcmp(arg->text, "nodelay") == 0) {
-                    server->limit_req_nodelay = true;
-                } else if (server->limit_req_zone[0] == '\0') {
-                    snprintf(server->limit_req_zone, sizeof(server->limit_req_zone), "%s", arg->text);
-                }
-            }
-        } else if (token_is_word(directive, "limit_req_status")) {
-            const token_t *val = parser_scalar(parser, "status code");
-            if (val == NULL) return false;
-            uint64_t code = 0;
-            if (!token_to_u64(val, 400, 599, &code)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_req_status");
-                return false;
-            }
-            server->limit_req_status = (int)code;
-        } else if (token_is_word(directive, "limit_conn")) {
-            const token_t *first = parser_scalar(parser, "zone name");
-            if (first == NULL) return false;
-            if (strncmp(first->text, "zone=", 5) == 0) {
-                snprintf(server->limit_conn_zone, sizeof(server->limit_conn_zone), "%s", first->text + 5);
-            } else {
-                snprintf(server->limit_conn_zone, sizeof(server->limit_conn_zone), "%s", first->text);
-            }
-            const token_t *second = parser_scalar(parser, "max connections");
-            if (second == NULL) return false;
-            server->limit_conn_max = (uint32_t)strtoul(second->text, NULL, 10);
-        } else if (token_is_word(directive, "limit_conn_status")) {
-            const token_t *val = parser_scalar(parser, "status code");
-            if (val == NULL) return false;
-            uint64_t code = 0;
-            if (!token_to_u64(val, 400, 599, &code)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid limit_conn_status");
-                return false;
-            }
-            server->limit_conn_status = (int)code;
-        } else if (token_is_word(directive, "proxy_cache")) {
-            const token_t *val = parser_scalar(parser, "cache zone name or off");
-            if (val == NULL) return false;
-            if (token_is_word(val, "off")) {
-                server->proxy_cache[0] = '\0';
-            } else {
-                snprintf(server->proxy_cache, sizeof(server->proxy_cache), "%s", val->text);
-            }
-        } else if (token_is_word(directive, "proxy_cache_key")) {
-            const token_t *val = parser_scalar(parser, "cache key");
-            if (val == NULL) return false;
-            snprintf(server->proxy_cache_key, sizeof(server->proxy_cache_key), "%s", val->text);
-        } else if (token_is_word(directive, "proxy_cache_bypass")) {
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *arg = parser_scalar(parser, "bypass variable");
-                if (arg == NULL) return false;
-                if (server->proxy_cache_bypass[0] != '\0') {
-                    strncat(server->proxy_cache_bypass, " ",
-                            sizeof(server->proxy_cache_bypass) - strlen(server->proxy_cache_bypass) - 1);
-                }
-                strncat(server->proxy_cache_bypass, arg->text,
-                        sizeof(server->proxy_cache_bypass) - strlen(server->proxy_cache_bypass) - 1);
-            }
-        } else if (token_is_word(directive, "proxy_cache_valid")) {
-            token_t tokens[8];
-            size_t count = 0;
-            while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-                const token_t *tok = parser_scalar(parser, "proxy_cache_valid parameter");
-                if (tok == NULL) return false;
-                if (count < 8) {
-                    tokens[count++] = *tok;
-                }
-            }
-            if (count == 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_valid requires arguments");
-                return false;
-            }
-            uint64_t valid_ms = 0;
-            if (!token_to_duration_ms(&tokens[count - 1], &valid_ms)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, &tokens[count - 1],
-                             "invalid cache validity duration '%s'", tokens[count - 1].text);
-                return false;
-            }
-            if (count == 1) {
-                int default_codes[] = {200, 301, 302};
-                for (size_t c = 0; c < 3 && server->cache_valid_rule_count < 8; c++) {
-                    server->cache_valid_rules[server->cache_valid_rule_count].status_code = default_codes[c];
-                    server->cache_valid_rules[server->cache_valid_rule_count].valid_ms = valid_ms;
-                    server->cache_valid_rule_count++;
-                }
-            } else {
-                for (size_t c = 0; c < count - 1 && server->cache_valid_rule_count < 8; c++) {
-                    int code = 0;
-                    if (token_is_word(&tokens[c], "any")) {
-                        code = 0;
-                    } else {
-                        code = atoi(tokens[c].text);
-                    }
-                    server->cache_valid_rules[server->cache_valid_rule_count].status_code = code;
-                    server->cache_valid_rules[server->cache_valid_rule_count].valid_ms = valid_ms;
-                    server->cache_valid_rule_count++;
-                }
-            }
-        } else if (token_is_word(directive, "set_real_ip_from")) {
-            if (!config_parse_set_real_ip_from(parser, directive, server->real_ip_rules,
-                                              &server->real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "real_ip_header")) {
-            if (!config_parse_real_ip_header(parser, server->real_ip_header, sizeof(server->real_ip_header))) {
-                return false;
-            }
-            server->has_real_ip_header = true;
-        } else if (token_is_word(directive, "real_ip_recursive")) {
-            if (!config_parse_real_ip_recursive(parser, &server->real_ip_recursive)) {
-                return false;
-            }
-            server->has_real_ip_recursive = true;
-        } else if (token_is_word(directive, "access_log")) {
-            if (!config_parse_access_log(parser, directive, &server->access_log)) {
-                return false;
-            }
-            server->has_access_log = true;
-        } else if (token_is_word(directive, "root")) {
-            const token_t *value = parser_scalar(parser, "a filesystem path");
-            if (value == NULL) return false;
-            server->root = config_strdup_range(value->text, value->length);
-            if (server->root == NULL) return config_oom(parser->error);
-        } else if (token_is_word(directive, "add_header")) {
-            if (!config_add_response_header(parser, &server->add_headers,
-                                            &server->add_header_count,
-                                            &server->add_header_capacity)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "server_tokens")) {
-            if (!parse_server_tokens_directive(parser, &server->server_tokens)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "keepalive_requests")) {
-            if (!parse_keepalive_requests(parser, &server->keepalive_requests, &server->has_keepalive_requests)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "client_max_body_size")) {
-            if (!parse_client_max_body_size(parser, &server->client_max_body_size, &server->has_client_max_body_size)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache")) {
-            if (!parse_open_file_cache_directive(parser, &server->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_valid")) {
-            if (!parse_open_file_cache_valid_directive(parser, &server->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_min_uses")) {
-            if (!parse_open_file_cache_min_uses_directive(parser, &server->open_file_cache)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "open_file_cache_errors")) {
-            if (!parse_open_file_cache_errors_directive(parser, &server->open_file_cache)) {
-                return false;
-            }
-        } else if (parse_acme_directive(parser, directive, &server->acme)) {
-            /* handled */
-        } else {
-            bool handled_failover = false;
-            if (!parse_failover_directive(parser, directive, &server->next_upstream,
-                                          &server->has_next_upstream,
-                                          &server->proxy_intercept_errors,
-                                          &server->has_proxy_intercept_errors,
-                                          &handled_failover)) {
-                return false;
-            }
-            if (handled_failover) {
-                /* handled */
-            } else {
-                bool handled_cookie = false;
-                if (!parse_cookie_directive(parser, directive,
-                                            &server->cookie_domains, &server->cookie_domain_count,
-                                            &server->cookie_domain_capacity, &server->cookie_domain_off,
-                                            &server->cookie_paths, &server->cookie_path_count,
-                                            &server->cookie_path_capacity, &server->cookie_path_off,
-                                            &handled_cookie)) {
-                    return false;
-                }
-                if (handled_cookie) {
-                    /* handled */
-                } else {
-                    bool handled_sub = false;
-                    if (!parse_sub_filter_directive(parser, directive, &server->sub_filter, &handled_sub)) {
-                        return false;
-                    }
-                    if (handled_sub) {
-                        /* handled */
-                    } else {
-                        bool handled_res = false;
-                    if (!parse_resolver_directive(parser, directive, &server->resolver, &handled_res)) {
-                        return false;
-                    }
-                    if (handled_res) {
-                        /* handled */
-                    } else {
-                        bool handled_otel = false;
-                        if (!parse_otel_directive(parser, directive, &server->otel, &handled_otel)) {
-                            return false;
-                        }
-                        if (handled_otel) {
-                            /* handled */
-                        } else {
-                            bool handled_api = false;
-                            if (!parse_api_directive(parser, directive, &server->api, &handled_api)) {
-                                return false;
-                            }
-                            if (handled_api) {
-                                /* handled */
-                            } else {
-                                bool handled_auth = false;
-                                if (!parse_auth_basic_directive(parser, directive, &server->auth_basic, &handled_auth)) {
-                                    return false;
-                                }
-                                if (handled_auth) {
-                                    /* handled */
-                                } else {
-                                    bool handled_compress = false;
-                                    if (parse_compress_directive(parser, directive, &server->compress, &server->has_compress, &handled_compress)) {
-                                        if (!handled_compress) {
-                                            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
-                                            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, keepalive_requests, client_max_body_size, gzip, brotli, zstd");
-                                            return false;
-                                        }
-                                    } else {
-                                        return false;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-        if (!parser_expect_semicolon(parser)) {
-            return false;
-        }
-    }
-
-    if (!parser_expect_rbrace(parser)) {
-        return false;
-    }
-
-    if (!server->has_keepalive_requests && parser->config->http.keepalive_requests > 0) {
-        server->keepalive_requests = parser->config->http.keepalive_requests;
-        server->has_keepalive_requests = true;
-    }
-    if (!server->has_client_max_body_size && parser->config->http.has_client_max_body_size) {
-        server->client_max_body_size = parser->config->http.client_max_body_size;
-        server->has_client_max_body_size = true;
-    }
-
-    /* Inherit http-level real_ip, access_log, and server_tokens settings */
-    if (!server->has_access_log && parser->config->http.has_access_log) {
-        server->access_log = parser->config->http.access_log;
-        server->has_access_log = true;
-    }
-    if (server->real_ip_rule_count == 0 && parser->config->http.real_ip_rule_count > 0) {
-        server->real_ip_rule_count = parser->config->http.real_ip_rule_count;
-        memcpy(server->real_ip_rules, parser->config->http.real_ip_rules, sizeof(parser->config->http.real_ip_rules));
-    }
-    if (!server->has_real_ip_header && parser->config->http.has_real_ip_header) {
-        snprintf(server->real_ip_header, sizeof(server->real_ip_header), "%s", parser->config->http.real_ip_header);
-        server->has_real_ip_header = true;
-    }
-    if (!server->has_real_ip_recursive && parser->config->http.has_real_ip_recursive) {
-        server->real_ip_recursive = parser->config->http.real_ip_recursive;
-        server->has_real_ip_recursive = true;
-    }
-    if (!server->server_tokens.set && parser->config->http.server_tokens.set) {
-        server->server_tokens = parser->config->http.server_tokens;
-    }
-    if (!compress_config_inherit(&server->compress, &server->has_compress, &parser->config->http.compress, parser->config->http.has_compress)) {
-        return config_oom(parser->error);
-    }
-    next_upstream_inherit(&server->next_upstream, &server->has_next_upstream,
-                          &parser->config->http.next_upstream, parser->config->http.has_next_upstream);
-    proxy_intercept_errors_inherit(&server->proxy_intercept_errors, &server->has_proxy_intercept_errors,
-                                   parser->config->http.proxy_intercept_errors, parser->config->http.has_proxy_intercept_errors);
-    cookie_domain_inherit(&server->cookie_domains, &server->cookie_domain_count, &server->cookie_domain_capacity, server->cookie_domain_off,
-                          parser->config->http.cookie_domains, parser->config->http.cookie_domain_count, parser->config->http.cookie_domain_off);
-    cookie_path_inherit(&server->cookie_paths, &server->cookie_path_count, &server->cookie_path_capacity, server->cookie_path_off,
-                        parser->config->http.cookie_paths, parser->config->http.cookie_path_count, parser->config->http.cookie_path_off);
-    sub_filter_inherit(&server->sub_filter, &parser->config->http.sub_filter);
-    resolver_inherit(&server->resolver, &parser->config->http.resolver);
-    otel_inherit(&server->otel, &parser->config->http.otel);
-    auth_basic_inherit(&server->auth_basic, &parser->config->http.auth_basic);
-    open_file_cache_inherit(&server->open_file_cache, &parser->config->http.open_file_cache);
-    acme_inherit(&server->acme, &parser->config->http.acme);
-
-    if (!have_listen) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
-        return false;
-    }
-    if (server->listen_tls && !server->tls.enabled) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "listen tls requires a tls block");
-        return false;
-    }
-    return true;
-}
-
-static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t *upstream) {
-    const token_t *endpoint = parser_scalar(parser, "a backend address");
-    if (endpoint == NULL) {
-        return false;
-    }
-
-    char endpoint_text[APEX_CONFIG_HOST_MAX * 2u];
-    if (endpoint->length >= sizeof(endpoint_text)) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "backend address is too long");
-        return false;
-    }
-    memcpy(endpoint_text, endpoint->text, endpoint->length);
-    endpoint_text[endpoint->length] = '\0';
-
-    apex_upstream_server_config_t server;
-    memset(&server, 0, sizeof(server));
-    server.weight = 1u;
-    server.line = endpoint->line;
-    if (!parse_host_port(endpoint_text, false, false, server.host, sizeof(server.host), &server.port)) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "invalid backend address '%s'", endpoint->text);
-        parser_hint(parser, "backend addresses use host:port or [ipv6]:port");
-        return false;
-    }
-
-    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-        const token_t *attribute = parser_peek(parser);
-        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected ';' after backend address");
-            return false;
-        }
-
-        const char *name = attribute->text;
-        size_t name_length = attribute->length;
-        const char *equals = memchr(name, '=', name_length);
-        size_t key_length = name_length;
-
-        if (equals == NULL) {
-            if (token_is_word(attribute, "backup")) {
-                server.is_backup = true;
-                parser_advance(parser);
-                continue;
-            }
-            if (token_is_word(attribute, "down")) {
-                server.is_down = true;
-                parser_advance(parser);
-                continue;
-            }
-        }
-
-        if (equals != NULL) {
-            key_length = (size_t)(equals - name);
-        }
-        parser_advance(parser);
-
-        char option_text[64];
-        const token_t *value_token = NULL;
-        token_t inline_value;
-        if (equals != NULL) {
-            size_t value_length = name_length - key_length - 1u;
-            if (value_length >= sizeof(option_text)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "backend option value is too long");
-                return false;
-            }
-            memcpy(option_text, equals + 1, value_length);
-            option_text[value_length] = '\0';
-            memset(&inline_value, 0, sizeof(inline_value));
-            inline_value.kind = TOKEN_WORD;
-            inline_value.text = option_text;
-            inline_value.length = value_length;
-            inline_value.line = attribute->line;
-            inline_value.column = attribute->column;
-            inline_value.file_index = attribute->file_index;
-            value_token = &inline_value;
-        } else {
-            const token_t *equals_token = parser_peek(parser);
-            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
-                             "backend option '%s' requires '=' and a value", name);
-                return false;
-            }
-            parser_advance(parser);
-            value_token = parser_scalar(parser, "an option value");
-            if (value_token == NULL) {
-                return false;
-            }
-        }
-
-        uint64_t parsed = 0;
-        if (key_length == 6u && strncmp(name, "weight", 6u) == 0) {
-            if (!token_to_u64(value_token, 1u, APEX_CONFIG_MAX_WEIGHT, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "weight must be between 1 and %u",
-                             (unsigned)APEX_CONFIG_MAX_WEIGHT);
-                return false;
-            }
-            server.weight = (uint32_t)parsed;
-        } else if (key_length == 9u && strncmp(name, "max_conns", 9u) == 0) {
-            if (!token_to_u64(value_token, 0u, APEX_CONFIG_MAX_CONNS, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_conns is out of range");
-                return false;
-            }
-            server.max_conns = (uint32_t)parsed;
-        } else if (key_length == 9u && strncmp(name, "max_fails", 9u) == 0) {
-            if (!token_to_u64(value_token, 1u, 1000u, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_fails must be between 1 and 1000");
-                return false;
-            }
-            upstream->max_fails = (uint32_t)parsed;
-        } else if (key_length == 12u && strncmp(name, "fail_timeout", 12u) == 0) {
-            if (!token_to_duration_ms(value_token, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for fail_timeout");
-                return false;
-            }
-            upstream->fail_timeout_ms = parsed;
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown backend option");
-            parser_hint(parser, "backend options are weight=<n>, max_conns=<n>, max_fails=<n>, fail_timeout=<dur>, backup, down");
-            return false;
-        }
-    }
-
-    if (!parser_expect_semicolon(parser)) {
-        return false;
-    }
-    return upstream_add_server(parser, upstream, &server);
-}
-
-static bool parse_upstream_health_check_item(parser_t *parser, apex_upstream_config_t *upstream) {
-    upstream->health_check_enabled = true;
-    if (upstream->health_check_interval_ms == 0) {
-        upstream->health_check_interval_ms = 5000;
-    }
-    if (upstream->health_check_timeout_ms == 0) {
-        upstream->health_check_timeout_ms = 2000;
-    }
-    if (upstream->health_check_fall == 0) {
-        upstream->health_check_fall = 2;
-    }
-    if (upstream->health_check_rise == 0) {
-        upstream->health_check_rise = 2;
-    }
-    if (upstream->health_check_uri[0] == '\0') {
-        snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "/");
-    }
-
-    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-        const token_t *attribute = parser_peek(parser);
-        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unterminated 'health_check' directive");
-            return false;
-        }
-        if (attribute->kind != TOKEN_WORD && attribute->kind != TOKEN_STRING) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected a health_check option");
-            return false;
-        }
-
-        const char *name = attribute->text;
-        size_t name_length = attribute->length;
-        const char *equals = strchr(name, '=');
-        size_t key_length = name_length;
-        if (equals != NULL) {
-            key_length = (size_t)(equals - name);
-        }
-        parser_advance(parser);
-
-        char option_text[128];
-        const token_t *value_token = NULL;
-        token_t inline_value;
-        if (equals != NULL) {
-            size_t value_length = name_length - key_length - 1u;
-            if (value_length >= sizeof(option_text)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "health_check option value is too long");
-                return false;
-            }
-            memcpy(option_text, equals + 1, value_length);
-            option_text[value_length] = '\0';
-            memset(&inline_value, 0, sizeof(inline_value));
-            inline_value.kind = TOKEN_WORD;
-            inline_value.text = option_text;
-            inline_value.length = value_length;
-            inline_value.line = attribute->line;
-            inline_value.column = attribute->column;
-            inline_value.file_index = attribute->file_index;
-            value_token = &inline_value;
-        } else {
-            const token_t *equals_token = parser_peek(parser);
-            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
-                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
-                             "health_check option '%s' requires '=' and a value", name);
-                return false;
-            }
-            parser_advance(parser);
-            value_token = parser_scalar(parser, "an option value");
-            if (value_token == NULL) {
-                return false;
-            }
-        }
-
-        uint64_t parsed = 0;
-        if (key_length == 3u && strncmp(name, "uri", 3u) == 0) {
-            if (value_token->length >= sizeof(upstream->health_check_uri)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "health_check uri is too long");
-                return false;
-            }
-            snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "%s", value_token->text);
-        } else if (key_length == 8u && strncmp(name, "interval", 8u) == 0) {
-            if (!token_to_duration_ms(value_token, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for interval");
-                return false;
-            }
-            upstream->health_check_interval_ms = parsed;
-        } else if (key_length == 7u && strncmp(name, "timeout", 7u) == 0) {
-            if (!token_to_duration_ms(value_token, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for timeout");
-                return false;
-            }
-            upstream->health_check_timeout_ms = parsed;
-        } else if (key_length == 4u && strncmp(name, "fall", 4u) == 0) {
-            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "fall must be between 1 and 100");
-                return false;
-            }
-            upstream->health_check_fall = (uint32_t)parsed;
-        } else if (key_length == 4u && strncmp(name, "rise", 4u) == 0) {
-            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "rise must be between 1 and 100");
-                return false;
-            }
-            upstream->health_check_rise = (uint32_t)parsed;
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown health_check option");
-            parser_hint(parser, "health_check options are uri=<path>, interval=<dur>, timeout=<dur>, fall=<n>, rise=<n>");
-            return false;
-        }
-    }
-
-    return parser_expect_semicolon(parser);
-}
-
-static bool parse_upstream_block(parser_t *parser) {
-    const token_t *name = parser_identifier(parser, "an upstream name");
-    if (name == NULL) {
-        return false;
-    }
-    if (is_reserved_word(name->text)) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "reserved word '%s' cannot name an upstream",
-                     name->text);
-        return false;
-    }
-    if (apex_config_find_upstream(parser->config, name->text) != NULL) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "duplicate upstream '%s'", name->text);
-        return false;
-    }
-
-    apex_upstream_config_t *upstream = config_add_upstream(parser, name);
-    if (upstream == NULL) {
-        return false;
-    }
-
-    if (!parser_expect_lbrace(parser)) {
-        return false;
-    }
-
-    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
-        const token_t *directive = parser_peek(parser);
-        if (directive->kind == TOKEN_EOF) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'upstream' block");
-            return false;
-        }
-        if (directive->kind != TOKEN_WORD) {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected an upstream directive");
-            return false;
-        }
-        parser_advance(parser);
-
-        if (token_is_word(directive, "server")) {
-            if (!parse_upstream_server_item(parser, upstream)) {
-                return false;
-            }
-            continue;
-        }
-        if (token_is_word(directive, "health_check")) {
-            if (!parse_upstream_health_check_item(parser, upstream)) {
-                return false;
-            }
-            continue;
-        }
-        if (token_is_word(directive, "least_conn") || token_is_word(directive, "least-conn")) {
-            upstream->policy = APEX_BALANCE_LEAST_CONN;
-        } else if (token_is_word(directive, "ip_hash") || token_is_word(directive, "ip-hash")) {
-            upstream->policy = APEX_BALANCE_IP_HASH;
-        } else if (token_is_word(directive, "policy") || token_is_word(directive, "algorithm")) {
-            const token_t *value = parser_scalar(parser, "round_robin, p2c, least_conn, or ip_hash");
-            if (value == NULL) {
-                return false;
-            }
-            if (token_is_word(value, "round_robin") || token_is_word(value, "round-robin")) {
-                upstream->policy = APEX_BALANCE_ROUND_ROBIN;
-            } else if (token_is_word(value, "p2c")) {
-                upstream->policy = APEX_BALANCE_P2C;
-            } else if (token_is_word(value, "least_conn") || token_is_word(value, "least-conn")) {
-                upstream->policy = APEX_BALANCE_LEAST_CONN;
-            } else if (token_is_word(value, "ip_hash") || token_is_word(value, "ip-hash")) {
-                upstream->policy = APEX_BALANCE_IP_HASH;
-            } else {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "policy must be round_robin, p2c, least_conn, or ip_hash");
-                return false;
-            }
-        } else if (token_is_word(directive, "keepalive")) {
-            const token_t *value = parser_scalar(parser, "a connection count");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t parsed = 0;
-            if (!token_to_u64(value, 0u, APEX_CONFIG_MAX_KEEPALIVE, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "keepalive is out of range");
-                return false;
-            }
-            upstream->keepalive = (uint32_t)parsed;
-        } else if (token_is_word(directive, "max_fails")) {
-            const token_t *value = parser_scalar(parser, "a failure count");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t parsed = 0;
-            if (!token_to_u64(value, 1u, 1000u, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "max_fails must be between 1 and 1000");
-                return false;
-            }
-            upstream->max_fails = (uint32_t)parsed;
-        } else if (token_is_word(directive, "fail_timeout")) {
-            const token_t *value = parser_scalar(parser, "a duration");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t milliseconds = 0;
-            if (!token_to_duration_ms(value, &milliseconds)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration for fail_timeout");
-                return false;
-            }
-            upstream->fail_timeout_ms = milliseconds;
-        } else if (token_is_word(directive, "max_retries")) {
-            const token_t *value = parser_scalar(parser, "a retry count");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t parsed = 0;
-            if (!token_to_u64(value, 0u, 64u, &parsed)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "max_retries must be between 0 and 64");
-                return false;
-            }
-            upstream->max_retries = (uint32_t)parsed;
-        } else if (token_is_word(directive, "connect_timeout") || token_is_word(directive, "read_timeout") ||
-                   token_is_word(directive, "idle_timeout")) {
-            const token_t *value = parser_scalar(parser, "a duration");
-            if (value == NULL) {
-                return false;
-            }
-            uint64_t milliseconds = 0;
-            if (!token_to_duration_ms(value, &milliseconds)) {
-                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
-                return false;
-            }
-            if (token_is_word(directive, "connect_timeout")) {
-                upstream->connect_timeout_ms = milliseconds;
-            } else if (token_is_word(directive, "read_timeout")) {
-                upstream->read_timeout_ms = milliseconds;
-            } else {
-                upstream->idle_timeout_ms = milliseconds;
-            }
-        } else {
-            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown upstream directive '%s'",
-                         directive->text);
-            parser_hint(parser, "upstream accepts server, policy, keepalive, connect_timeout, read_timeout, "
-                                "idle_timeout, max_fails, fail_timeout, max_retries, health_check");
-            return false;
-        }
-
-        if (!parser_expect_semicolon(parser)) {
-            return false;
-        }
-    }
-
-    if (!parser_expect_rbrace(parser)) {
-        return false;
-    }
-    if (upstream->server_count == 0) {
-        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "upstream '%s' requires at least one server",
-                     upstream->name);
-        return false;
-    }
-    return true;
-}
-
-
 static bool parse_rate_str(const char *text, double *rate_per_sec, uint32_t *rate_r_s) {
     if (text == NULL || *text == '\0') return false;
     char *endptr = NULL;
@@ -4873,320 +3164,6 @@ static bool parse_rate_str(const char *text, double *rate_per_sec, uint32_t *rat
         return true;
     }
     return false;
-}
-
-static bool parse_http_directive(parser_t *parser, const token_t *directive) {
-    if (token_is_word(directive, "worker_connections")) {
-        const token_t *value = parser_scalar(parser, "a connection count");
-        if (value == NULL) {
-            return false;
-        }
-        uint64_t parsed = 0;
-        if (!token_to_u64(value, 1u, 10000000u, &parsed)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "worker_connections is out of range");
-            return false;
-        }
-        parser->config->http.worker_connections = (uint32_t)parsed;
-    } else if (token_is_word(directive, "keepalive_timeout") ||
-               token_is_word(directive, "client_header_timeout") ||
-               token_is_word(directive, "client_body_timeout")) {
-        const token_t *value = parser_scalar(parser, "a duration");
-        if (value == NULL) {
-            return false;
-        }
-        uint64_t milliseconds = 0;
-        if (!token_to_duration_ms(value, &milliseconds)) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
-            return false;
-        }
-        if (token_is_word(directive, "keepalive_timeout")) {
-            parser->config->http.keepalive_timeout_ms = milliseconds;
-        } else if (token_is_word(directive, "client_header_timeout")) {
-            parser->config->http.client_header_timeout_ms = milliseconds;
-        } else {
-            parser->config->http.client_body_timeout_ms = milliseconds;
-        }
-    } else if (token_is_word(directive, "server_tokens")) {
-        if (!parse_server_tokens_directive(parser, &parser->config->http.server_tokens)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "keepalive_requests")) {
-        if (!parse_keepalive_requests(parser, &parser->config->http.keepalive_requests, NULL)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "client_max_body_size")) {
-        if (!parse_client_max_body_size(parser, &parser->config->http.client_max_body_size, &parser->config->http.has_client_max_body_size)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "add_header")) {
-        if (!config_add_response_header(parser, &parser->config->http.add_headers,
-                                        &parser->config->http.add_header_count,
-                                        &parser->config->http.add_header_capacity)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "limit_req_zone")) {
-        if (parser->config->http.rate_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many rate limit zones (max %u)",
-                         APEX_CONFIG_MAX_RATE_ZONES);
-            return false;
-        }
-        apex_rate_limit_zone_t *zone = &parser->config->http.rate_zones[parser->config->http.rate_zone_count];
-        memset(zone, 0, sizeof(*zone));
-
-        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-            const token_t *arg = parser_scalar(parser, "limit_req_zone parameter");
-            if (arg == NULL) return false;
-            if (arg->text[0] == '$') {
-                snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
-            } else if (strncmp(arg->text, "zone=", 5) == 0) {
-                const char *spec = arg->text + 5;
-                const char *colon = strchr(spec, ':');
-                if (colon != NULL) {
-                    size_t name_len = (size_t)(colon - spec);
-                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
-                    memcpy(zone->name, spec, name_len);
-                    zone->name[name_len] = '\0';
-                    if (!parse_size_str(colon + 1, &zone->size_bytes)) {
-                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
-                        return false;
-                    }
-                } else {
-                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
-                }
-            } else if (strncmp(arg->text, "rate=", 5) == 0) {
-                if (!parse_rate_str(arg->text + 5, &zone->rate_per_sec, &zone->rate_r_s)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid rate '%s'", arg->text + 5);
-                    return false;
-                }
-            }
-        }
-        if (zone->name[0] == '\0') {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_req_zone requires a zone name");
-            return false;
-        }
-        if (zone->rate_per_sec <= 0.0) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_req_zone requires rate=<num>r/s or rate=<num>r/m");
-            return false;
-        }
-        parser->config->http.rate_zone_count++;
-    } else if (token_is_word(directive, "limit_conn_zone")) {
-        if (parser->config->http.conn_zone_count >= APEX_CONFIG_MAX_CONN_ZONES) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many conn limit zones (max %u)",
-                         APEX_CONFIG_MAX_CONN_ZONES);
-            return false;
-        }
-        apex_conn_limit_zone_t *zone = &parser->config->http.conn_zones[parser->config->http.conn_zone_count];
-        memset(zone, 0, sizeof(*zone));
-
-        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-            const token_t *arg = parser_scalar(parser, "limit_conn_zone parameter");
-            if (arg == NULL) return false;
-            if (arg->text[0] == '$') {
-                snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
-            } else if (strncmp(arg->text, "zone=", 5) == 0) {
-                const char *spec = arg->text + 5;
-                const char *colon = strchr(spec, ':');
-                if (colon != NULL) {
-                    size_t name_len = (size_t)(colon - spec);
-                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
-                    memcpy(zone->name, spec, name_len);
-                    zone->name[name_len] = '\0';
-                    if (!parse_size_str(colon + 1, &zone->size_bytes)) {
-                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
-                        return false;
-                    }
-                } else {
-                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
-                }
-            }
-        }
-        if (zone->name[0] == '\0') {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "limit_conn_zone requires a zone name");
-            return false;
-        }
-        parser->config->http.conn_zone_count++;
-    } else if (token_is_word(directive, "proxy_cache_path")) {
-        if (parser->config->http.cache_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "too many cache zones (max %u)",
-                         APEX_CONFIG_MAX_RATE_ZONES);
-            return false;
-        }
-        apex_cache_zone_config_t *zone = &parser->config->http.cache_zones[parser->config->http.cache_zone_count];
-        memset(zone, 0, sizeof(*zone));
-
-        const token_t *path_arg = parser_scalar(parser, "cache path");
-        if (path_arg == NULL) return false;
-        snprintf(zone->path, sizeof(zone->path), "%s", path_arg->text);
-        zone->inactive_ms = 600000; /* default 10m */
-        zone->max_size = 1024ULL * 1024ULL * 1024ULL; /* default 1GB */
-        zone->keys_zone_size = 10 * 1024 * 1024; /* default 10MB */
-
-        while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
-            const token_t *arg = parser_scalar(parser, "proxy_cache_path parameter");
-            if (arg == NULL) return false;
-            if (strncmp(arg->text, "keys_zone=", 10) == 0) {
-                const char *spec = arg->text + 10;
-                const char *colon = strchr(spec, ':');
-                if (colon != NULL) {
-                    size_t name_len = (size_t)(colon - spec);
-                    if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
-                    memcpy(zone->name, spec, name_len);
-                    zone->name[name_len] = '\0';
-                    if (!parse_size_str(colon + 1, &zone->keys_zone_size)) {
-                        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid keys_zone size '%s'", colon + 1);
-                        return false;
-                    }
-                } else {
-                    snprintf(zone->name, sizeof(zone->name), "%s", spec);
-                }
-            } else if (strncmp(arg->text, "max_size=", 9) == 0) {
-                if (!parse_size_str(arg->text + 9, &zone->max_size)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid max_size '%s'", arg->text + 9);
-                    return false;
-                }
-            } else if (strncmp(arg->text, "inactive=", 9) == 0) {
-                token_t temp_tok = *arg;
-                temp_tok.text = arg->text + 9;
-                temp_tok.length = strlen(temp_tok.text);
-                if (!token_to_duration_ms(&temp_tok, &zone->inactive_ms)) {
-                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid inactive duration '%s'", arg->text + 9);
-                    return false;
-                }
-            } else if (strncmp(arg->text, "levels=", 7) == 0) {
-                /* standard nginx levels=1:2 (supported) */
-            }
-        }
-        if (zone->name[0] == '\0') {
-            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, directive, "proxy_cache_path requires keys_zone=<name>:<size>");
-            return false;
-        }
-        parser->config->http.cache_zone_count++;
-    } else if (token_is_word(directive, "log_format")) {
-        if (!config_parse_log_format(parser, directive)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "access_log")) {
-        if (!config_parse_access_log(parser, directive, &parser->config->http.access_log)) {
-            return false;
-        }
-        parser->config->http.has_access_log = true;
-    } else if (token_is_word(directive, "set_real_ip_from")) {
-        if (!config_parse_set_real_ip_from(parser, directive, parser->config->http.real_ip_rules,
-                                          &parser->config->http.real_ip_rule_count, APEX_CONFIG_MAX_REAL_IP_RULES)) {
-            return false;
-        }
-    } else if (token_is_word(directive, "real_ip_header")) {
-        if (!config_parse_real_ip_header(parser, parser->config->http.real_ip_header,
-                                         sizeof(parser->config->http.real_ip_header))) {
-            return false;
-        }
-        parser->config->http.has_real_ip_header = true;
-    } else if (token_is_word(directive, "real_ip_recursive")) {
-        if (!config_parse_real_ip_recursive(parser, &parser->config->http.real_ip_recursive)) {
-            return false;
-        }
-        parser->config->http.has_real_ip_recursive = true;
-    } else {
-        bool handled_failover = false;
-        if (!parse_failover_directive(parser, directive, &parser->config->http.next_upstream,
-                                      &parser->config->http.has_next_upstream,
-                                      &parser->config->http.proxy_intercept_errors,
-                                      &parser->config->http.has_proxy_intercept_errors,
-                                      &handled_failover)) {
-            return false;
-        }
-        if (handled_failover) {
-            return true;
-        }
-        bool handled_cookie = false;
-        if (!parse_cookie_directive(parser, directive,
-                                    &parser->config->http.cookie_domains, &parser->config->http.cookie_domain_count,
-                                    &parser->config->http.cookie_domain_capacity, &parser->config->http.cookie_domain_off,
-                                    &parser->config->http.cookie_paths, &parser->config->http.cookie_path_count,
-                                    &parser->config->http.cookie_path_capacity, &parser->config->http.cookie_path_off,
-                                    &handled_cookie)) {
-            return false;
-        }
-        if (handled_cookie) {
-            return true;
-        }
-        bool handled_sub = false;
-        if (!parse_sub_filter_directive(parser, directive, &parser->config->http.sub_filter, &handled_sub)) {
-            return false;
-        }
-        if (handled_sub) {
-            return true;
-        }
-        bool handled_res = false;
-        if (!parse_resolver_directive(parser, directive, &parser->config->http.resolver, &handled_res)) {
-            return false;
-        }
-        if (handled_res) {
-            return true;
-        }
-        bool handled_otel = false;
-        if (!parse_otel_directive(parser, directive, &parser->config->http.otel, &handled_otel)) {
-            return false;
-        }
-        if (handled_otel) {
-            return true;
-        }
-        bool handled_auth = false;
-        if (!parse_auth_basic_directive(parser, directive, &parser->config->http.auth_basic, &handled_auth)) {
-            return false;
-        }
-        if (handled_auth) {
-            return true;
-        }
-        bool handled_compress = false;
-        if (parse_compress_directive(parser, directive, &parser->config->http.compress,
-                                     &parser->config->http.has_compress, &handled_compress)) {
-            if (handled_compress) {
-                return true;
-            }
-        } else {
-            return false;
-        }
-        if (token_is_word(directive, "open_file_cache")) {
-            if (!parse_open_file_cache_directive(parser, &parser->config->http.open_file_cache)) {
-                return false;
-            }
-            return true;
-        } else if (token_is_word(directive, "open_file_cache_valid")) {
-            if (!parse_open_file_cache_valid_directive(parser, &parser->config->http.open_file_cache)) {
-                return false;
-            }
-            return true;
-        } else if (token_is_word(directive, "open_file_cache_min_uses")) {
-            if (!parse_open_file_cache_min_uses_directive(parser, &parser->config->http.open_file_cache)) {
-                return false;
-            }
-            return true;
-        } else if (token_is_word(directive, "open_file_cache_errors")) {
-            if (!parse_open_file_cache_errors_directive(parser, &parser->config->http.open_file_cache)) {
-                return false;
-            }
-            return true;
-        } else if (token_is_word(directive, "acme")) {
-            if (parser_peek(parser)->kind == TOKEN_LBRACE) {
-                if (!parse_acme_block(parser, &parser->config->http.acme)) {
-                    return false;
-                }
-                return true;
-            }
-            if (!parse_acme_directive(parser, directive, &parser->config->http.acme)) {
-                return false;
-            }
-            return true;
-        } else if (parse_acme_directive(parser, directive, &parser->config->http.acme)) {
-            return true;
-        }
-        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
-        parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
-                            "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, upstream, server, keepalive_requests, client_max_body_size, gzip, brotli, zstd");
-        return false;
-    }
-    return true;
 }
 
 static bool map_add_entry_internal(parser_t *parser, apex_map_t *map, const char *key, size_t key_len, const char *val, size_t val_len) {
@@ -5431,6 +3408,2039 @@ const apex_compress_config_t *apex_config_get_compress(const apex_server_config_
     return NULL;
 }
 
+static bool parse_upstream_server_item(parser_t *parser, apex_upstream_config_t *upstream) {
+    const token_t *endpoint = parser_scalar(parser, "a backend address");
+    if (endpoint == NULL) {
+        return false;
+    }
+
+    char endpoint_text[APEX_CONFIG_HOST_MAX * 2u];
+    if (endpoint->length >= sizeof(endpoint_text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "backend address is too long");
+        return false;
+    }
+    memcpy(endpoint_text, endpoint->text, endpoint->length);
+    endpoint_text[endpoint->length] = '\0';
+
+    apex_upstream_server_config_t server;
+    memset(&server, 0, sizeof(server));
+    server.weight = 1u;
+    server.line = endpoint->line;
+    if (!parse_host_port(endpoint_text, false, false, server.host, sizeof(server.host), &server.port)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, endpoint, "invalid backend address '%s'", endpoint->text);
+        parser_hint(parser, "backend addresses use host:port or [ipv6]:port");
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *attribute = parser_peek(parser);
+        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected ';' after backend address");
+            return false;
+        }
+
+        const char *name = attribute->text;
+        size_t name_length = attribute->length;
+        const char *equals = memchr(name, '=', name_length);
+        size_t key_length = name_length;
+
+        if (equals == NULL) {
+            if (token_is_word(attribute, "backup")) {
+                server.is_backup = true;
+                parser_advance(parser);
+                continue;
+            }
+            if (token_is_word(attribute, "down")) {
+                server.is_down = true;
+                parser_advance(parser);
+                continue;
+            }
+        }
+
+        if (equals != NULL) {
+            key_length = (size_t)(equals - name);
+        }
+        parser_advance(parser);
+
+        char option_text[64];
+        const token_t *value_token = NULL;
+        token_t inline_value;
+        if (equals != NULL) {
+            size_t value_length = name_length - key_length - 1u;
+            if (value_length >= sizeof(option_text)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "backend option value is too long");
+                return false;
+            }
+            memcpy(option_text, equals + 1, value_length);
+            option_text[value_length] = '\0';
+            memset(&inline_value, 0, sizeof(inline_value));
+            inline_value.kind = TOKEN_WORD;
+            inline_value.text = option_text;
+            inline_value.length = value_length;
+            inline_value.line = attribute->line;
+            inline_value.column = attribute->column;
+            inline_value.file_index = attribute->file_index;
+            value_token = &inline_value;
+        } else {
+            const token_t *equals_token = parser_peek(parser);
+            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
+                             "backend option '%s' requires '=' and a value", name);
+                return false;
+            }
+            parser_advance(parser);
+            value_token = parser_scalar(parser, "an option value");
+            if (value_token == NULL) {
+                return false;
+            }
+        }
+
+        uint64_t parsed = 0;
+        if (key_length == 6u && strncmp(name, "weight", 6u) == 0) {
+            if (!token_to_u64(value_token, 1u, APEX_CONFIG_MAX_WEIGHT, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "weight must be between 1 and %u",
+                             (unsigned)APEX_CONFIG_MAX_WEIGHT);
+                return false;
+            }
+            server.weight = (uint32_t)parsed;
+        } else if (key_length == 9u && strncmp(name, "max_conns", 9u) == 0) {
+            if (!token_to_u64(value_token, 0u, APEX_CONFIG_MAX_CONNS, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_conns is out of range");
+                return false;
+            }
+            server.max_conns = (uint32_t)parsed;
+        } else if (key_length == 9u && strncmp(name, "max_fails", 9u) == 0) {
+            if (!token_to_u64(value_token, 1u, 1000u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "max_fails must be between 1 and 1000");
+                return false;
+            }
+            upstream->max_fails = (uint32_t)parsed;
+        } else if (key_length == 12u && strncmp(name, "fail_timeout", 12u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for fail_timeout");
+                return false;
+            }
+            upstream->fail_timeout_ms = parsed;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown backend option");
+            parser_hint(parser, "backend options are weight=<n>, max_conns=<n>, max_fails=<n>, fail_timeout=<dur>, backup, down");
+            return false;
+        }
+    }
+
+    if (!parser_expect_semicolon(parser)) {
+        return false;
+    }
+    return upstream_add_server(parser, upstream, &server);
+}
+
+static bool parse_upstream_health_check_item(parser_t *parser, apex_upstream_config_t *upstream) {
+    upstream->health_check_enabled = true;
+    if (upstream->health_check_interval_ms == 0) {
+        upstream->health_check_interval_ms = 5000;
+    }
+    if (upstream->health_check_timeout_ms == 0) {
+        upstream->health_check_timeout_ms = 2000;
+    }
+    if (upstream->health_check_fall == 0) {
+        upstream->health_check_fall = 2;
+    }
+    if (upstream->health_check_rise == 0) {
+        upstream->health_check_rise = 2;
+    }
+    if (upstream->health_check_uri[0] == '\0') {
+        snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "/");
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *attribute = parser_peek(parser);
+        if (attribute->kind == TOKEN_EOF || attribute->kind == TOKEN_RBRACE) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unterminated 'health_check' directive");
+            return false;
+        }
+        if (attribute->kind != TOKEN_WORD && attribute->kind != TOKEN_STRING) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "expected a health_check option");
+            return false;
+        }
+
+        const char *name = attribute->text;
+        size_t name_length = attribute->length;
+        const char *equals = strchr(name, '=');
+        size_t key_length = name_length;
+        if (equals != NULL) {
+            key_length = (size_t)(equals - name);
+        }
+        parser_advance(parser);
+
+        char option_text[128];
+        const token_t *value_token = NULL;
+        token_t inline_value;
+        if (equals != NULL) {
+            size_t value_length = name_length - key_length - 1u;
+            if (value_length >= sizeof(option_text)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, attribute, "health_check option value is too long");
+                return false;
+            }
+            memcpy(option_text, equals + 1, value_length);
+            option_text[value_length] = '\0';
+            memset(&inline_value, 0, sizeof(inline_value));
+            inline_value.kind = TOKEN_WORD;
+            inline_value.text = option_text;
+            inline_value.length = value_length;
+            inline_value.line = attribute->line;
+            inline_value.column = attribute->column;
+            inline_value.file_index = attribute->file_index;
+            value_token = &inline_value;
+        } else {
+            const token_t *equals_token = parser_peek(parser);
+            if (equals_token->kind != TOKEN_WORD || strcmp(equals_token->text, "=") != 0) {
+                parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute,
+                             "health_check option '%s' requires '=' and a value", name);
+                return false;
+            }
+            parser_advance(parser);
+            value_token = parser_scalar(parser, "an option value");
+            if (value_token == NULL) {
+                return false;
+            }
+        }
+
+        uint64_t parsed = 0;
+        if (key_length == 3u && strncmp(name, "uri", 3u) == 0) {
+            if (value_token->length >= sizeof(upstream->health_check_uri)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "health_check uri is too long");
+                return false;
+            }
+            snprintf(upstream->health_check_uri, sizeof(upstream->health_check_uri), "%s", value_token->text);
+        } else if (key_length == 8u && strncmp(name, "interval", 8u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for interval");
+                return false;
+            }
+            upstream->health_check_interval_ms = parsed;
+        } else if (key_length == 7u && strncmp(name, "timeout", 7u) == 0) {
+            if (!token_to_duration_ms(value_token, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "invalid duration for timeout");
+                return false;
+            }
+            upstream->health_check_timeout_ms = parsed;
+        } else if (key_length == 4u && strncmp(name, "fall", 4u) == 0) {
+            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "fall must be between 1 and 100");
+                return false;
+            }
+            upstream->health_check_fall = (uint32_t)parsed;
+        } else if (key_length == 4u && strncmp(name, "rise", 4u) == 0) {
+            if (!token_to_u64(value_token, 1u, 100u, &parsed)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value_token, "rise must be between 1 and 100");
+                return false;
+            }
+            upstream->health_check_rise = (uint32_t)parsed;
+        } else {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, attribute, "unknown health_check option");
+            parser_hint(parser, "health_check options are uri=<path>, interval=<dur>, timeout=<dur>, fall=<n>, rise=<n>");
+            return false;
+        }
+    }
+
+    return parser_expect_semicolon(parser);
+}
+
+
+/* ========================================================================= */
+/*           DECLARATIVE DIRECTIVE ENGINE & COMMON PARSER HELPERS            */
+/* ========================================================================= */
+
+typedef enum {
+    APEX_CONF_FLAG,       /* on | off -> bool */
+    APEX_CONF_STRING,     /* single word or string -> fixed char array */
+    APEX_CONF_STRDUP,     /* single word or string -> dynamically allocated char * */
+    APEX_CONF_SIZE,       /* size with k/m/g suffix -> size_t bytes */
+    APEX_CONF_MSEC,       /* duration with ms/s/m/h suffix -> uint64_t ms */
+    APEX_CONF_INT,        /* integer with min/max range -> int */
+    APEX_CONF_UINT32,     /* unsigned integer with min/max range -> uint32_t */
+    APEX_CONF_CUSTOM,     /* custom handler function callback */
+} apex_conf_type_t;
+
+typedef struct apex_directive apex_directive_t;
+
+typedef bool (*apex_directive_handler_fn)(parser_t *parser,
+                                         const apex_directive_t *dir,
+                                         const token_t *directive_token,
+                                         void *target_struct,
+                                         bool *consumed_block);
+
+struct apex_directive {
+    const char *name;                      /* Directive name, e.g. "sendfile" */
+    apex_conf_type_t type;                 /* Value type */
+    size_t offset;                         /* offsetof target field */
+    size_t has_offset;                     /* offsetof has_field flag (or 0) */
+    size_t max_size;                       /* buffer size for strings / secondary offset */
+    int64_t min_val;                       /* min range value */
+    int64_t max_val;                       /* max range value */
+    apex_directive_handler_fn custom_fn;   /* custom handler callback */
+};
+
+static bool parse_conf_flag(parser_t *parser, const apex_directive_t *dir,
+                            const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "on or off");
+    if (value == NULL) return false;
+    bool *dst = (bool *)((char *)target + dir->offset);
+    if (token_is_word(value, "on")) {
+        *dst = true;
+    } else if (token_is_word(value, "off")) {
+        *dst = false;
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "%s must be 'on' or 'off'", dir->name);
+        return false;
+    }
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_string(parser_t *parser, const apex_directive_t *dir,
+                              const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a value");
+    if (value == NULL) return false;
+    if (value->length >= dir->max_size) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "%s is too long", dir->name);
+        return false;
+    }
+    char *dst = (char *)target + dir->offset;
+    memcpy(dst, value->text, value->length);
+    dst[value->length] = '\0';
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_strdup(parser_t *parser, const apex_directive_t *dir,
+                              const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a value");
+    if (value == NULL) return false;
+    char **dst = (char **)((char *)target + dir->offset);
+    free(*dst);
+    *dst = config_strdup_range(value->text, value->length);
+    if (*dst == NULL) return config_oom(parser->error);
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_size(parser_t *parser, const apex_directive_t *dir,
+                            const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a size");
+    if (value == NULL) return false;
+    size_t bytes = 0;
+    if (!parse_size_str(value->text, &bytes)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid size '%s'", value->text);
+        return false;
+    }
+    *(size_t *)((char *)target + dir->offset) = bytes;
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_msec(parser_t *parser, const apex_directive_t *dir,
+                            const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a duration");
+    if (value == NULL) return false;
+    uint64_t milliseconds = 0;
+    if (!token_to_duration_ms(value, &milliseconds)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid duration");
+        return false;
+    }
+    *(uint64_t *)((char *)target + dir->offset) = milliseconds;
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_int(parser_t *parser, const apex_directive_t *dir,
+                           const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a status code");
+    if (value == NULL) return false;
+    uint64_t parsed = 0;
+    if (!token_to_u64(value, (uint64_t)dir->min_val, (uint64_t)dir->max_val, &parsed)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid %s", dir->name);
+        return false;
+    }
+    *(int *)((char *)target + dir->offset) = (int)parsed;
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool parse_conf_uint32(parser_t *parser, const apex_directive_t *dir,
+                              const token_t *tok, void *target) {
+    (void)tok;
+    const token_t *value = parser_scalar(parser, "a number");
+    if (value == NULL) return false;
+    uint64_t parsed = 0;
+    if (!token_to_u64(value, (uint64_t)dir->min_val, (uint64_t)dir->max_val, &parsed)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "%s is out of range", dir->name);
+        return false;
+    }
+    *(uint32_t *)((char *)target + dir->offset) = (uint32_t)parsed;
+    if (dir->has_offset != 0) {
+        *(bool *)((char *)target + dir->has_offset) = true;
+    }
+    return true;
+}
+
+static bool config_dispatch_directive(parser_t *parser,
+                                      const apex_directive_t *table,
+                                      size_t table_size,
+                                      const token_t *directive,
+                                      void *target,
+                                      bool *handled,
+                                      bool *consumed_block) {
+    *handled = false;
+    *consumed_block = false;
+    for (size_t i = 0; i < table_size; i++) {
+        const apex_directive_t *dir = &table[i];
+        if (token_is_word(directive, dir->name)) {
+            *handled = true;
+            switch (dir->type) {
+            case APEX_CONF_FLAG:
+                return parse_conf_flag(parser, dir, directive, target);
+            case APEX_CONF_STRING:
+                return parse_conf_string(parser, dir, directive, target);
+            case APEX_CONF_STRDUP:
+                return parse_conf_strdup(parser, dir, directive, target);
+            case APEX_CONF_SIZE:
+                return parse_conf_size(parser, dir, directive, target);
+            case APEX_CONF_MSEC:
+                return parse_conf_msec(parser, dir, directive, target);
+            case APEX_CONF_INT:
+                return parse_conf_int(parser, dir, directive, target);
+            case APEX_CONF_UINT32:
+                return parse_conf_uint32(parser, dir, directive, target);
+            case APEX_CONF_CUSTOM:
+                return dir->custom_fn(parser, dir, directive, target, consumed_block);
+            }
+        }
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                       TLS DIRECTIVE HANDLERS                              */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_tls_protocols(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_tls_config_t *tls = (apex_tls_config_t *)target;
+    size_t count = 0;
+    while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
+        const token_t *protocol = parser_scalar(parser, "a protocol name");
+        if (protocol == NULL || !tls_add_protocol(parser, tls, protocol)) {
+            return false;
+        }
+        count++;
+    }
+    if (count == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "expected at least one protocol");
+        return false;
+    }
+    return true;
+}
+
+static bool conf_handle_tls_client_auth(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_tls_config_t *tls = (apex_tls_config_t *)target;
+    const token_t *value = parser_scalar(parser, "a client authentication mode");
+    if (value == NULL) return false;
+    if (token_is_word(value, "off")) {
+        tls->client_auth = APEX_TLS_CLIENT_AUTH_OFF;
+    } else if (token_is_word(value, "optional")) {
+        tls->client_auth = APEX_TLS_CLIENT_AUTH_OPTIONAL;
+    } else if (token_is_word(value, "required")) {
+        tls->client_auth = APEX_TLS_CLIENT_AUTH_REQUIRED;
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "client_auth must be off, optional, or required");
+        return false;
+    }
+    return true;
+}
+
+static const apex_directive_t g_tls_directives[] = {
+    {"certificate", APEX_CONF_STRDUP, offsetof(apex_tls_config_t, certificate), 0, 0, 0, 0, NULL},
+    {"private_key", APEX_CONF_STRDUP, offsetof(apex_tls_config_t, private_key), 0, 0, 0, 0, NULL},
+    {"ciphers",     APEX_CONF_STRDUP, offsetof(apex_tls_config_t, ciphers), 0, 0, 0, 0, NULL},
+    {"protocols",   APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_tls_protocols},
+    {"client_auth", APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_tls_client_auth},
+};
+
+static bool parse_tls_block(parser_t *parser, apex_server_config_t *server) {
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+    server->tls.enabled = true;
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'tls' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a tls directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        bool handled = false;
+        bool consumed_block = false;
+        if (!config_dispatch_directive(parser, g_tls_directives,
+                                       sizeof(g_tls_directives) / sizeof(g_tls_directives[0]),
+                                       directive, &server->tls, &handled, &consumed_block)) {
+            return false;
+        }
+
+        if (!handled) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown tls directive '%s'", directive->text);
+            parser_hint(parser, "tls accepts certificate, private_key, protocols, ciphers, client_auth");
+            return false;
+        }
+
+        if (!consumed_block && !parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (server->tls.certificate == NULL || server->tls.private_key == NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, NULL, "tls block requires certificate and private_key");
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                      SHARED DIRECTIVE HANDLERS                            */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_acl(parser_t *parser, const apex_directive_t *dir,
+                            const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    bool allow = token_is_word(tok, "allow");
+    const token_t *val = parser_scalar(parser, "a CIDR address or 'all'");
+    if (val == NULL) return false;
+    apex_acl_rule_t *rules = (apex_acl_rule_t *)((char *)target + dir->offset);
+    size_t *count = (size_t *)((char *)target + dir->has_offset);
+    if (*count >= APEX_CONFIG_MAX_ACL_RULES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "too many allow/deny rules (max %u)",
+                     (unsigned)APEX_CONFIG_MAX_ACL_RULES);
+        return false;
+    }
+    apex_acl_rule_t *rule = &rules[*count];
+    memset(rule, 0, sizeof(*rule));
+    rule->allow = allow;
+    if (!config_parse_cidr(val->text, val->length, rule)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, val, "invalid CIDR address '%s'", val->text);
+        return false;
+    }
+    (*count)++;
+    return true;
+}
+
+static bool conf_handle_return(parser_t *parser, const apex_directive_t *dir,
+                               const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    int *code_out = (int *)((char *)target + dir->offset);
+    char *url_out = (char *)((char *)target + dir->has_offset);
+    size_t url_size = dir->max_size;
+
+    const token_t *first = parser_scalar(parser, "a redirect code or URL");
+    if (first == NULL) return false;
+    int code = 302;
+    const token_t *url_tok = NULL;
+    if (first->length > 0 && isdigit((unsigned char)first->text[0])) {
+        uint64_t cval = 0;
+        if (!token_to_u64(first, 200, 599, &cval)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, first, "invalid return status code");
+            return false;
+        }
+        code = (int)cval;
+        if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+            url_tok = parser_scalar(parser, "a redirect URL or text");
+            if (url_tok == NULL) return false;
+        }
+    } else {
+        url_tok = first;
+    }
+
+    *code_out = code;
+    if (url_tok != NULL) {
+        if (url_tok->length >= url_size) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, url_tok, "return URL is too long");
+            return false;
+        }
+        memcpy(url_out, url_tok->text, url_tok->length);
+        url_out[url_tok->length] = '\0';
+    } else {
+        url_out[0] = '\0';
+    }
+    return true;
+}
+
+static bool conf_handle_limit_req(parser_t *parser, const apex_directive_t *dir,
+                                  const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    char *zone = (char *)target + dir->offset;
+    uint32_t *burst = (uint32_t *)((char *)target + dir->has_offset);
+    bool *nodelay = (bool *)((char *)target + dir->max_size);
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "limit_req parameter");
+        if (arg == NULL) return false;
+        if (strncmp(arg->text, "zone=", 5) == 0) {
+            snprintf(zone, 64, "%s", arg->text + 5);
+        } else if (strncmp(arg->text, "burst=", 6) == 0) {
+            *burst = (uint32_t)strtoul(arg->text + 6, NULL, 10);
+        } else if (strcmp(arg->text, "nodelay") == 0) {
+            *nodelay = true;
+        } else if (zone[0] == '\0') {
+            snprintf(zone, 64, "%s", arg->text);
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_limit_conn(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    char *zone = (char *)target + dir->offset;
+    uint32_t *max_conn = (uint32_t *)((char *)target + dir->has_offset);
+    const token_t *first = parser_scalar(parser, "zone name");
+    if (first == NULL) return false;
+    if (strncmp(first->text, "zone=", 5) == 0) {
+        snprintf(zone, 64, "%s", first->text + 5);
+    } else {
+        snprintf(zone, 64, "%s", first->text);
+    }
+    const token_t *second = parser_scalar(parser, "max connections");
+    if (second == NULL) return false;
+    *max_conn = (uint32_t)strtoul(second->text, NULL, 10);
+    return true;
+}
+
+static bool conf_handle_proxy_cache(parser_t *parser, const apex_directive_t *dir,
+                                    const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    char *cache = (char *)target + dir->offset;
+    size_t cache_size = dir->max_size;
+    const token_t *val = parser_scalar(parser, "cache zone name or off");
+    if (val == NULL) return false;
+    if (token_is_word(val, "off")) {
+        cache[0] = '\0';
+    } else {
+        snprintf(cache, cache_size, "%s", val->text);
+    }
+    return true;
+}
+
+static bool conf_handle_proxy_cache_bypass(parser_t *parser, const apex_directive_t *dir,
+                                           const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    char *bypass = (char *)target + dir->offset;
+    size_t bypass_size = dir->max_size;
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "bypass variable");
+        if (arg == NULL) return false;
+        if (bypass[0] != '\0') {
+            strncat(bypass, " ", bypass_size - strlen(bypass) - 1);
+        }
+        strncat(bypass, arg->text, bypass_size - strlen(bypass) - 1);
+    }
+    return true;
+}
+
+static bool conf_handle_proxy_cache_valid(parser_t *parser, const apex_directive_t *dir,
+                                          const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_cache_valid_rule_t *rules = (apex_cache_valid_rule_t *)((char *)target + dir->offset);
+    size_t *count = (size_t *)((char *)target + dir->has_offset);
+    token_t tokens[8];
+    size_t ntokens = 0;
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *t = parser_scalar(parser, "proxy_cache_valid parameter");
+        if (t == NULL) return false;
+        if (ntokens < 8) {
+            tokens[ntokens++] = *t;
+        }
+    }
+    if (ntokens == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "proxy_cache_valid requires arguments");
+        return false;
+    }
+    uint64_t valid_ms = 0;
+    if (!token_to_duration_ms(&tokens[ntokens - 1], &valid_ms)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, &tokens[ntokens - 1],
+                     "invalid cache validity duration '%s'", tokens[ntokens - 1].text);
+        return false;
+    }
+    if (ntokens == 1) {
+        int default_codes[] = {200, 301, 302};
+        for (size_t c = 0; c < 3 && *count < 8; c++) {
+            rules[*count].status_code = default_codes[c];
+            rules[*count].valid_ms = valid_ms;
+            (*count)++;
+        }
+    } else {
+        for (size_t c = 0; c < ntokens - 1 && *count < 8; c++) {
+            int code = 0;
+            if (token_is_word(&tokens[c], "any")) {
+                code = 0;
+            } else {
+                code = atoi(tokens[c].text);
+            }
+            rules[*count].status_code = code;
+            rules[*count].valid_ms = valid_ms;
+            (*count)++;
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_real_ip_from(parser_t *parser, const apex_directive_t *dir,
+                                     const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_real_ip_rule_t *rules = (apex_real_ip_rule_t *)((char *)target + dir->offset);
+    size_t *count = (size_t *)((char *)target + dir->has_offset);
+    return config_parse_set_real_ip_from(parser, tok, rules, count, APEX_CONFIG_MAX_REAL_IP_RULES);
+}
+
+static bool conf_handle_real_ip_header(parser_t *parser, const apex_directive_t *dir,
+                                       const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    char *header_out = (char *)target + dir->offset;
+    bool *has_header = (bool *)((char *)target + dir->has_offset);
+    if (!config_parse_real_ip_header(parser, header_out, dir->max_size)) {
+        return false;
+    }
+    *has_header = true;
+    return true;
+}
+
+static bool conf_handle_real_ip_recursive(parser_t *parser, const apex_directive_t *dir,
+                                          const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    bool *recursive_out = (bool *)((char *)target + dir->offset);
+    bool *has_recursive = (bool *)((char *)target + dir->has_offset);
+    if (!config_parse_real_ip_recursive(parser, recursive_out)) {
+        return false;
+    }
+    *has_recursive = true;
+    return true;
+}
+
+static bool conf_handle_access_log(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_access_log_config_t *log_cfg = (apex_access_log_config_t *)((char *)target + dir->offset);
+    bool *has_log = (bool *)((char *)target + dir->has_offset);
+    if (!config_parse_access_log(parser, tok, log_cfg)) {
+        return false;
+    }
+    *has_log = true;
+    return true;
+}
+
+static bool conf_handle_add_header(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    apex_add_header_t **headers_ptr = (apex_add_header_t **)((char *)target + dir->offset);
+    size_t *count_ptr = (size_t *)((char *)target + dir->has_offset);
+    size_t *cap_ptr = (size_t *)((char *)target + dir->max_size);
+    return config_add_response_header(parser, headers_ptr, count_ptr, cap_ptr);
+}
+
+static bool conf_handle_client_max_body_size(parser_t *parser, const apex_directive_t *dir,
+                                             const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    size_t *out_val = (size_t *)((char *)target + dir->offset);
+    bool *has_val = (bool *)((char *)target + dir->has_offset);
+    return parse_client_max_body_size(parser, out_val, has_val);
+}
+
+static bool conf_handle_server_tokens(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    apex_server_tokens_config_t *tokens = (apex_server_tokens_config_t *)((char *)target + dir->offset);
+    return parse_server_tokens_directive(parser, tokens);
+}
+
+static bool conf_handle_keepalive_requests(parser_t *parser, const apex_directive_t *dir,
+                                          const token_t *tok, void *target, bool *consumed_block) {
+    (void)tok; (void)consumed_block;
+    uint32_t *out_val = (uint32_t *)((char *)target + dir->offset);
+    bool *has_val = dir->has_offset != 0 ? (bool *)((char *)target + dir->has_offset) : NULL;
+    return parse_keepalive_requests(parser, out_val, has_val);
+}
+
+static bool conf_handle_open_file_cache(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_open_file_cache_config_t *cfg = (apex_open_file_cache_config_t *)((char *)target + dir->offset);
+    if (token_is_word(tok, "open_file_cache")) {
+        return parse_open_file_cache_directive(parser, cfg);
+    } else if (token_is_word(tok, "open_file_cache_valid")) {
+        return parse_open_file_cache_valid_directive(parser, cfg);
+    } else if (token_is_word(tok, "open_file_cache_min_uses")) {
+        return parse_open_file_cache_min_uses_directive(parser, cfg);
+    } else if (token_is_word(tok, "open_file_cache_errors")) {
+        return parse_open_file_cache_errors_directive(parser, cfg);
+    }
+    return false;
+}
+
+static bool conf_handle_failover(parser_t *parser, const apex_directive_t *dir,
+                                 const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_next_upstream_config_t *next_upstream = (apex_next_upstream_config_t *)((char *)target + dir->offset);
+    bool *has_next_upstream = (bool *)((char *)target + dir->has_offset);
+    bool *proxy_intercept_errors = (bool *)((char *)target + dir->max_size);
+    bool *has_proxy_intercept_errors = (bool *)((char *)target + dir->min_val);
+    bool handled = false;
+    if (!parse_failover_directive(parser, tok, next_upstream, has_next_upstream,
+                                  proxy_intercept_errors, has_proxy_intercept_errors, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_cookie(parser_t *parser, const apex_directive_t *dir,
+                               const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    /* Struct layout matches apex_cookie_domain_rule_t* / count / cap / off, then paths */
+    char *base = (char *)target + dir->offset;
+    apex_cookie_domain_rule_t **domains = (apex_cookie_domain_rule_t **)base;
+    size_t *domain_count = (size_t *)(base + sizeof(apex_cookie_domain_rule_t *));
+    size_t *domain_cap = (size_t *)(base + sizeof(apex_cookie_domain_rule_t *) + sizeof(size_t));
+    bool *domain_off = (bool *)(base + sizeof(apex_cookie_domain_rule_t *) + 2 * sizeof(size_t));
+
+    char *paths_base = (char *)target + dir->has_offset;
+    apex_cookie_path_rule_t **paths = (apex_cookie_path_rule_t **)paths_base;
+    size_t *path_count = (size_t *)(paths_base + sizeof(apex_cookie_path_rule_t *));
+    size_t *path_cap = (size_t *)(paths_base + sizeof(apex_cookie_path_rule_t *) + sizeof(size_t));
+    bool *path_off = (bool *)(paths_base + sizeof(apex_cookie_path_rule_t *) + 2 * sizeof(size_t));
+
+    bool handled = false;
+    if (!parse_cookie_directive(parser, tok, domains, domain_count, domain_cap, domain_off,
+                                paths, path_count, path_cap, path_off, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_sub_filter(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_sub_filter_config_t *sub = (apex_sub_filter_config_t *)((char *)target + dir->offset);
+    bool handled = false;
+    if (!parse_sub_filter_directive(parser, tok, sub, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_resolver(parser_t *parser, const apex_directive_t *dir,
+                                 const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_resolver_config_t *res = (apex_resolver_config_t *)((char *)target + dir->offset);
+    bool handled = false;
+    if (!parse_resolver_directive(parser, tok, res, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_otel(parser_t *parser, const apex_directive_t *dir,
+                             const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_otel_config_t *otel = (apex_otel_config_t *)((char *)target + dir->offset);
+    bool handled = false;
+    if (!parse_otel_directive(parser, tok, otel, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_api(parser_t *parser, const apex_directive_t *dir,
+                            const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_api_config_t *api = (apex_api_config_t *)((char *)target + dir->offset);
+    bool handled = false;
+    if (!parse_api_directive(parser, tok, api, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_auth_basic(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_auth_basic_config_t *auth = (apex_auth_basic_config_t *)((char *)target + dir->offset);
+    bool handled = false;
+    if (!parse_auth_basic_directive(parser, tok, auth, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_compress(parser_t *parser, const apex_directive_t *dir,
+                                 const token_t *tok, void *target, bool *consumed_block) {
+    (void)consumed_block;
+    apex_compress_config_t *compress = (apex_compress_config_t *)((char *)target + dir->offset);
+    bool *has_compress = (bool *)((char *)target + dir->has_offset);
+    bool handled = false;
+    if (!parse_compress_directive(parser, tok, compress, has_compress, &handled)) {
+        return false;
+    }
+    return handled;
+}
+
+static bool conf_handle_acme(parser_t *parser, const apex_directive_t *dir,
+                             const token_t *tok, void *target, bool *consumed_block) {
+    apex_acme_config_t *acme = (apex_acme_config_t *)((char *)target + dir->offset);
+    if (parser_peek(parser)->kind == TOKEN_LBRACE) {
+        *consumed_block = true;
+        return parse_acme_block(parser, acme);
+    }
+    return parse_acme_directive(parser, tok, acme);
+}
+
+static bool conf_handle_error_page_common(parser_t *parser, const token_t *tok,
+                                          apex_error_page_config_t **pages_ptr,
+                                          size_t *count_ptr, size_t *cap_ptr,
+                                          const char *ctx_name) {
+    int codes[16];
+    size_t code_count = 0;
+    while (parser_peek(parser)->kind == TOKEN_WORD &&
+           isdigit((unsigned char)parser_peek(parser)->text[0])) {
+        const token_t *code_token = parser_scalar(parser, "an HTTP status code");
+        if (code_token == NULL) return false;
+        uint64_t code_val = 0;
+        if (!token_to_u64(code_token, 300, 599, &code_val)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, code_token, "invalid HTTP error status code");
+            return false;
+        }
+        if (code_count < sizeof(codes) / sizeof(codes[0])) {
+            codes[code_count++] = (int)code_val;
+        }
+    }
+    if (code_count == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, tok, "error_page requires at least one status code");
+        return false;
+    }
+    const token_t *path_token = parser_scalar(parser, "a file path for error_page");
+    if (path_token == NULL) return false;
+    for (size_t c = 0; c < code_count; c++) {
+        if (!config_add_error_page(parser, pages_ptr, count_ptr, cap_ptr, ctx_name, codes[c], path_token)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                      LOCATION DIRECTIVE HANDLERS                          */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_proxy_pass(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    const token_t *value = parser_scalar(parser, "an upstream name or host:port");
+    if (value == NULL || !location_set_proxy_pass(parser, location, value)) {
+        return false;
+    }
+    return true;
+}
+
+static bool conf_handle_location_root(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    if (location->target != APEX_PROXY_TARGET_NONE || location->root != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok,
+                     "location cannot declare more than one terminal action");
+        return false;
+    }
+    const token_t *value = parser_scalar(parser, "a filesystem path");
+    if (value == NULL) return false;
+    location->root = config_strdup_range(value->text, value->length);
+    if (location->root == NULL) return config_oom(parser->error);
+    return true;
+}
+
+static bool conf_handle_location_index(parser_t *parser, const apex_directive_t *dir,
+                                       const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *value = parser_scalar(parser, "an index filename");
+        if (value == NULL || !location_add_index(parser, location, value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_location_try_files(parser_t *parser, const apex_directive_t *dir,
+                                           const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *value = parser_scalar(parser, "a try_files pattern");
+        if (value == NULL || !location_add_try_file(parser, location, value)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_proxy_set_header(parser_t *parser, const apex_directive_t *dir,
+                                         const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    const token_t *name = parser_scalar(parser, "a header name");
+    const token_t *value = parser_scalar(parser, "a header value");
+    if (name == NULL || value == NULL || !location_add_header(parser, location, name, value)) {
+        return false;
+    }
+    return true;
+}
+
+static bool conf_handle_proxy_http_version(parser_t *parser, const apex_directive_t *dir,
+                                           const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    const token_t *value = parser_scalar(parser, "1.0 or 1.1");
+    if (value == NULL) return false;
+    if (token_is_word(value, "1.0")) {
+        location->http_version = 10;
+    } else if (token_is_word(value, "1.1")) {
+        location->http_version = 11;
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "proxy_http_version must be 1.0 or 1.1");
+        return false;
+    }
+    return true;
+}
+
+static bool conf_handle_stub_status(parser_t *parser, const apex_directive_t *dir,
+                                    const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    location->stub_status = true;
+    if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *val = parser_scalar(parser, "stub_status arg");
+        if (val != NULL && token_is_word(val, "off")) {
+            location->stub_status = false;
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_metrics(parser_t *parser, const apex_directive_t *dir,
+                                const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    location->metrics = true;
+    if (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *val = parser_scalar(parser, "metrics arg");
+        if (val != NULL && token_is_word(val, "off")) {
+            location->metrics = false;
+        }
+    }
+    return true;
+}
+
+static bool conf_handle_fastcgi_param(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    const token_t *key = parser_scalar(parser, "a fastcgi parameter name");
+    if (key == NULL) return false;
+    const token_t *val = parser_scalar(parser, "a fastcgi parameter value");
+    if (val == NULL) return false;
+    if (location->fastcgi_param_count >= location->fastcgi_param_capacity) {
+        size_t ncap = location->fastcgi_param_capacity ? location->fastcgi_param_capacity * 2 : 8;
+        apex_config_header_t *nparams = realloc(location->fastcgi_params, ncap * sizeof(apex_config_header_t));
+        if (!nparams) return config_oom(parser->error);
+        location->fastcgi_params = nparams;
+        location->fastcgi_param_capacity = ncap;
+    }
+    apex_config_header_t *p = &location->fastcgi_params[location->fastcgi_param_count++];
+    p->name = config_strdup_range(key->text, key->length);
+    p->value = config_strdup_range(val->text, val->length);
+    p->line = key->line;
+    if (!p->name || !p->value) return config_oom(parser->error);
+    return true;
+}
+
+static bool conf_handle_error_page_loc(parser_t *parser, const apex_directive_t *dir,
+                                       const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)consumed_block;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    return conf_handle_error_page_common(parser, tok, &location->error_pages,
+                                         &location->error_page_count, &location->error_page_capacity, "location");
+}
+
+static bool conf_handle_location_extensibility(parser_t *parser, const apex_directive_t *dir,
+                                               const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir;
+    apex_location_config_t *location = (apex_location_config_t *)target;
+    bool handled_ext = false;
+    if (!parse_extensibility_directive(parser, tok,
+                                       &location->access_by_lua,
+                                       &location->content_by_lua,
+                                       &location->header_filter_by_lua,
+                                       location->wasm_filter_path,
+                                       sizeof(location->wasm_filter_path),
+                                       &handled_ext)) {
+        return false;
+    }
+    *consumed_block = true;
+    return handled_ext;
+}
+
+static const apex_directive_t g_location_directives[] = {
+    {"proxy_pass",             APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_proxy_pass},
+    {"root",                   APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_root},
+    {"index",                  APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_index},
+    {"try_files",              APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_try_files},
+    {"sendfile",               APEX_CONF_FLAG,   offsetof(apex_location_config_t, sendfile), 0, 0, 0, 0, NULL},
+    {"etag",                   APEX_CONF_FLAG,   offsetof(apex_location_config_t, etag), 0, 0, 0, 0, NULL},
+    {"precompressed",          APEX_CONF_FLAG,   offsetof(apex_location_config_t, precompressed), 0, 0, 0, 0, NULL},
+    {"gzip_static",            APEX_CONF_FLAG,   offsetof(apex_location_config_t, precompressed), 0, 0, 0, 0, NULL},
+    {"brotli_static",          APEX_CONF_FLAG,   offsetof(apex_location_config_t, precompressed), 0, 0, 0, 0, NULL},
+    {"proxy_set_header",       APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_proxy_set_header},
+    {"proxy_connect_timeout",  APEX_CONF_MSEC,   offsetof(apex_location_config_t, connect_timeout_ms), offsetof(apex_location_config_t, has_connect_timeout), 0, 0, 0, NULL},
+    {"proxy_read_timeout",     APEX_CONF_MSEC,   offsetof(apex_location_config_t, read_timeout_ms), offsetof(apex_location_config_t, has_read_timeout), 0, 0, 0, NULL},
+    {"proxy_http_version",     APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_proxy_http_version},
+    {"return",                 APEX_CONF_CUSTOM, offsetof(apex_location_config_t, return_code), offsetof(apex_location_config_t, return_url), sizeof(((apex_location_config_t *)0)->return_url), 0, 0, conf_handle_return},
+    {"allow",                  APEX_CONF_CUSTOM, offsetof(apex_location_config_t, acl_rules), offsetof(apex_location_config_t, acl_rule_count), 0, 0, 0, conf_handle_acl},
+    {"deny",                   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, acl_rules), offsetof(apex_location_config_t, acl_rule_count), 0, 0, 0, conf_handle_acl},
+    {"limit_req",              APEX_CONF_CUSTOM, offsetof(apex_location_config_t, limit_req_zone), offsetof(apex_location_config_t, limit_req_burst), offsetof(apex_location_config_t, limit_req_nodelay), 0, 0, conf_handle_limit_req},
+    {"limit_req_status",       APEX_CONF_INT,    offsetof(apex_location_config_t, limit_req_status), 0, 0, 400, 599, NULL},
+    {"limit_conn",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, limit_conn_zone), offsetof(apex_location_config_t, limit_conn_max), 0, 0, 0, conf_handle_limit_conn},
+    {"limit_conn_status",      APEX_CONF_INT,    offsetof(apex_location_config_t, limit_conn_status), 0, 0, 400, 599, NULL},
+    {"stub_status",            APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_stub_status},
+    {"metrics",                APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_metrics},
+    {"proxy_cache",            APEX_CONF_CUSTOM, offsetof(apex_location_config_t, proxy_cache), 0, sizeof(((apex_location_config_t *)0)->proxy_cache), 0, 0, conf_handle_proxy_cache},
+    {"proxy_cache_key",        APEX_CONF_STRING, offsetof(apex_location_config_t, proxy_cache_key), 0, sizeof(((apex_location_config_t *)0)->proxy_cache_key), 0, 0, NULL},
+    {"proxy_cache_bypass",     APEX_CONF_CUSTOM, offsetof(apex_location_config_t, proxy_cache_bypass), 0, sizeof(((apex_location_config_t *)0)->proxy_cache_bypass), 0, 0, conf_handle_proxy_cache_bypass},
+    {"proxy_cache_valid",      APEX_CONF_CUSTOM, offsetof(apex_location_config_t, cache_valid_rules), offsetof(apex_location_config_t, cache_valid_rule_count), 0, 0, 0, conf_handle_proxy_cache_valid},
+    {"set_real_ip_from",       APEX_CONF_CUSTOM, offsetof(apex_location_config_t, real_ip_rules), offsetof(apex_location_config_t, real_ip_rule_count), 0, 0, 0, conf_handle_real_ip_from},
+    {"real_ip_header",         APEX_CONF_CUSTOM, offsetof(apex_location_config_t, real_ip_header), offsetof(apex_location_config_t, has_real_ip_header), sizeof(((apex_location_config_t *)0)->real_ip_header), 0, 0, conf_handle_real_ip_header},
+    {"real_ip_recursive",      APEX_CONF_CUSTOM, offsetof(apex_location_config_t, real_ip_recursive), offsetof(apex_location_config_t, has_real_ip_recursive), 0, 0, 0, conf_handle_real_ip_recursive},
+    {"access_log",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, access_log), offsetof(apex_location_config_t, has_access_log), 0, 0, 0, conf_handle_access_log},
+    {"fastcgi_pass",           APEX_CONF_STRING, offsetof(apex_location_config_t, fastcgi_pass), 0, sizeof(((apex_location_config_t *)0)->fastcgi_pass), 0, 0, NULL},
+    {"fastcgi_index",          APEX_CONF_STRING, offsetof(apex_location_config_t, fastcgi_index), 0, sizeof(((apex_location_config_t *)0)->fastcgi_index), 0, 0, NULL},
+    {"fastcgi_param",          APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_fastcgi_param},
+    {"add_header",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, add_headers), offsetof(apex_location_config_t, add_header_count), offsetof(apex_location_config_t, add_header_capacity), 0, 0, conf_handle_add_header},
+    {"proxy_ssl_server_name",  APEX_CONF_FLAG,   offsetof(apex_location_config_t, proxy_ssl_server_name), 0, 0, 0, 0, NULL},
+    {"proxy_ssl_name",         APEX_CONF_STRING, offsetof(apex_location_config_t, proxy_ssl_name), 0, sizeof(((apex_location_config_t *)0)->proxy_ssl_name), 0, 0, NULL},
+    {"error_page",             APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_error_page_loc},
+    {"client_max_body_size",   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, client_max_body_size), offsetof(apex_location_config_t, has_client_max_body_size), 0, 0, 0, conf_handle_client_max_body_size},
+    {"open_file_cache",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_valid",  APEX_CONF_CUSTOM, offsetof(apex_location_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_min_uses", APEX_CONF_CUSTOM, offsetof(apex_location_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_errors", APEX_CONF_CUSTOM, offsetof(apex_location_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"proxy_next_upstream",    APEX_CONF_CUSTOM, offsetof(apex_location_config_t, next_upstream), offsetof(apex_location_config_t, has_next_upstream), offsetof(apex_location_config_t, proxy_intercept_errors), offsetof(apex_location_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_tries", APEX_CONF_CUSTOM, offsetof(apex_location_config_t, next_upstream), offsetof(apex_location_config_t, has_next_upstream), offsetof(apex_location_config_t, proxy_intercept_errors), offsetof(apex_location_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_timeout", APEX_CONF_CUSTOM, offsetof(apex_location_config_t, next_upstream), offsetof(apex_location_config_t, has_next_upstream), offsetof(apex_location_config_t, proxy_intercept_errors), offsetof(apex_location_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_intercept_errors", APEX_CONF_CUSTOM, offsetof(apex_location_config_t, next_upstream), offsetof(apex_location_config_t, has_next_upstream), offsetof(apex_location_config_t, proxy_intercept_errors), offsetof(apex_location_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_cookie_domain",    APEX_CONF_CUSTOM, offsetof(apex_location_config_t, cookie_domains), offsetof(apex_location_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"proxy_cookie_path",      APEX_CONF_CUSTOM, offsetof(apex_location_config_t, cookie_domains), offsetof(apex_location_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"sub_filter",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_once",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_types",       APEX_CONF_CUSTOM, offsetof(apex_location_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"resolver",               APEX_CONF_CUSTOM, offsetof(apex_location_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"resolver_timeout",       APEX_CONF_CUSTOM, offsetof(apex_location_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"otel",                   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_trace_context",     APEX_CONF_CUSTOM, offsetof(apex_location_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_span_name",         APEX_CONF_CUSTOM, offsetof(apex_location_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"api",                    APEX_CONF_CUSTOM, offsetof(apex_location_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"api_key",                APEX_CONF_CUSTOM, offsetof(apex_location_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"api_secret",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"auth_basic",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"auth_basic_user_file",   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"gzip",                   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_types",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_min_length",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli",                 APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_types",           APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_min_length",      APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_comp_level",      APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd",                   APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_types",             APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_min_length",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_location_config_t, compress), offsetof(apex_location_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"access_by_lua",          APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"access_by_lua_file",     APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"access_by_lua_block",    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"content_by_lua",         APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"content_by_lua_file",    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"content_by_lua_block",   APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"header_filter_by_lua",   APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"header_filter_by_lua_file", APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"header_filter_by_lua_block", APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+    {"wasm_filter",            APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_location_extensibility},
+};
+
+static bool parse_location_block(parser_t *parser, apex_server_config_t *server) {
+    const token_t *begin = parser_peek(parser);
+    bool exact = false;
+    const token_t *match = parser_peek(parser);
+    if ((match->kind == TOKEN_WORD || match->kind == TOKEN_STRING) && match->text != NULL &&
+        strcmp(match->text, "=") == 0) {
+        exact = true;
+        parser_advance(parser);
+    }
+
+    const token_t *path = parser_scalar(parser, "a location path");
+    if (path == NULL) {
+        return false;
+    }
+    if (path->length == 0 || path->text[0] != '/') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path must start with '/'");
+        return false;
+    }
+    if (path->text[0] == '~' || path->text[0] == '@') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "regex and named locations are not supported");
+        return false;
+    }
+    for (size_t index = 0; index < path->length; index++) {
+        unsigned char byte = (unsigned char)path->text[index];
+        if (byte <= 0x20 || byte == '\r' || byte == '\n') {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, path, "location path contains whitespace");
+            return false;
+        }
+    }
+
+    apex_location_config_t *location = server_add_location(parser, server, begin);
+    if (location == NULL) {
+        return false;
+    }
+    location->path = config_strdup_range(path->text, path->length);
+    if (location->path == NULL) {
+        return config_oom(parser->error);
+    }
+    location->exact = exact;
+    location->sendfile = true;
+    location->etag = true;
+    location->precompressed = true;
+
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'location' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a location directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        bool handled = false;
+        bool consumed_block = false;
+        if (!config_dispatch_directive(parser, g_location_directives,
+                                       sizeof(g_location_directives) / sizeof(g_location_directives[0]),
+                                       directive, location, &handled, &consumed_block)) {
+            return false;
+        }
+
+        if (!handled) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown location directive '%s'", directive->text);
+            parser_hint(parser, "location accepts proxy_pass, root, index, try_files, sendfile, etag, precompressed, proxy_set_header, proxy_*_timeout, "
+                                "proxy_http_version, return, error_page, allow, deny, limit_req, limit_conn, stub_status, metrics, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, fastcgi_pass, fastcgi_index, fastcgi_param, add_header, proxy_ssl_server_name, proxy_ssl_name, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, client_max_body_size, gzip, brotli, zstd");
+            return false;
+        }
+
+        if (!consumed_block && !parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+
+    if (!location->has_client_max_body_size && server->has_client_max_body_size) {
+        location->client_max_body_size = server->client_max_body_size;
+        location->has_client_max_body_size = true;
+    }
+
+    /* Inherit server root if not configured in location */
+    if (location->root == NULL && server->root != NULL) {
+        location->root = config_strdup_range(server->root, strlen(server->root));
+        if (location->root == NULL) return config_oom(parser->error);
+    }
+
+    /* Inherit server cache settings if not explicitly configured in location */
+    if (location->proxy_cache[0] == '\0' && server->proxy_cache[0] != '\0') {
+        snprintf(location->proxy_cache, sizeof(location->proxy_cache), "%s", server->proxy_cache);
+        if (location->proxy_cache_key[0] == '\0' && server->proxy_cache_key[0] != '\0') {
+            snprintf(location->proxy_cache_key, sizeof(location->proxy_cache_key), "%s", server->proxy_cache_key);
+        }
+        if (location->proxy_cache_bypass[0] == '\0' && server->proxy_cache_bypass[0] != '\0') {
+            snprintf(location->proxy_cache_bypass, sizeof(location->proxy_cache_bypass), "%s", server->proxy_cache_bypass);
+        }
+        if (location->cache_valid_rule_count == 0 && server->cache_valid_rule_count > 0) {
+            location->cache_valid_rule_count = server->cache_valid_rule_count;
+            memcpy(location->cache_valid_rules, server->cache_valid_rules, sizeof(server->cache_valid_rules));
+        }
+    }
+
+    /* Inherit server real_ip and access_log settings if not configured in location */
+    if (!location->has_access_log && server->has_access_log) {
+        location->access_log = server->access_log;
+        location->has_access_log = true;
+    }
+    if (location->real_ip_rule_count == 0 && server->real_ip_rule_count > 0) {
+        location->real_ip_rule_count = server->real_ip_rule_count;
+        memcpy(location->real_ip_rules, server->real_ip_rules, sizeof(server->real_ip_rules));
+    }
+    if (!location->has_real_ip_header && server->has_real_ip_header) {
+        snprintf(location->real_ip_header, sizeof(location->real_ip_header), "%s", server->real_ip_header);
+        location->has_real_ip_header = true;
+    }
+    if (!location->has_real_ip_recursive && server->has_real_ip_recursive) {
+        location->real_ip_recursive = server->real_ip_recursive;
+        location->has_real_ip_recursive = true;
+    }
+    if (!compress_config_inherit(&location->compress, &location->has_compress, &server->compress, server->has_compress)) {
+        return config_oom(parser->error);
+    }
+    next_upstream_inherit(&location->next_upstream, &location->has_next_upstream,
+                          &server->next_upstream, server->has_next_upstream);
+    proxy_intercept_errors_inherit(&location->proxy_intercept_errors, &location->has_proxy_intercept_errors,
+                                   server->proxy_intercept_errors, server->has_proxy_intercept_errors);
+    if (location->error_page_count == 0 && server->error_page_count > 0) {
+        location->error_pages = calloc(server->error_page_count, sizeof(apex_error_page_config_t));
+        if (location->error_pages == NULL) return config_oom(parser->error);
+        location->error_page_count = server->error_page_count;
+        location->error_page_capacity = server->error_page_count;
+        for (size_t i = 0; i < server->error_page_count; i++) {
+            location->error_pages[i].status_code = server->error_pages[i].status_code;
+            location->error_pages[i].line = server->error_pages[i].line;
+            location->error_pages[i].path = config_strdup_range(server->error_pages[i].path, strlen(server->error_pages[i].path));
+            if (location->error_pages[i].path == NULL) return config_oom(parser->error);
+        }
+    }
+    cookie_domain_inherit(&location->cookie_domains, &location->cookie_domain_count, &location->cookie_domain_capacity, location->cookie_domain_off,
+                          server->cookie_domains, server->cookie_domain_count, server->cookie_domain_off);
+    cookie_path_inherit(&location->cookie_paths, &location->cookie_path_count, &location->cookie_path_capacity, location->cookie_path_off,
+                        server->cookie_paths, server->cookie_path_count, server->cookie_path_off);
+    sub_filter_inherit(&location->sub_filter, &server->sub_filter);
+    resolver_inherit(&location->resolver, &server->resolver);
+    otel_inherit(&location->otel, &server->otel);
+    api_inherit(&location->api, &server->api);
+    auth_basic_inherit(&location->auth_basic, &server->auth_basic);
+    open_file_cache_inherit(&location->open_file_cache, &server->open_file_cache);
+
+    if (location->target == APEX_PROXY_TARGET_NONE && location->root == NULL && location->return_code == 0 &&
+        !location->stub_status && !location->metrics && location->fastcgi_pass[0] == '\0' && !location->api.enabled &&
+        location->content_by_lua == NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "location requires proxy_pass, fastcgi_pass, root, return, stub_status, metrics, content_by_lua, or api");
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                       SERVER DIRECTIVE HANDLERS                           */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_server_listen(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)consumed_block;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    if (server->listen_port != 0 || server->listen_host[0] != '\0' || server->listen_tls) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "server declares listen more than once");
+        return false;
+    }
+    const token_t *value = parser_scalar(parser, "a listen address");
+    if (value == NULL) return false;
+
+    char listen_text[APEX_CONFIG_HOST_MAX * 2u];
+    if (value->length >= sizeof(listen_text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "listen address is too long");
+        return false;
+    }
+    memcpy(listen_text, value->text, value->length);
+    listen_text[value->length] = '\0';
+
+    uint16_t port = 0;
+    if (listen_text[0] == ':' || listen_text[0] == '[') {
+        if (!parse_host_port(listen_text, true, true, server->listen_host, sizeof(server->listen_host), &port)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'", value->text);
+            return false;
+        }
+    } else if (strchr(listen_text, ':') == NULL) {
+        uint64_t parsed = 0;
+        const token_t *port_token = value;
+        if (!token_to_u64(port_token, 0, 65535, &parsed)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen port");
+            return false;
+        }
+        server->listen_host[0] = '\0';
+        port = (uint16_t)parsed;
+    } else {
+        if (!parse_host_port(listen_text, false, true, server->listen_host, sizeof(server->listen_host), &port)) {
+            parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "invalid listen address '%s'", value->text);
+            return false;
+        }
+    }
+
+    server->listen_port = port;
+
+    if (token_is_word(parser_peek(parser), "tls")) {
+        parser_advance(parser);
+        server->listen_tls = true;
+    }
+    return true;
+}
+
+static bool conf_handle_server_name(parser_t *parser, const apex_directive_t *dir,
+                                    const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)consumed_block;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    size_t count = 0;
+    while (parser_peek(parser)->kind == TOKEN_WORD || parser_peek(parser)->kind == TOKEN_STRING) {
+        const token_t *name = parser_scalar(parser, "a server name");
+        if (name == NULL || !server_add_name(parser, server, name)) {
+            return false;
+        }
+        count++;
+    }
+    if (count == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SYNTAX, parser_peek(parser), "server_name requires a name");
+        return false;
+    }
+    return true;
+}
+
+static bool conf_handle_server_tls(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    if (server->tls.enabled) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "server declares tls more than once");
+        return false;
+    }
+    *consumed_block = true;
+    return parse_tls_block(parser, server);
+}
+
+static bool conf_handle_server_location(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    *consumed_block = true;
+    return parse_location_block(parser, server);
+}
+
+static bool conf_handle_error_page_srv(parser_t *parser, const apex_directive_t *dir,
+                                       const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)consumed_block;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    return conf_handle_error_page_common(parser, tok, &server->error_pages,
+                                         &server->error_page_count, &server->error_page_capacity, "server");
+}
+
+static bool conf_handle_server_extensibility(parser_t *parser, const apex_directive_t *dir,
+                                             const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir;
+    apex_server_config_t *server = (apex_server_config_t *)target;
+    bool handled_ext = false;
+    if (!parse_extensibility_directive(parser, tok,
+                                       &server->access_by_lua,
+                                       NULL,
+                                       &server->header_filter_by_lua,
+                                       server->wasm_filter_path,
+                                       sizeof(server->wasm_filter_path),
+                                       &handled_ext)) {
+        return false;
+    }
+    *consumed_block = true;
+    return handled_ext;
+}
+
+static const apex_directive_t g_server_directives[] = {
+    {"listen",                 APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_listen},
+    {"server_name",            APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_name},
+    {"tls",                    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_tls},
+    {"acme",                   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, acme), 0, 0, 0, 0, conf_handle_acme},
+    {"location",               APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_location},
+    {"root",                   APEX_CONF_STRDUP, offsetof(apex_server_config_t, root), 0, 0, 0, 0, NULL},
+    {"error_page",             APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_error_page_srv},
+    {"return",                 APEX_CONF_CUSTOM, offsetof(apex_server_config_t, return_code), offsetof(apex_server_config_t, return_url), sizeof(((apex_server_config_t *)0)->return_url), 0, 0, conf_handle_return},
+    {"allow",                  APEX_CONF_CUSTOM, offsetof(apex_server_config_t, acl_rules), offsetof(apex_server_config_t, acl_rule_count), 0, 0, 0, conf_handle_acl},
+    {"deny",                   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, acl_rules), offsetof(apex_server_config_t, acl_rule_count), 0, 0, 0, conf_handle_acl},
+    {"limit_req",              APEX_CONF_CUSTOM, offsetof(apex_server_config_t, limit_req_zone), offsetof(apex_server_config_t, limit_req_burst), offsetof(apex_server_config_t, limit_req_nodelay), 0, 0, conf_handle_limit_req},
+    {"limit_req_status",       APEX_CONF_INT,    offsetof(apex_server_config_t, limit_req_status), 0, 0, 400, 599, NULL},
+    {"limit_conn",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, limit_conn_zone), offsetof(apex_server_config_t, limit_conn_max), 0, 0, 0, conf_handle_limit_conn},
+    {"limit_conn_status",      APEX_CONF_INT,    offsetof(apex_server_config_t, limit_conn_status), 0, 0, 400, 599, NULL},
+    {"proxy_cache",            APEX_CONF_CUSTOM, offsetof(apex_server_config_t, proxy_cache), 0, sizeof(((apex_server_config_t *)0)->proxy_cache), 0, 0, conf_handle_proxy_cache},
+    {"proxy_cache_key",        APEX_CONF_STRING, offsetof(apex_server_config_t, proxy_cache_key), 0, sizeof(((apex_server_config_t *)0)->proxy_cache_key), 0, 0, NULL},
+    {"proxy_cache_bypass",     APEX_CONF_CUSTOM, offsetof(apex_server_config_t, proxy_cache_bypass), 0, sizeof(((apex_server_config_t *)0)->proxy_cache_bypass), 0, 0, conf_handle_proxy_cache_bypass},
+    {"proxy_cache_valid",      APEX_CONF_CUSTOM, offsetof(apex_server_config_t, cache_valid_rules), offsetof(apex_server_config_t, cache_valid_rule_count), 0, 0, 0, conf_handle_proxy_cache_valid},
+    {"set_real_ip_from",       APEX_CONF_CUSTOM, offsetof(apex_server_config_t, real_ip_rules), offsetof(apex_server_config_t, real_ip_rule_count), 0, 0, 0, conf_handle_real_ip_from},
+    {"real_ip_header",         APEX_CONF_CUSTOM, offsetof(apex_server_config_t, real_ip_header), offsetof(apex_server_config_t, has_real_ip_header), sizeof(((apex_server_config_t *)0)->real_ip_header), 0, 0, conf_handle_real_ip_header},
+    {"real_ip_recursive",      APEX_CONF_CUSTOM, offsetof(apex_server_config_t, real_ip_recursive), offsetof(apex_server_config_t, has_real_ip_recursive), 0, 0, 0, conf_handle_real_ip_recursive},
+    {"access_log",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, access_log), offsetof(apex_server_config_t, has_access_log), 0, 0, 0, conf_handle_access_log},
+    {"add_header",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, add_headers), offsetof(apex_server_config_t, add_header_count), offsetof(apex_server_config_t, add_header_capacity), 0, 0, conf_handle_add_header},
+    {"server_tokens",          APEX_CONF_CUSTOM, offsetof(apex_server_config_t, server_tokens), 0, 0, 0, 0, conf_handle_server_tokens},
+    {"keepalive_requests",     APEX_CONF_CUSTOM, offsetof(apex_server_config_t, keepalive_requests), offsetof(apex_server_config_t, has_keepalive_requests), 0, 0, 0, conf_handle_keepalive_requests},
+    {"client_max_body_size",   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, client_max_body_size), offsetof(apex_server_config_t, has_client_max_body_size), 0, 0, 0, conf_handle_client_max_body_size},
+    {"open_file_cache",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_valid",  APEX_CONF_CUSTOM, offsetof(apex_server_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_min_uses", APEX_CONF_CUSTOM, offsetof(apex_server_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_errors", APEX_CONF_CUSTOM, offsetof(apex_server_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"proxy_next_upstream",    APEX_CONF_CUSTOM, offsetof(apex_server_config_t, next_upstream), offsetof(apex_server_config_t, has_next_upstream), offsetof(apex_server_config_t, proxy_intercept_errors), offsetof(apex_server_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_tries", APEX_CONF_CUSTOM, offsetof(apex_server_config_t, next_upstream), offsetof(apex_server_config_t, has_next_upstream), offsetof(apex_server_config_t, proxy_intercept_errors), offsetof(apex_server_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_timeout", APEX_CONF_CUSTOM, offsetof(apex_server_config_t, next_upstream), offsetof(apex_server_config_t, has_next_upstream), offsetof(apex_server_config_t, proxy_intercept_errors), offsetof(apex_server_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_intercept_errors", APEX_CONF_CUSTOM, offsetof(apex_server_config_t, next_upstream), offsetof(apex_server_config_t, has_next_upstream), offsetof(apex_server_config_t, proxy_intercept_errors), offsetof(apex_server_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_cookie_domain",    APEX_CONF_CUSTOM, offsetof(apex_server_config_t, cookie_domains), offsetof(apex_server_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"proxy_cookie_path",      APEX_CONF_CUSTOM, offsetof(apex_server_config_t, cookie_domains), offsetof(apex_server_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"sub_filter",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_once",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_types",       APEX_CONF_CUSTOM, offsetof(apex_server_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"resolver",               APEX_CONF_CUSTOM, offsetof(apex_server_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"resolver_timeout",       APEX_CONF_CUSTOM, offsetof(apex_server_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"otel",                   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_trace_context",     APEX_CONF_CUSTOM, offsetof(apex_server_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_span_name",         APEX_CONF_CUSTOM, offsetof(apex_server_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"api",                    APEX_CONF_CUSTOM, offsetof(apex_server_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"api_key",                APEX_CONF_CUSTOM, offsetof(apex_server_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"api_secret",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, api), 0, 0, 0, 0, conf_handle_api},
+    {"auth_basic",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"auth_basic_user_file",   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"gzip",                   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_types",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_min_length",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli",                 APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_types",           APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_min_length",      APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_comp_level",      APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd",                   APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_types",             APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_min_length",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_server_config_t, compress), offsetof(apex_server_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"access_by_lua",          APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"access_by_lua_file",     APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"access_by_lua_block",    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"header_filter_by_lua",   APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"header_filter_by_lua_file", APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"header_filter_by_lua_block", APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+    {"wasm_filter",            APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_server_extensibility},
+};
+
+static bool parse_server_block(parser_t *parser) {
+    const token_t *begin = parser_peek(parser);
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    apex_server_config_t *server = config_add_server(parser, begin);
+    if (server == NULL) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'server' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected a server directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        bool handled = false;
+        bool consumed_block = false;
+        if (!config_dispatch_directive(parser, g_server_directives,
+                                       sizeof(g_server_directives) / sizeof(g_server_directives[0]),
+                                       directive, server, &handled, &consumed_block)) {
+            return false;
+        }
+
+        if (!handled) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown server directive '%s'", directive->text);
+            parser_hint(parser, "server accepts listen, server_name, tls, root, location, error_page, return, allow, deny, limit_req, limit_conn, proxy_cache, proxy_cache_key, proxy_cache_bypass, proxy_cache_valid, set_real_ip_from, real_ip_header, real_ip_recursive, access_log, add_header, server_tokens, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, api, api_key, auth_basic, auth_basic_user_file, keepalive_requests, client_max_body_size, gzip, brotli, zstd");
+            return false;
+        }
+
+        if (!consumed_block && !parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+
+    if (!server->has_keepalive_requests && parser->config->http.keepalive_requests > 0) {
+        server->keepalive_requests = parser->config->http.keepalive_requests;
+        server->has_keepalive_requests = true;
+    }
+    if (!server->has_client_max_body_size && parser->config->http.has_client_max_body_size) {
+        server->client_max_body_size = parser->config->http.client_max_body_size;
+        server->has_client_max_body_size = true;
+    }
+
+    /* Inherit http-level real_ip, access_log, and server_tokens settings */
+    if (!server->has_access_log && parser->config->http.has_access_log) {
+        server->access_log = parser->config->http.access_log;
+        server->has_access_log = true;
+    }
+    if (server->real_ip_rule_count == 0 && parser->config->http.real_ip_rule_count > 0) {
+        server->real_ip_rule_count = parser->config->http.real_ip_rule_count;
+        memcpy(server->real_ip_rules, parser->config->http.real_ip_rules, sizeof(parser->config->http.real_ip_rules));
+    }
+    if (!server->has_real_ip_header && parser->config->http.has_real_ip_header) {
+        snprintf(server->real_ip_header, sizeof(server->real_ip_header), "%s", parser->config->http.real_ip_header);
+        server->has_real_ip_header = true;
+    }
+    if (!server->has_real_ip_recursive && parser->config->http.has_real_ip_recursive) {
+        server->real_ip_recursive = parser->config->http.real_ip_recursive;
+        server->has_real_ip_recursive = true;
+    }
+    if (!server->server_tokens.set && parser->config->http.server_tokens.set) {
+        server->server_tokens = parser->config->http.server_tokens;
+    }
+    if (!compress_config_inherit(&server->compress, &server->has_compress, &parser->config->http.compress, parser->config->http.has_compress)) {
+        return config_oom(parser->error);
+    }
+    next_upstream_inherit(&server->next_upstream, &server->has_next_upstream,
+                          &parser->config->http.next_upstream, parser->config->http.has_next_upstream);
+    proxy_intercept_errors_inherit(&server->proxy_intercept_errors, &server->has_proxy_intercept_errors,
+                                   parser->config->http.proxy_intercept_errors, parser->config->http.has_proxy_intercept_errors);
+    cookie_domain_inherit(&server->cookie_domains, &server->cookie_domain_count, &server->cookie_domain_capacity, server->cookie_domain_off,
+                          parser->config->http.cookie_domains, parser->config->http.cookie_domain_count, parser->config->http.cookie_domain_off);
+    cookie_path_inherit(&server->cookie_paths, &server->cookie_path_count, &server->cookie_path_capacity, server->cookie_path_off,
+                        parser->config->http.cookie_paths, parser->config->http.cookie_path_count, parser->config->http.cookie_path_off);
+    sub_filter_inherit(&server->sub_filter, &parser->config->http.sub_filter);
+    resolver_inherit(&server->resolver, &parser->config->http.resolver);
+    otel_inherit(&server->otel, &parser->config->http.otel);
+    auth_basic_inherit(&server->auth_basic, &parser->config->http.auth_basic);
+    open_file_cache_inherit(&server->open_file_cache, &parser->config->http.open_file_cache);
+    acme_inherit(&server->acme, &parser->config->http.acme);
+
+    if (server->listen_port == 0 && server->listen_host[0] == '\0' && !server->listen_tls) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "server requires a listen directive");
+        return false;
+    }
+    if (server->listen_tls && !server->tls.enabled) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, begin, "listen tls requires a tls block");
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                      UPSTREAM DIRECTIVE HANDLERS                          */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_upstream_server(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok;
+    *consumed_block = true;
+    return parse_upstream_server_item(parser, (apex_upstream_config_t *)target);
+}
+
+static bool conf_handle_upstream_health_check(parser_t *parser, const apex_directive_t *dir,
+                                              const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok;
+    *consumed_block = true;
+    return parse_upstream_health_check_item(parser, (apex_upstream_config_t *)target);
+}
+
+static bool conf_handle_upstream_policy(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)consumed_block;
+    apex_upstream_config_t *upstream = (apex_upstream_config_t *)target;
+    if (token_is_word(tok, "least_conn") || token_is_word(tok, "least-conn")) {
+        upstream->policy = APEX_BALANCE_LEAST_CONN;
+        return true;
+    }
+    if (token_is_word(tok, "ip_hash") || token_is_word(tok, "ip-hash")) {
+        upstream->policy = APEX_BALANCE_IP_HASH;
+        return true;
+    }
+    const token_t *value = parser_scalar(parser, "round_robin, p2c, least_conn, or ip_hash");
+    if (value == NULL) return false;
+    if (token_is_word(value, "round_robin") || token_is_word(value, "round-robin")) {
+        upstream->policy = APEX_BALANCE_ROUND_ROBIN;
+    } else if (token_is_word(value, "p2c")) {
+        upstream->policy = APEX_BALANCE_P2C;
+    } else if (token_is_word(value, "least_conn") || token_is_word(value, "least-conn")) {
+        upstream->policy = APEX_BALANCE_LEAST_CONN;
+    } else if (token_is_word(value, "ip_hash") || token_is_word(value, "ip-hash")) {
+        upstream->policy = APEX_BALANCE_IP_HASH;
+    } else {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, value, "policy must be round_robin, p2c, least_conn, or ip_hash");
+        return false;
+    }
+    return true;
+}
+
+static const apex_directive_t g_upstream_directives[] = {
+    {"server",          APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_server},
+    {"health_check",    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_health_check},
+    {"least_conn",      APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"least-conn",      APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"ip_hash",         APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"ip-hash",         APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"policy",          APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"algorithm",       APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_upstream_policy},
+    {"keepalive",       APEX_CONF_UINT32, offsetof(apex_upstream_config_t, keepalive), 0, 0, 0, APEX_CONFIG_MAX_KEEPALIVE, NULL},
+    {"max_fails",       APEX_CONF_UINT32, offsetof(apex_upstream_config_t, max_fails), 0, 0, 1, 1000, NULL},
+    {"fail_timeout",    APEX_CONF_MSEC,   offsetof(apex_upstream_config_t, fail_timeout_ms), 0, 0, 0, 0, NULL},
+    {"max_retries",     APEX_CONF_UINT32, offsetof(apex_upstream_config_t, max_retries), 0, 0, 0, 64, NULL},
+    {"connect_timeout", APEX_CONF_MSEC,   offsetof(apex_upstream_config_t, connect_timeout_ms), 0, 0, 0, 0, NULL},
+    {"read_timeout",    APEX_CONF_MSEC,   offsetof(apex_upstream_config_t, read_timeout_ms), 0, 0, 0, 0, NULL},
+    {"idle_timeout",    APEX_CONF_MSEC,   offsetof(apex_upstream_config_t, idle_timeout_ms), 0, 0, 0, 0, NULL},
+};
+
+static bool parse_upstream_block(parser_t *parser) {
+    const token_t *name = parser_identifier(parser, "an upstream name");
+    if (name == NULL) {
+        return false;
+    }
+    if (is_reserved_word(name->text)) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "reserved word '%s' cannot name an upstream",
+                     name->text);
+        return false;
+    }
+    if (apex_config_find_upstream(parser->config, name->text) != NULL) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "duplicate upstream '%s'", name->text);
+        return false;
+    }
+
+    apex_upstream_config_t *upstream = config_add_upstream(parser, name);
+    if (upstream == NULL) {
+        return false;
+    }
+
+    if (!parser_expect_lbrace(parser)) {
+        return false;
+    }
+
+    while (parser_peek(parser)->kind != TOKEN_RBRACE) {
+        const token_t *directive = parser_peek(parser);
+        if (directive->kind == TOKEN_EOF) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unterminated 'upstream' block");
+            return false;
+        }
+        if (directive->kind != TOKEN_WORD) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "expected an upstream directive");
+            return false;
+        }
+        parser_advance(parser);
+
+        bool handled = false;
+        bool consumed_block = false;
+        if (!config_dispatch_directive(parser, g_upstream_directives,
+                                       sizeof(g_upstream_directives) / sizeof(g_upstream_directives[0]),
+                                       directive, upstream, &handled, &consumed_block)) {
+            return false;
+        }
+
+        if (!handled) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown upstream directive '%s'",
+                         directive->text);
+            parser_hint(parser, "upstream accepts server, policy, keepalive, connect_timeout, read_timeout, "
+                                "idle_timeout, max_fails, fail_timeout, max_retries, health_check");
+            return false;
+        }
+
+        if (!consumed_block && !parser_expect_semicolon(parser)) {
+            return false;
+        }
+    }
+
+    if (!parser_expect_rbrace(parser)) {
+        return false;
+    }
+    if (upstream->server_count == 0) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, name, "upstream '%s' requires at least one server",
+                     upstream->name);
+        return false;
+    }
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*                        HTTP DIRECTIVE HANDLERS                            */
+/* ------------------------------------------------------------------------- */
+
+static bool conf_handle_limit_req_zone(parser_t *parser, const apex_directive_t *dir,
+                                       const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)target; (void)consumed_block;
+    if (parser->config->http.rate_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "too many rate limit zones (max %u)",
+                     APEX_CONFIG_MAX_RATE_ZONES);
+        return false;
+    }
+    apex_rate_limit_zone_t *zone = &parser->config->http.rate_zones[parser->config->http.rate_zone_count];
+    memset(zone, 0, sizeof(*zone));
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "limit_req_zone parameter");
+        if (arg == NULL) return false;
+        if (arg->text[0] == '$') {
+            snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
+        } else if (strncmp(arg->text, "zone=", 5) == 0) {
+            const char *spec = arg->text + 5;
+            const char *colon = strchr(spec, ':');
+            if (colon != NULL) {
+                size_t name_len = (size_t)(colon - spec);
+                if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                memcpy(zone->name, spec, name_len);
+                zone->name[name_len] = '\0';
+                if (!parse_size_str(colon + 1, &zone->size_bytes)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
+                    return false;
+                }
+            } else {
+                snprintf(zone->name, sizeof(zone->name), "%s", spec);
+            }
+        } else if (strncmp(arg->text, "rate=", 5) == 0) {
+            if (!parse_rate_str(arg->text + 5, &zone->rate_per_sec, &zone->rate_r_s)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid rate '%s'", arg->text + 5);
+                return false;
+            }
+        }
+    }
+    if (zone->name[0] == '\0') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "limit_req_zone requires a zone name");
+        return false;
+    }
+    if (zone->rate_per_sec <= 0.0) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "limit_req_zone requires rate=<num>r/s or rate=<num>r/m");
+        return false;
+    }
+    parser->config->http.rate_zone_count++;
+    return true;
+}
+
+static bool conf_handle_limit_conn_zone(parser_t *parser, const apex_directive_t *dir,
+                                        const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)target; (void)consumed_block;
+    if (parser->config->http.conn_zone_count >= APEX_CONFIG_MAX_CONN_ZONES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "too many conn limit zones (max %u)",
+                     APEX_CONFIG_MAX_CONN_ZONES);
+        return false;
+    }
+    apex_conn_limit_zone_t *zone = &parser->config->http.conn_zones[parser->config->http.conn_zone_count];
+    memset(zone, 0, sizeof(*zone));
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "limit_conn_zone parameter");
+        if (arg == NULL) return false;
+        if (arg->text[0] == '$') {
+            snprintf(zone->key_var, sizeof(zone->key_var), "%s", arg->text);
+        } else if (strncmp(arg->text, "zone=", 5) == 0) {
+            const char *spec = arg->text + 5;
+            const char *colon = strchr(spec, ':');
+            if (colon != NULL) {
+                size_t name_len = (size_t)(colon - spec);
+                if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                memcpy(zone->name, spec, name_len);
+                zone->name[name_len] = '\0';
+                if (!parse_size_str(colon + 1, &zone->size_bytes)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid zone size '%s'", colon + 1);
+                    return false;
+                }
+            } else {
+                snprintf(zone->name, sizeof(zone->name), "%s", spec);
+            }
+        }
+    }
+    if (zone->name[0] == '\0') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "limit_conn_zone requires a zone name");
+        return false;
+    }
+    parser->config->http.conn_zone_count++;
+    return true;
+}
+
+static bool conf_handle_proxy_cache_path(parser_t *parser, const apex_directive_t *dir,
+                                         const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)target; (void)consumed_block;
+    if (parser->config->http.cache_zone_count >= APEX_CONFIG_MAX_RATE_ZONES) {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "too many cache zones (max %u)",
+                     APEX_CONFIG_MAX_RATE_ZONES);
+        return false;
+    }
+    apex_cache_zone_config_t *zone = &parser->config->http.cache_zones[parser->config->http.cache_zone_count];
+    memset(zone, 0, sizeof(*zone));
+
+    const token_t *path_arg = parser_scalar(parser, "cache path");
+    if (path_arg == NULL) return false;
+    snprintf(zone->path, sizeof(zone->path), "%s", path_arg->text);
+    zone->inactive_ms = 600000; /* default 10m */
+    zone->max_size = 1024ULL * 1024ULL * 1024ULL; /* default 1GB */
+    zone->keys_zone_size = 10 * 1024 * 1024; /* default 10MB */
+
+    while (parser_peek(parser)->kind != TOKEN_SEMICOLON) {
+        const token_t *arg = parser_scalar(parser, "proxy_cache_path parameter");
+        if (arg == NULL) return false;
+        if (strncmp(arg->text, "keys_zone=", 10) == 0) {
+            const char *spec = arg->text + 10;
+            const char *colon = strchr(spec, ':');
+            if (colon != NULL) {
+                size_t name_len = (size_t)(colon - spec);
+                if (name_len >= sizeof(zone->name)) name_len = sizeof(zone->name) - 1;
+                memcpy(zone->name, spec, name_len);
+                zone->name[name_len] = '\0';
+                if (!parse_size_str(colon + 1, &zone->keys_zone_size)) {
+                    parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid keys_zone size '%s'", colon + 1);
+                    return false;
+                }
+            } else {
+                snprintf(zone->name, sizeof(zone->name), "%s", spec);
+            }
+        } else if (strncmp(arg->text, "max_size=", 9) == 0) {
+            if (!parse_size_str(arg->text + 9, &zone->max_size)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid max_size '%s'", arg->text + 9);
+                return false;
+            }
+        } else if (strncmp(arg->text, "inactive=", 9) == 0) {
+            token_t temp_tok = *arg;
+            temp_tok.text = arg->text + 9;
+            temp_tok.length = strlen(temp_tok.text);
+            if (!token_to_duration_ms(&temp_tok, &zone->inactive_ms)) {
+                parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, arg, "invalid inactive duration '%s'", arg->text + 9);
+                return false;
+            }
+        } else if (strncmp(arg->text, "levels=", 7) == 0) {
+            /* standard nginx levels=1:2 (supported) */
+        }
+    }
+    if (zone->name[0] == '\0') {
+        parser_error(parser, APEX_CONFIG_ERR_SEMANTIC, tok, "proxy_cache_path requires keys_zone=<name>:<size>");
+        return false;
+    }
+    parser->config->http.cache_zone_count++;
+    return true;
+}
+
+static bool conf_handle_log_format(parser_t *parser, const apex_directive_t *dir,
+                                   const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)target; (void)consumed_block;
+    return config_parse_log_format(parser, tok);
+}
+
+static bool conf_handle_http_upstream(parser_t *parser, const apex_directive_t *dir,
+                                      const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)target;
+    *consumed_block = true;
+    return parse_upstream_block(parser);
+}
+
+static bool conf_handle_http_server(parser_t *parser, const apex_directive_t *dir,
+                                    const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)target;
+    *consumed_block = true;
+    return parse_server_block(parser);
+}
+
+static bool conf_handle_http_map(parser_t *parser, const apex_directive_t *dir,
+                                 const token_t *tok, void *target, bool *consumed_block) {
+    (void)dir; (void)tok; (void)target;
+    *consumed_block = true;
+    return parse_map_block(parser);
+}
+
+static const apex_directive_t g_http_directives[] = {
+    {"worker_connections",     APEX_CONF_UINT32, offsetof(apex_http_config_t, worker_connections), 0, 0, 1, 10000000, NULL},
+    {"keepalive_timeout",      APEX_CONF_MSEC,   offsetof(apex_http_config_t, keepalive_timeout_ms), 0, 0, 0, 0, NULL},
+    {"client_header_timeout",  APEX_CONF_MSEC,   offsetof(apex_http_config_t, client_header_timeout_ms), 0, 0, 0, 0, NULL},
+    {"client_body_timeout",    APEX_CONF_MSEC,   offsetof(apex_http_config_t, client_body_timeout_ms), 0, 0, 0, 0, NULL},
+    {"server_tokens",          APEX_CONF_CUSTOM, offsetof(apex_http_config_t, server_tokens), 0, 0, 0, 0, conf_handle_server_tokens},
+    {"keepalive_requests",     APEX_CONF_CUSTOM, offsetof(apex_http_config_t, keepalive_requests), 0, 0, 0, 0, conf_handle_keepalive_requests},
+    {"client_max_body_size",   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, client_max_body_size), offsetof(apex_http_config_t, has_client_max_body_size), 0, 0, 0, conf_handle_client_max_body_size},
+    {"add_header",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, add_headers), offsetof(apex_http_config_t, add_header_count), offsetof(apex_http_config_t, add_header_capacity), 0, 0, conf_handle_add_header},
+    {"limit_req_zone",         APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_limit_req_zone},
+    {"limit_conn_zone",        APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_limit_conn_zone},
+    {"proxy_cache_path",       APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_proxy_cache_path},
+    {"log_format",             APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_log_format},
+    {"access_log",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, access_log), offsetof(apex_http_config_t, has_access_log), 0, 0, 0, conf_handle_access_log},
+    {"set_real_ip_from",       APEX_CONF_CUSTOM, offsetof(apex_http_config_t, real_ip_rules), offsetof(apex_http_config_t, real_ip_rule_count), 0, 0, 0, conf_handle_real_ip_from},
+    {"real_ip_header",         APEX_CONF_CUSTOM, offsetof(apex_http_config_t, real_ip_header), offsetof(apex_http_config_t, has_real_ip_header), sizeof(((apex_http_config_t *)0)->real_ip_header), 0, 0, conf_handle_real_ip_header},
+    {"real_ip_recursive",      APEX_CONF_CUSTOM, offsetof(apex_http_config_t, real_ip_recursive), offsetof(apex_http_config_t, has_real_ip_recursive), 0, 0, 0, conf_handle_real_ip_recursive},
+    {"proxy_next_upstream",    APEX_CONF_CUSTOM, offsetof(apex_http_config_t, next_upstream), offsetof(apex_http_config_t, has_next_upstream), offsetof(apex_http_config_t, proxy_intercept_errors), offsetof(apex_http_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_tries", APEX_CONF_CUSTOM, offsetof(apex_http_config_t, next_upstream), offsetof(apex_http_config_t, has_next_upstream), offsetof(apex_http_config_t, proxy_intercept_errors), offsetof(apex_http_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_next_upstream_timeout", APEX_CONF_CUSTOM, offsetof(apex_http_config_t, next_upstream), offsetof(apex_http_config_t, has_next_upstream), offsetof(apex_http_config_t, proxy_intercept_errors), offsetof(apex_http_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_intercept_errors", APEX_CONF_CUSTOM, offsetof(apex_http_config_t, next_upstream), offsetof(apex_http_config_t, has_next_upstream), offsetof(apex_http_config_t, proxy_intercept_errors), offsetof(apex_http_config_t, has_proxy_intercept_errors), 0, conf_handle_failover},
+    {"proxy_cookie_domain",    APEX_CONF_CUSTOM, offsetof(apex_http_config_t, cookie_domains), offsetof(apex_http_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"proxy_cookie_path",      APEX_CONF_CUSTOM, offsetof(apex_http_config_t, cookie_domains), offsetof(apex_http_config_t, cookie_paths), 0, 0, 0, conf_handle_cookie},
+    {"sub_filter",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_once",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"sub_filter_types",       APEX_CONF_CUSTOM, offsetof(apex_http_config_t, sub_filter), 0, 0, 0, 0, conf_handle_sub_filter},
+    {"resolver",               APEX_CONF_CUSTOM, offsetof(apex_http_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"resolver_timeout",       APEX_CONF_CUSTOM, offsetof(apex_http_config_t, resolver), 0, 0, 0, 0, conf_handle_resolver},
+    {"otel",                   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_trace_context",     APEX_CONF_CUSTOM, offsetof(apex_http_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"otel_span_name",         APEX_CONF_CUSTOM, offsetof(apex_http_config_t, otel), 0, 0, 0, 0, conf_handle_otel},
+    {"auth_basic",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"auth_basic_user_file",   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, auth_basic), 0, 0, 0, 0, conf_handle_auth_basic},
+    {"gzip",                   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_types",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_min_length",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"gzip_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli",                 APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_types",           APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_min_length",      APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"brotli_comp_level",      APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd",                   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_types",             APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_min_length",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"zstd_comp_level",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, compress), offsetof(apex_http_config_t, has_compress), 0, 0, 0, conf_handle_compress},
+    {"open_file_cache",        APEX_CONF_CUSTOM, offsetof(apex_http_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_valid",  APEX_CONF_CUSTOM, offsetof(apex_http_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_min_uses", APEX_CONF_CUSTOM, offsetof(apex_http_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"open_file_cache_errors", APEX_CONF_CUSTOM, offsetof(apex_http_config_t, open_file_cache), 0, 0, 0, 0, conf_handle_open_file_cache},
+    {"acme",                   APEX_CONF_CUSTOM, offsetof(apex_http_config_t, acme), 0, 0, 0, 0, conf_handle_acme},
+    {"upstream",               APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_http_upstream},
+    {"server",                 APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_http_server},
+    {"map",                    APEX_CONF_CUSTOM, 0, 0, 0, 0, 0, conf_handle_http_map},
+};
+
 static bool parse_http_block(parser_t *parser) {
     if (!parser_expect_lbrace(parser)) {
         return false;
@@ -5448,33 +5458,35 @@ static bool parse_http_block(parser_t *parser) {
         }
         parser_advance(parser);
 
-        if (token_is_word(directive, "upstream")) {
-            if (!parse_upstream_block(parser)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "server")) {
-            if (!parse_server_block(parser)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "map")) {
-            if (!parse_map_block(parser)) {
-                return false;
-            }
-        } else if (token_is_word(directive, "http") || token_is_word(directive, "modules") ||
-                   token_is_word(directive, "include")) {
+        if (token_is_word(directive, "http") || token_is_word(directive, "modules") ||
+            token_is_word(directive, "include")) {
             parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "'%s' is not allowed inside http",
                          directive->text);
             return false;
-        } else {
-            if (!parse_http_directive(parser, directive) || !parser_expect_semicolon(parser)) {
-                return false;
-            }
+        }
+
+        bool handled = false;
+        bool consumed_block = false;
+        if (!config_dispatch_directive(parser, g_http_directives,
+                                       sizeof(g_http_directives) / sizeof(g_http_directives[0]),
+                                       directive, &parser->config->http, &handled, &consumed_block)) {
+            return false;
+        }
+
+        if (!handled) {
+            parser_error(parser, APEX_CONFIG_ERR_SYNTAX, directive, "unknown http directive '%s'", directive->text);
+            parser_hint(parser, "http accepts worker_connections, keepalive_timeout, client_header_timeout, "
+                                "client_body_timeout, server_tokens, limit_req_zone, limit_conn_zone, proxy_cache_path, log_format, access_log, set_real_ip_from, real_ip_header, real_ip_recursive, proxy_next_upstream, proxy_next_upstream_tries, proxy_next_upstream_timeout, proxy_intercept_errors, proxy_cookie_domain, proxy_cookie_path, sub_filter, sub_filter_once, sub_filter_types, resolver, resolver_timeout, otel, otel_trace_context, otel_span_name, upstream, server, keepalive_requests, client_max_body_size, gzip, brotli, zstd");
+            return false;
+        }
+
+        if (!consumed_block && !parser_expect_semicolon(parser)) {
+            return false;
         }
     }
 
     return parser_expect_rbrace(parser);
 }
-
 static bool parse_modules_block(parser_t *parser) {
     if (!parser_expect_lbrace(parser)) {
         return false;
