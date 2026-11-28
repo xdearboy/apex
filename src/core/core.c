@@ -1190,7 +1190,7 @@ static inline bool configure_client(int fd) {
 }
 
 static void sweep_timeouts(worker_arg_t *worker, uint64_t now_ms) {
-    uint64_t client_header_timeout_ms = 60000;
+    uint64_t client_header_timeout_ms = 10000;
     uint64_t keepalive_timeout_ms = 65000;
     if (worker->generation != NULL && worker->generation->config != NULL) {
         if (worker->generation->config->http.client_header_timeout_ms > 0) {
@@ -1250,9 +1250,13 @@ static void *worker_main(void *arg) {
         }
 
         int ready_events_count = 0;
+        int poll_timeout_ms = (worker->connection_count > 0) ? 50 : 1000;
 #if defined(APEX_HAVE_URING)
         if (worker->use_uring) {
-            struct __kernel_timespec ts = {.tv_sec = 1, .tv_nsec = 0};
+            struct __kernel_timespec ts = {
+                .tv_sec = (time_t)(poll_timeout_ms / 1000),
+                .tv_nsec = (long)((poll_timeout_ms % 1000) * 1000000L)
+            };
             struct io_uring_cqe *cqe = NULL;
             int ret = io_uring_wait_cqe_timeout(&worker->ring, &cqe, &ts);
             if (ret == 0 && cqe != NULL) {
@@ -1274,10 +1278,10 @@ static void *worker_main(void *arg) {
                 ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 0);
             }
         } else {
-            ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+            ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, poll_timeout_ms);
         }
 #else
-        ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, 1000);
+        ready_events_count = epoll_wait(epoll_fd, events, MAX_EVENTS, poll_timeout_ms);
 #endif
         if (ready_events_count < 0) {
             if (errno == EINTR) {
@@ -1289,7 +1293,8 @@ static void *worker_main(void *arg) {
         }
 
         uint64_t now_ms = core_monotonic_ms();
-        if (now_ms - last_sweep_ms >= 1000) {
+        uint64_t sweep_interval = (worker->connection_count > 0) ? 250 : 1000;
+        if (now_ms - last_sweep_ms >= sweep_interval) {
             sweep_timeouts(worker, now_ms);
             last_sweep_ms = now_ms;
         }
@@ -1334,7 +1339,8 @@ static void *worker_main(void *arg) {
                 }
             }
             if (matched_listener != NULL) {
-                while (1) {
+                int accepted_burst = 0;
+                while (accepted_burst < 128) {
                     if (atomic_load_explicit(&worker->control->shutdown, memory_order_acquire) != WORKERS_RUNNING) {
                         break;
                     }
@@ -1351,6 +1357,7 @@ static void *worker_main(void *arg) {
                         goto worker_finished;
                     }
 
+                    accepted_burst++;
                     if (client_socket_fd >= MAX_FDS || !configure_client(client_socket_fd)) {
                         if (close_fd(&client_socket_fd) != 0) {
                             atomic_store_explicit(&worker->error, EIO, memory_order_relaxed);
@@ -1650,20 +1657,28 @@ static int prepare_worker(worker_arg_t *worker, const apex_listener_set_t *liste
         worker->listeners[li].port = ep->port;
         worker->listeners[li].tls = ep->tls;
 
-        struct epoll_event event = {.events = EPOLLIN | EPOLLET, .data.fd = fd};
+        uint32_t listen_events = EPOLLIN | EPOLLET;
+#if defined(EPOLLEXCLUSIVE)
+        listen_events |= EPOLLEXCLUSIVE;
+#endif
+        struct epoll_event event = {.events = listen_events, .data.fd = fd};
         if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
-            perror("apex: epoll_ctl listener");
-            for (size_t prev = 0; prev <= li; prev++) {
-                if (worker->listeners[prev].quic_server != NULL) {
-                    apex_quic_server_destroy(worker->listeners[prev].quic_server);
-                    worker->listeners[prev].quic_server = NULL;
+            /* Fallback without EPOLLEXCLUSIVE if not supported by kernel */
+            event.events = EPOLLIN | EPOLLET;
+            if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, fd, &event) != 0) {
+                perror("apex: epoll_ctl listener");
+                for (size_t prev = 0; prev <= li; prev++) {
+                    if (worker->listeners[prev].quic_server != NULL) {
+                        apex_quic_server_destroy(worker->listeners[prev].quic_server);
+                        worker->listeners[prev].quic_server = NULL;
+                    }
+                    close_fd(&worker->listeners[prev].udp_fd);
+                    close_fd(&worker->listeners[prev].fd);
                 }
-                close_fd(&worker->listeners[prev].udp_fd);
-                close_fd(&worker->listeners[prev].fd);
+                close_fd(&worker->wake_fd);
+                close_fd(&worker->epoll_fd);
+                return -1;
             }
-            close_fd(&worker->wake_fd);
-            close_fd(&worker->epoll_fd);
-            return -1;
         }
 
         if (ep->tls) {
