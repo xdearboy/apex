@@ -69,7 +69,7 @@ fi
 
 # 5. Fetch Latest Release Version
 log_info "Fetching latest release metadata from GitHub..."
-LATEST_TAG=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*//' || echo "")
+LATEST_TAG=$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' || echo "")
 if [ -z "${LATEST_TAG}" ]; then
     LATEST_TAG="v1.5.0"
 fi
