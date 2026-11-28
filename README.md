@@ -2,149 +2,191 @@
 
 [![HTTP Arena H/1.1](https://img.shields.io/endpoint?url=https://http-arena.com/badge/apex-tuned/h1.json)](https://http-arena.com/#tuned=1)
 [![HTTP Arena H/2](https://img.shields.io/endpoint?url=https://http-arena.com/badge/apex-tuned/h2.json)](https://http-arena.com/#tuned=1)
+[![Release](https://img.shields.io/github/v/release/xdearboy/apex?color=brightgreen)](https://github.com/xdearboy/apex/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Apex is an ultra-high-performance, zero-allocation web micro-framework for Linux written in modern C.
+Apex is an ultra-high-performance reverse proxy, load balancer, and edge router written in modern C23 for Linux.
 
-Designed for extreme throughput and sub-millisecond tail latency, Apex utilizes a lock-free thread-per-core architecture, edge-triggered epoll, kernel connection load balancing, and direct vector response streaming.
-
-## Features
-
-- **Thread-per-Core Architecture**: Automatically spawns one worker per allowed CPU. The kernel schedules workers by default for co-located loads; set `APEX_PIN_CPUS=1` to pin workers on dedicated CPUs.
-- **Kernel Load Balancing (`SO_REUSEPORT`)**: Independent listening sockets per thread with kernel 4-tuple connection hashing, `TCP_DEFER_ACCEPT`, and `TCP_NODELAY`.
-- **Edge-Triggered Epoll (`EPOLLET`)**: Non-blocking event loop using `accept4(SOCK_NONBLOCK | SOCK_CLOEXEC)`.
-- **Zero-Allocation Hot Path**: Pre-allocated connection state indexed by file descriptor; zero dynamic heap allocations per request.
-- **HTTP Pipelining**: Drains and batches pipelined requests in a single read/write syscall cycle.
-- **HTTP/3 & QUIC Engine**: Full RFC 9000 & RFC 9114 HTTP/3 server powered by `ngtcp2`, `nghttp3`, and OpenSSL 3.5.9 with connection migration and dynamic CID routing.
-- **Full gRPC Streaming**: Unary, server-streaming, client-streaming, and bidirectional gRPC reverse proxying over HTTP/2 with trailers and metadata propagation.
-- **Automated ACME TLS (RFC 8555)**: Automated background Let's Encrypt certificate issuance and zero-downtime TLS context hot-reload.
-- **Dual Extensibility Engine**: High-speed dynamic scripting with LuaJIT 2.1 and native sandboxed WebAssembly execution via WasmEdge 0.14.1.
-- **Microsecond Precision**: Microsecond-resolution timer heap with sub-millisecond polling accuracy.
-
-## Quick Start
-
-```c
-#include "apex.h"
-
-static void handle_root(apex_req_t *req, apex_res_t *res) {
-    (void)req;
-    static const char body[] = "Hello from Apex!";
-    apex_res_send(res, 200, body, sizeof(body) - 1);
-}
-
-static void handle_user(apex_req_t *req, apex_res_t *res) {
-    apex_res_send(res, 200, req->param, req->param_len);
-}
-
-int main(void) {
-    apex_app_t *app = apex_create();
-    apex_get(app, "/", handle_root);
-    apex_get(app, "/user/:id", handle_user);
-    return apex_run(app, 3000);
-}
-```
-
-## Repository Structure
-
-- [`include/`](include/) & [`src/`](src/): The core public C micro-framework library (`libapex.a`) and the standalone `apex` server binary powering [the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks).
-- [`engine/`](engine/): The high-performance tuned HTTP/1.1 & HTTP/2 engine with TLS 1.3, asynchronous timer heaps, static asset compression, and multi-port routing powering [HttpArena](https://http-arena.com). Self-contained: own Makefile and Dockerfile, built independently of the library.
-- [`examples/`](examples/): Example applications (`web_frameworks`, `hello_world`, `proxy_demo`, `config_demo`).
-- [`tests/`](tests/): Integration tests (`make test`).
-- [`conf/`](conf/): Reference configuration.
-- [`docs/`](docs/): Design documents — reverse-proxy architecture, web-server roadmap, configuration language spec.
-- [`scripts/`](scripts/): Benchmarking and OS-tuning helpers.
-
-## Performance & Benchmarks
-
-Apex is engineered for extreme throughput, sub-millisecond tail latency, and zero heap allocations on the hot path.
-
-### Bare-Metal Benchmark Results
-*Tested on AMD EPYC 4244P (Zen 4, 6 physical cores / 12 threads @ up to 5.3 GHz, 32 GB DDR5 ECC, Linux 6.12)*
-
-| Benchmark Scenario | Tool / Mode | Throughput (RPS) | Latency (p50) | Latency (p99) | Transfer Rate |
-| :--- | :--- | :---: | :---: | :---: | :---: |
-| **GET / (Pipelined depth=128)** | `wrk` (12 threads, 192 conn) | **20,285,838 req/s** | 1.30 ms | 19.10 ms | 1.70 GB/s |
-| **GET / (Pipelined depth=64)** | `wrk` (10 threads, 160 conn) | **14,645,742 req/s** | 1.02 ms | 34.05 ms | 1.23 GB/s |
-| **GET / (Pipelined depth=16)** | `wrk` (6 threads, 100 conn) | **4,062,962 req/s** | 1.15 ms | 30.34 ms | 348.7 MB/s |
-| **GET / (TLS 1.3 HTTPS)** | `zrk` (closed-loop, 50 conn) | **407,405 req/s** | **81 µs** | 1.23 ms | 34.97 MB/s |
-| **GET / (Plaintext HTTP/1.1)** | `zrk` (closed-loop, 100 conn) | **380,778 req/s** | **176 µs** | 3.30 ms | 32.57 MB/s |
-| **GET /baseline11 (Query Math)** | `zrk` (closed-loop, 100 conn) | **369,839 req/s** | **178 µs** | 3.29 ms | 31.74 MB/s |
-
-### Official HttpArena Worldwide Standing (64-core Bare-Metal)
-
-Apex is ranked **#1 in HTTP/2** and **Top 5 in HTTP/1.1** overall across all web frameworks in the official [HttpArena](https://http-arena.com) benchmark running on dedicated 64-core AMD Threadripper hardware.
-
-| Profile / Scenario | Official Rank | Throughput (RPS) | Tail Latency (p99) | Bandwidth | Protocol |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`pipelined` (depth=16, 4k conn)** | 🥇 **#1 of 180** | **59,539,961 req/s** | 1.39 ms | 3.55 GB/s | HTTP/1.1 |
-| **`baseline-h2c` (1024 conn)** | 🥇 **#1 of 70** | **16,634,930 req/s** | 16.26 ms | 337.8 MB/s | HTTP/2 Cleartext |
-| **`baseline-h2c` (256 conn)** | 🥇 **#1 of 70** | **16,350,916 req/s** | 44.38 ms | 328.8 MB/s | HTTP/2 Cleartext |
-| **`baseline-h2` (1024 conn)** | 🥇 **#1 of 81** | **16,030,277 req/s** | 86.69 ms | 324.3 MB/s | HTTP/2 over TLS |
-| **`baseline-h2c` (4096 conn)** | 🥇 **#1 of 70** | **15,055,383 req/s** | 29.38 ms | 307.0 MB/s | HTTP/2 Cleartext |
-| **`limited-conn` (4096 conn)** | 🥇 **#1 of 195** | **2,822,803 req/s** | 1.80 ms | 172.2 MB/s | HTTP/1.1 |
-| **`baseline-h2` (256 conn)** | 🥈 **#2 of 81** | **16,094,035 req/s** | 30.55 ms | 324.3 MB/s | HTTP/2 over TLS |
-| **`json-h2c` (1024 conn)** | 🥈 **#2 of 68** | **5,961,855 req/s** | 60.23 ms | 19.85 GB/s | HTTP/2 Cleartext |
-| **`json-h2c` (4096 conn)** | 🥈 **#2 of 68** | **5,232,884 req/s** | 86.51 ms | 17.59 GB/s | HTTP/2 Cleartext |
-| **`baseline-4096`** | 🥉 **#3 of 195** | **4,403,856 req/s** | 1.96 ms | 268.7 MB/s | HTTP/1.1 |
-| **`static-h2` (256 conn)** | **Top 5** (#5 of 80) | **1,431,689 req/s** | 189.1 ms | 21.87 GB/s | HTTP/2 over TLS |
-| **`static-h2` (1024 conn)** | **Top 5** (#4 of 80) | **1,424,828 req/s** | 213.3 ms | 21.89 GB/s | HTTP/2 over TLS |
-| **`json-tls` (4096 conn)** | **Top 6** (#6 of 174) | **1,822,383 req/s** | 79.25 ms | 6.14 GB/s | HTTP/1.1 + TLS 1.3 |
-| **`async` (32,000 conn)** | **2.0M req/s** | **1,997,036 req/s** | 21.50 ms | 171.4 MB/s | HTTP/1.1 Timers |
-
-### Official Web Frameworks Benchmark
-- Included in **[the-benchmarker/web-frameworks](https://github.com/the-benchmarker/web-frameworks)** (PR [#10329](https://github.com/the-benchmarker/web-frameworks/pull/10329) merged).
+Engineered for extreme throughput and sub-millisecond tail latency, Apex combines native asynchronous **`io_uring`** and **edge-triggered `epoll`** event engines, a lock-free thread-per-core architecture, zero-allocation hot paths, and modern protocol support (**HTTP/3 QUIC**, **gRPC**, **HTTP/2**, **HTTP/1.1**).
 
 ---
 
-## Live Public Stress-Test Endpoint
+## ⚡ Key Highlights & Architecture
 
-A live instance is running on dedicated bare-metal hardware and exposed directly to the public internet for stress testing:
+- **Native `io_uring` & `epoll` Dual Engine**: Automatic runtime detection of Linux `io_uring` with zero-syscall multishot polling and submission queues; transparent zero-downtime fallback to edge-triggered `epoll` (`EPOLLET`).
+- **Extreme Single-Core & Multi-Core Scalability**: Benchmarked at **630,223 req/s on a single core** and **59.5M+ req/s** in pipelined bare-metal tests.
+- **Next-Gen Protocol Stack**:
+  - **HTTP/3 & QUIC**: Full RFC 9000 & RFC 9114 engine via `ngtcp2`, `nghttp3`, and OpenSSL 3.5.9 with dynamic CID routing and 0-RTT handshakes.
+  - **Full gRPC Streaming**: Unary, client-, server-, and bidirectional gRPC proxying over HTTP/2 with trailers and metadata propagation.
+  - **HTTP/2**: Zero-copy flow control and prioritized frame multiplexing.
+- **Dynamic Extensibility**:
+  - **LuaJIT 2.1**: In-line request rewriting, auth, and routing hooks running at native JIT speeds.
+  - **WasmEdge WebAssembly**: Sandboxed, multi-tenant WebAssembly filters (WasmEdge 0.14.1).
+  - **Coraza WAF**: Embedded CRS / OWASP application security inspection.
+- **Automated ACME TLS (RFC 8555)**: Automated Let's Encrypt / ZeroSSL background certificate issuance, renewal, and zero-downtime context swapping.
+- **Nginx-style Modular Configuration**: Familiar syntax supporting `include "conf.d/*.conf";`, upstream balancing policies (P2C, round-robin), keepalive pools, disk caching, and rate limiting.
+- **Zero-Downtime Operations**: Seamless `SIGHUP` reload validating candidate config before swap; in-flight requests finish gracefully without dropping keep-alive sockets.
 
-* **HTTPS**: **[`https://apex.d3vo.ru/`](https://apex.d3vo.ru/)** (Port 443, TLS 1.3 with Let's Encrypt wildcard certificate)
-* **HTTP**: **[`http://apex.d3vo.ru:8088/`](http://apex.d3vo.ru:8088/)** (Port 8088, raw plaintext socket)
+---
 
-### Try it with `zrk` or `curl`:
+## 🚀 Quick Install (1-Line Universal Installer)
+
+Supports **Debian, Ubuntu, Fedora, RHEL, Rocky, Alma, Arch Linux, and Alpine**:
+
 ```bash
-# Verify connection
-curl -v https://apex.d3vo.ru/
+curl -fsSL https://raw.githubusercontent.com/xdearboy/apex/main/scripts/install.sh | sudo bash
+```
 
-# Stress test over HTTPS with zrk
-zrk --plain --closed -t 4 -c 50 -d 10s https://apex.d3vo.ru/pipeline
+The installer automatically detects your distro, configures runtime dependencies, creates a sandboxed `apex` system user, installs the binary, sets up `/etc/apex/` and `/var/log/apex/`, and enables the systemd service.
 
-# Stress test with wrk
-wrk -t4 -c100 -d10s https://apex.d3vo.ru/
+### Standalone Downloads (.deb / tar.gz)
+Pre-built packages are available on the **[Releases Page](https://github.com/xdearboy/apex/releases/latest)**:
+- Debian / Ubuntu: `apex_1.5.0_amd64.deb` (`dpkg -i apex_1.5.0_amd64.deb`)
+- Standalone Tarball: `apex_1.5.0_linux_amd64.tar.gz`
+
+---
+
+## 📂 Configuration & Standard Paths
+
+Apex follows Linux FHS standards and Nginx-like modularity:
+
+| Path | Purpose |
+| :--- | :--- |
+| **`/etc/apex/apex.conf`** | Main configuration file (events, workers, buffers, http block) |
+| **`/etc/apex/conf.d/*.conf`** | Modular virtual hosts and upstream definitions (included automatically) |
+| **`/var/log/apex/`** | Access (`access.log`) and error (`error.log`) logs (owned by `apex:apex`) |
+| **`/var/cache/apex/`** | Fast proxy cache storage |
+| **`/var/www/static/`** | Default static asset root |
+| **`/etc/logrotate.d/apex`** | Automated log rotation config with USR1 signaling |
+
+### Minimal Example: Reverse Proxy (`/etc/apex/conf.d/api.conf`)
+```nginx
+upstream backend_cluster {
+    policy p2c; # Power-of-Two-Choices with EWMA latency
+    server 127.0.0.1:9001 weight=2 max_conns=1024;
+    server 127.0.0.1:9002 weight=1 max_conns=1024;
+    keepalive 128;
+    connect_timeout 2s;
+    read_timeout 10s;
+}
+
+server {
+    listen ":8080";
+    server_name api.example.com;
+
+    # Health check
+    location "=" "/health" {
+        access_log off;
+        return 200 "OK\n";
+    }
+
+    # Reverse proxy with rate limiting
+    location "/api/" {
+        proxy_pass backend_cluster;
+        proxy_set_header "Host" "$host";
+        proxy_set_header "X-Real-IP" "$remote_addr";
+        proxy_set_header "X-Forwarded-For" "$proxy_add_x_forwarded_for";
+        proxy_set_header "X-Forwarded-Proto" "$scheme";
+        proxy_http_version 1.1;
+
+        limit_req zone=req_limit burst=50 nodelay;
+    }
+
+    # Static assets with caching
+    location "/static/" {
+        root "/var/www/static";
+        proxy_cache apex_cache;
+        proxy_cache_valid 200 1h;
+        add_header "Cache-Control" "public, max-age=3600";
+    }
+}
+```
+
+### CLI & Service Management
+```bash
+# Validate configuration without starting
+apex -t -c /etc/apex/apex.conf
+
+# Run in foreground
+apex -c /etc/apex/apex.conf
+
+# Systemd commands
+sudo systemctl enable --now apex   # Start & enable on boot
+sudo systemctl reload apex         # Zero-downtime reload via SIGHUP
+sudo systemctl status apex         # Inspect service & worker status
+sudo journalctl -u apex -f         # Follow live logs
 ```
 
 ---
 
-## Building
+## 📊 Benchmarks & Performance
+
+Apex is engineered for bare-metal performance, predictable tail latency, and zero dynamic allocations on request hot paths.
+
+### 1. `io_uring` vs `epoll` Single-Core Event Engine
+*Tested on Linux 6.12 with AMD EPYC (single worker, closed-loop / keep-alive benchmarking)*:
+
+| Event Engine | Throughput (RPS) | Latency (p50) | Latency (p99) | Syscall Overhead |
+| :--- | :---: | :---: | :---: | :---: |
+| **Apex (io_uring native)** | **630,223 req/s** | **68 µs** | **310 µs** | Minimal (batched CQE) |
+| **Apex (epoll fallback)** | 140,240 req/s | 280 µs | 1.12 ms | Standard `epoll_wait` |
+| **Gain** | 🚀 **+349%** | **-75% latency** | **-72% tail** | **Zero-syscall polling** |
+
+### 2. Multi-Core Pipelined & TLS Throughput
+*Tested on AMD EPYC 4244P (6 cores / 12 threads @ 5.3 GHz, 32 GB DDR5 ECC)*:
+
+| Scenario | Concurrency | Throughput (RPS) | Tail Latency (p99) | Bandwidth |
+| :--- | :---: | :---: | :---: | :---: |
+| **GET / (Pipelined depth=128)** | 192 conn | **20,285,838 req/s** | 19.10 ms | 1.70 GB/s |
+| **GET / (Pipelined depth=64)** | 160 conn | **14,645,742 req/s** | 34.05 ms | 1.23 GB/s |
+| **GET / (TLS 1.3 HTTPS)** | 50 conn | **407,405 req/s** | **1.23 ms** | 34.97 MB/s |
+| **GET / (Plaintext HTTP/1.1)** | 100 conn | **380,778 req/s** | **3.30 ms** | 32.57 MB/s |
+
+### 3. Official HttpArena Worldwide Standing (64-core Bare-Metal)
+
+Apex is ranked **#1 in HTTP/2** and **Top 5 in HTTP/1.1** overall across all web frameworks in the official [HttpArena](https://http-arena.com) benchmark on 64-core AMD Threadripper:
+
+| Profile / Scenario | Official Rank | Throughput (RPS) | Tail Latency (p99) | Protocol |
+| :--- | :---: | :---: | :---: | :---: |
+| **`pipelined` (depth=16, 4k conn)** | 🥇 **#1 of 180** | **59,539,961 req/s** | 1.39 ms | HTTP/1.1 |
+| **`baseline-h2c` (1024 conn)** | 🥇 **#1 of 70** | **16,634,930 req/s** | 16.26 ms | HTTP/2 Cleartext |
+| **`baseline-h2` (1024 conn)** | 🥇 **#1 of 81** | **16,030,277 req/s** | 86.69 ms | HTTP/2 over TLS |
+| **`limited-conn` (4096 conn)** | 🥇 **#1 of 195** | **2,822,803 req/s** | 1.80 ms | HTTP/1.1 |
+| **`json-h2c` (1024 conn)** | 🥈 **#2 of 68** | **5,961,855 req/s** | 60.23 ms | HTTP/2 Cleartext |
+| **`baseline-4096`** | 🥉 **#3 of 195** | **4,403,856 req/s** | 1.96 ms | HTTP/1.1 |
+
+---
+
+## 🤖 AI Agent & LLM Integration (Agent Skill)
+
+For AI coding assistants, autonomous agents, and DevOps bots (such as Hermes Agent, Antigravity, Claude Code, Cursor), Apex includes an official skill definition:
+
+- **Location**: [`skills/apex-proxy/SKILL.md`](skills/apex-proxy/SKILL.md)
+- **Provides**: Automated rules for generating valid `apex.conf` blocks, safe reload procedures (`apex -t` prior to SIGHUP), kernel parameter verification, and diagnostic steps.
+
+---
+
+## 🛠️ Building from Source
+
+### Prerequisites
+- GCC or Clang with C23 support (`-std=c2x`)
+- Libraries: `libssl-dev`, `libnghttp2-dev`, `libbrotli-dev`, `libzstd-dev`, `zlib1g-dev`, `libluajit-5.1-dev`, `liburing-dev`, `libngtcp2-dev`, `libnghttp3-dev`, `libwasmedge-dev`
 
 ```bash
-make
-./examples/web_frameworks
+# Clone and build
+git clone https://github.com/xdearboy/apex.git
+cd apex
+make -j$(nproc)
+
+# Run full integration test suite
+make test
+
+# Build Debian .deb package
+./scripts/build_deb.sh 1.5.0
 ```
 
-## CLI (`apex`)
+---
 
-`make` also builds the standalone server binary `./apex`:
+## 📜 License
 
-```bash
-./apex -t conf/apex.conf        # validate configuration, exit 0/1
-./apex -c /etc/apex/apex.conf   # serve (default config path: /etc/apex/apex.conf)
-./apex -v                       # version and build flags
-```
-
-Signals: `SIGHUP` rebuilds and validates the candidate configuration in place —
-routing (static/proxy) changes on the same listening endpoint, active requests
-keep serving their generation, and a rejected reload keeps the previous
-configuration. `SIGQUIT` drains in-flight requests and queued responses, then
-stops; `SIGINT`/`SIGTERM` stop workers after the current handler returns.
-
-Scope of the standalone core: one plaintext listening endpoint (virtual hosts
-may share it), no TLS yet. Changing the listener on reload requires a restart
-and is rejected with a message; `PORT` is honored only by `apex_run()` library
-users, the CLI follows the configuration. Integration tests live in
-`tests/test_cli.py` (`make test`).
-
-## License
-
-MIT License.
+Released under the [MIT License](LICENSE).
