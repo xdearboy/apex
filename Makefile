@@ -3,7 +3,7 @@ CSTD ?= -std=c2x
 CFLAGS ?= $(CSTD) -O3 -flto -march=native -mtune=native -D_GNU_SOURCE -pthread -Wall -Wextra -Werror -Iinclude -Isrc -Isrc/core -Isrc/config -Isrc/http -Isrc/net -Isrc/storage -Isrc/security -Isrc/observability
 AR ?= ar
 LDFLAGS ?= -pthread -flto -rdynamic
-VERSION ?= 1.4.0
+VERSION ?= 1.5.0
 PYTHON ?= python3
 
 ifdef SANITIZE

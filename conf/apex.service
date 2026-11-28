@@ -1,11 +1,14 @@
 [Unit]
 Description=Apex High-Performance Reverse Proxy & Edge Router
-Documentation=https://github.com/cu3rd/posvyat-challenge
+Documentation=https://github.com/xdearboy/apex
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+User=apex
+Group=apex
+ExecStartPre=/usr/bin/apex -t -c /etc/apex/apex.conf
 ExecStart=/usr/bin/apex -c /etc/apex/apex.conf
 ExecReload=/bin/kill -s HUP $MAINPID
 KillSignal=SIGQUIT
@@ -15,8 +18,9 @@ Restart=on-failure
 RestartSec=5s
 
 # Security and resource limits
-LimitNOFILE=65536
-LimitNPROC=65536
+LimitNOFILE=1048576
+LimitNPROC=524288
+LimitMEMLOCK=infinity
 TasksMax=infinity
 
 # System sandboxing
@@ -30,6 +34,11 @@ ProtectControlGroups=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Logging & Output
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=apex
 
 [Install]
 WantedBy=multi-user.target

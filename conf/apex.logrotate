@@ -1,0 +1,13 @@
+/var/log/apex/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 0640 apex apex
+    sharedscripts
+    postrotate
+        /bin/kill -USR1 $(cat /run/apex.pid 2>/dev/null) 2>/dev/null || systemctl reload apex.service >/dev/null 2>&1 || true
+    endscript
+}

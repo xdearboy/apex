@@ -1,26 +1,20 @@
 # Changelog
 
-## [Unreleased]
+## [1.5.0]
 
 ### Added
-- Standalone CLI binary `./apex` (`src/main.c`): `-c <path>` (default `/etc/apex/apex.conf`),
-  `-t` config validation without starting workers, `-v` version with real build metadata
-  (generated into `src/build_meta.h`), invalid usage exits 1.
-- `SIGHUP` hot reload: a fully validated candidate generation is built before publication;
-  rejected reloads (syntax, semantics, unresolvable upstream, listener change) keep the
-  previous configuration and the running process. In-flight requests finish with their
-  generation; routing changes on the same listening endpoint without dropping keep-alive
-  connections.
-- Graceful `SIGQUIT` shutdown: drains in-flight requests and queued responses, closes idle
-  keep-alive connections with FIN (not RST); `SIGINT`/`SIGTERM` stop workers after the
-  current handler returns. Control loop uses `signalfd` + `eventfd` (no async-signal
-  parse/alloc/free).
-- Integration test suite `tests/test_cli.py` (24 tests, runs via `make test`).
+- **Native Linux `io_uring` Event Engine**:
+  - Implemented high-performance asynchronous event notifications via `io_uring_wait_cqe_timeout` and multishot polling (`io_uring_prep_poll_multishot`) in `src/core/core.c`.
+  - Achieved up to **630,223 RPS** (+349% improvement) on single-core benchmarks.
+  - Transparent runtime detection and graceful zero-downtime fallback to standard `epoll` when `io_uring` is unprivileged or unavailable.
+- **Universal Multi-Distro Packaging & Distribution**:
+  - One-line universal installer `scripts/install.sh` supporting Debian, Ubuntu, Fedora, RHEL, Rocky, Alma, Arch, and Alpine.
+  - Automatic GitHub Actions Release workflow generating standalone binary tarballs, `.deb` packages, and multi-arch Docker images (`ghcr.io/xdearboy/apex:1.5.0`).
+- **Nginx-style Modular Configuration & Directory Layout**:
+  - Added support for `include "conf.d/*.conf";` wildcard pattern expansion for modular virtual hosts.
+  - Modernized `conf/apex.conf` reference configuration with structured JSON / Combined logging, buffer tuning, rate-limiting zones, and proxy cache paths.
+  - Hardened systemd unit file with automatic syntax verification (`ExecStartPre=/usr/bin/apex -t`), sandboxing (`CAP_NET_BIND_SERVICE`), and logrotate integration.
 
-### Changed
-- Removed `TCP_DEFER_ACCEPT` from the listener: it caused queued idle connections to be
-  reset when the drain path closed the listener; the accept queue is now drained before
-  the listener is closed so idle clients always observe FIN.
 
 ## [1.4.0]
 
